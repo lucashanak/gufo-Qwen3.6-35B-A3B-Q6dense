@@ -1700,7 +1700,7 @@ __device__ __forceinline__ uint4 DequantKv8(uint2 raw, __half scale) {
   return out.u;
 }
 
-/// grid (tokens, kv_row / 256), 256 threads: one wave per 32-value block.
+/// grid (tokens, kv_row / 256), 256 threads: one 16-lane group per block.
 __global__ void QuantizeKvKernel(const __half* __restrict__ cache,
                                  std::int8_t* __restrict__ values,
                                  __half* __restrict__ scales,
@@ -1712,14 +1712,25 @@ __global__ void QuantizeKvKernel(const __half* __restrict__ cache,
   const float x = __half2float(cache[i]);
   float amax = fabsf(x);
 #pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
+  for (int off = 8; off > 0; off >>= 1)
     amax = fmaxf(amax, __shfl_xor(amax, off));
   const __half scale = __float2half(amax / 127.0F);
   const float d = __half2float(scale);
   const float q = d > 0.0F ? rintf(x / d) : 0.0F;
   values[i] = static_cast<std::int8_t>(fminf(fmaxf(q, -127.0F), 127.0F));
-  if (threadIdx.x % 32 == 0)
-    scales[i / 32] = scale;
+  if (threadIdx.x % 16 == 0)
+    scales[i / 16] = scale;
+}
+
+/// grid (rows, kv_row / 256), 256 threads: value * its block's F16 scale.
+__global__ void DequantizeKvKernel(const std::int8_t* __restrict__ values,
+                                   const __half* __restrict__ scales,
+                                   __half* __restrict__ cache,
+                                   std::uint32_t kv_row) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * kv_row +
+                        blockIdx.y * 256 + threadIdx.x;
+  cache[i] = __float2half(static_cast<float>(values[i]) *
+                          __half2float(scales[i / 16]));
 }
 
 constexpr std::uint32_t kGqaTile = 32;
@@ -1842,7 +1853,7 @@ __launch_bounds__(256) __global__ void GqaDecodeAttentionWmmaKernel(
       if (pos < n_kv_max) {
         const std::size_t off = pos * kv_stride + kvh * d + d16;
         k_reg[j] = *reinterpret_cast<const uint4*>(k_q8 + off);
-        k_sc[j] = k_scale[off / 32];
+        k_sc[j] = k_scale[off / 16];
       }
       // V lanes walk keys instead of dims, so the transposed LDS stores of
       // one wave land in distinct banks rather than 16-way conflicting.
@@ -1851,7 +1862,7 @@ __launch_bounds__(256) __global__ void GqaDecodeAttentionWmmaKernel(
       if (vpos < n_kv_max) {
         const std::size_t voff = vpos * kv_stride + kvh * d + vd16;
         v_reg[j] = *reinterpret_cast<const uint4*>(v_q8 + voff);
-        v_sc[j] = v_scale[voff / 32];
+        v_sc[j] = v_scale[voff / 16];
       }
     }
   };
@@ -4776,6 +4787,15 @@ void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
              hipStream_t stream) {
   hipLaunchKernelGGL(StoreKvKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
                      src, cache, row_dim, start_pos);
+}
+
+void DequantizeKv(const std::int8_t* values, const __half* scales,
+                  __half* cache, std::uint32_t n_rows, std::uint32_t kv_row,
+                  hipStream_t stream) {
+  if (n_rows == 0)
+    return;
+  hipLaunchKernelGGL(DequantizeKvKernel, dim3(n_rows, kv_row / 256), dim3(256),
+                     0, stream, values, scales, cache, kv_row);
 }
 
 void QuantizeKv(const __half* cache, std::int8_t* values, __half* scales,
