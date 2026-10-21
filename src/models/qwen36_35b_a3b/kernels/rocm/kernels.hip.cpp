@@ -18,6 +18,9 @@ namespace gufo::models::qwen36_35b_a3b::rocm {
 namespace {
 
 constexpr unsigned kThreads = 256;
+// Rows a fused projection + residual norm serves; its last block norms them
+// one after another, which loses to the parallel norm launch past this.
+constexpr unsigned kAddNormFusedRows = 2;
 
 __device__ __forceinline__ float SigmoidF(float x) {
   return 1.0f / (1.0f + __expf(-x));
@@ -259,11 +262,11 @@ __device__ __forceinline__ void Q6KRowsDot(const std::uint8_t* __restrict__ w0,
 /// each output is SiLU(gate) * up, in SwigluKernel's arithmetic; the two
 /// rows are separate sums as in two ungated projections.
 template<unsigned kTokens, unsigned kRows>
-__launch_bounds__(256) __global__
-    void DenseQ6KVecKernel(const std::uint8_t* __restrict__ w,
-                           const std::uint8_t* __restrict__ up,
-                           const float* __restrict__ x, float* __restrict__ y,
-                           std::uint32_t rows, std::uint32_t k) {
+__device__ void DenseQ6KVecRows(const std::uint8_t* __restrict__ w,
+                                const std::uint8_t* __restrict__ up,
+                                const float* __restrict__ x,
+                                float* __restrict__ y, std::uint32_t rows,
+                                std::uint32_t k) {
   const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t row0 =
       (blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize) * kRows;
@@ -301,6 +304,15 @@ __launch_bounds__(256) __global__
       for (unsigned t = 0; t < kTokens; ++t)
         y[static_cast<std::size_t>(t) * rows + row0 + r] = acc[r][t];
   }
+}
+
+template<unsigned kTokens, unsigned kRows>
+__launch_bounds__(256) __global__
+    void DenseQ6KVecKernel(const std::uint8_t* __restrict__ w,
+                           const std::uint8_t* __restrict__ up,
+                           const float* __restrict__ x, float* __restrict__ y,
+                           std::uint32_t rows, std::uint32_t k) {
+  DenseQ6KVecRows<kTokens, kRows>(w, up, x, y, rows, k);
 }
 
 /// Q4_K/Q5_K sub-block scale and min (ggml get_scale_min_k4).
@@ -390,11 +402,10 @@ __launch_bounds__(256) __global__
 
 /// res[row] += delta[row], then out[row] = rmsnorm(res[row]) * gamma. One
 /// block per row; a null gamma leaves only the residual update.
-__global__ void AddRmsNormKernel(float* res, const float* delta,
-                                 const float* gamma, float* out,
-                                 std::uint32_t dim, float eps) {
+__device__ void AddRmsNormRow(float* res, const float* delta,
+                              const float* gamma, float* out,
+                              std::uint32_t dim, float eps, std::size_t row) {
   __shared__ float shared[32];
-  const std::size_t row = blockIdx.x;
   float* r = res + row * dim;
   const float* dl = delta + row * dim;
   float ss = 0.0f;
@@ -411,6 +422,38 @@ __global__ void AddRmsNormKernel(float* res, const float* delta,
   for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
     dst[i] = r[i] * scale * gamma[i];
   }
+}
+
+__global__ void AddRmsNormKernel(float* res, const float* delta,
+                                 const float* gamma, float* out,
+                                 std::uint32_t dim, float eps) {
+  AddRmsNormRow(res, delta, gamma, out, dim, eps, blockIdx.x);
+}
+
+/// DenseQ6KVecKernel's projection into `y`, then AddRmsNormKernel for each
+/// of its kTokens rows (res += y; out = rmsnorm(res) * gamma) in the last
+/// block to finish. `done` starts at zero and is left at zero.
+template<unsigned kTokens, unsigned kRows>
+__launch_bounds__(256) __global__ void DenseQ6KVecAddNormKernel(
+    const std::uint8_t* __restrict__ w, const float* __restrict__ x, float* y,
+    std::uint32_t rows, std::uint32_t k, float* res, const float* gamma,
+    float* out, float eps, std::uint32_t* done) {
+  DenseQ6KVecRows<kTokens, kRows>(w, nullptr, x, y, rows, k);
+  __shared__ bool last;
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0)
+    last = atomicAdd(done, 1u) == gridDim.x - 1;
+  __syncthreads();
+  if (!last)
+    return;
+  __threadfence();
+  for (unsigned t = 0; t < kTokens; ++t) {
+    AddRmsNormRow(res, y, gamma, out, rows, eps, t);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    *done = 0;
 }
 
 /// Four adjacent float lanes from F32 or F16 rows.
@@ -3662,6 +3705,39 @@ bool DenseQ6KVec(const void* w, const float* x, float* y, std::uint32_t tokens,
     Q6K_CASE(7)
     Q6K_CASE(8)
 #undef Q6K_CASE
+  }
+  return true;
+}
+
+bool DenseQ6KVecAddNorm(const void* w, const float* x, float* y,
+                        std::uint32_t tokens, std::uint32_t rows,
+                        std::uint32_t k, float* res, const float* gamma,
+                        float* out, float eps, std::uint32_t* done,
+                        hipStream_t stream) {
+  if (tokens == 0 || tokens > kAddNormFusedRows || k % 512 != 0 ||
+      gamma == nullptr)
+    return false;
+  const auto* wb = static_cast<const std::uint8_t*>(w);
+  // DenseQ6KVec's row split, so each output keeps its arithmetic.
+  const std::uint32_t per_wave = tokens >= 2 && rows >= 2048 ? 2 : 1;
+  const dim3 grid((rows + 8 * per_wave - 1) / (8 * per_wave));
+  switch (tokens) {
+#define Q6K_NORM_CASE(T)                                                     \
+  case T:                                                                    \
+    if (per_wave == 2)                                                       \
+      hipLaunchKernelGGL((DenseQ6KVecAddNormKernel<T, 2>), grid, dim3(256),  \
+                         0, stream, wb, x, y, rows, k, res, gamma, out, eps, \
+                         done);                                              \
+    else                                                                     \
+      hipLaunchKernelGGL((DenseQ6KVecAddNormKernel<T, 1>), grid, dim3(256),  \
+                         0, stream, wb, x, y, rows, k, res, gamma, out, eps, \
+                         done);                                              \
+    break;
+    Q6K_NORM_CASE(1)
+    Q6K_NORM_CASE(2)
+#undef Q6K_NORM_CASE
+    default:
+      return false;
   }
   return true;
 }

@@ -348,6 +348,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                         kAttnSplits * (c.head_dim + 2));
   s.router = f32(T * (c.num_experts + 1));
   s.router_done = Alloc<std::uint32_t>(a, 1, error_msg);
+  s.norm_done = Alloc<std::uint32_t>(a, 1, error_msg);
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
   s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
   {
@@ -1074,6 +1075,27 @@ void Executor::Combine(float* res, const float* gamma,
   half_src_ = nullptr;
 }
 
+bool Executor::ProjectCombine(const DeviceTensor& w, const float* x,
+                              float* res, const float* gamma,
+                              std::uint32_t n_tokens, bool batch,
+                              std::string* error_msg) const {
+  const Config& c = config();
+  if (!MatrixRows(n_tokens) && w.type == GgmlType::kQ6_K && !moe_pending_ &&
+      moe_vec_pending_ == 0 &&
+      DenseQ6KVecAddNorm(w.data, x, s_.block_out, n_tokens, w.rows, w.cols,
+                         res, gamma, s_.xn, c.rms_eps, s_.norm_done,
+                         stream_)) {
+    q8t_src_ = nullptr;
+    half_src_ = nullptr;
+    return true;
+  }
+  if (!(batch ? DenseBatch(w, x, s_.block_out, n_tokens, error_msg)
+              : Dense(w, x, s_.block_out, n_tokens, error_msg)))
+    return false;
+  Combine(res, gamma, n_tokens);
+  return true;
+}
+
 bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                                const float* x, float* out,
                                std::uint32_t n_tokens, bool speculative,
@@ -1743,16 +1765,26 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!session.CheckCancellation(error_msg))
       return false;
     const DeviceLayer& l = layers[il];
+    // Decode rows leave the output projection to ProjectCombine.
+    const bool decode = !MatrixRows(n);
     if (l.linear) {
       if (!LinearAttention(l, session.linear_[il], s_.xn, s_.block_out, n,
-                           speculative, error_msg)) {
+                           speculative, error_msg, false, !decode)) {
         return false;
       }
     } else if (!Attention(l, session.attention_[il], s_.xn, s_.block_out, n,
-                          &session.control_->position, start_pos, error_msg)) {
+                          &session.control_->position, start_pos, error_msg,
+                          false, false, !decode)) {
       return false;
     }
-    Combine(s_.res, l.post_norm.f32(), n);
+    if (decode) {
+      if (!ProjectCombine(l.linear ? l.ssm_out : l.attn_out,
+                          l.linear ? s_.gdn_out : s_.ctx, s_.res,
+                          l.post_norm.f32(), n, false, error_msg))
+        return false;
+    } else {
+      Combine(s_.res, l.post_norm.f32(), n);
+    }
     if (!Moe(l, s_.xn, s_.block_out, n, error_msg)) {
       return false;
     }

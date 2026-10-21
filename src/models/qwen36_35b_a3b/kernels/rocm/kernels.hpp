@@ -72,6 +72,16 @@ bool DenseQ45KVec(unsigned bits, const void* w, const float* x, float* y,
 /// all scales, all d) in place, the layout DenseQ6KVec reads. Synchronous.
 bool RepackQ6KRows(void* w, std::uint32_t rows, std::uint32_t k);
 
+/// DenseQ6KVec for one or two decode rows fused with AddRmsNormRows over
+/// its output (res += y; out = rmsnorm(res) * gamma), both in their own
+/// arithmetic: the last block to finish runs the norms. `done` must start
+/// at zero and is left at zero. False, launching nothing, for other shapes.
+bool DenseQ6KVecAddNorm(const void* w, const float* x, float* y,
+                        std::uint32_t tokens, std::uint32_t rows,
+                        std::uint32_t k, float* res, const float* gamma,
+                        float* out, float eps, std::uint32_t* done,
+                        hipStream_t stream);
+
 /// Dense Q6_K projection (rows repacked by RepackQ6KRows) for 1-8 decode
 /// rows, F32 activations, weights read
 /// and decoded once for all rows. y is [tokens][rows]. False (nothing

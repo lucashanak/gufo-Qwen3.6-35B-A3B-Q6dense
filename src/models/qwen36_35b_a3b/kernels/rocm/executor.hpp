@@ -375,6 +375,12 @@ private:
   /// res += block_out (after a deferred MoE epilogue), then, with `gamma`,
   /// the next sub-block's RMSNorm of the updated residual into s_.xn.
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens) const;
+  /// A mixer's output projection into s_.block_out followed by Combine:
+  /// one or two decode rows of a Q6_K projection fuse with the residual
+  /// norm; anything else runs Dense (DenseBatch with `batch`) and Combine.
+  bool ProjectCombine(const DeviceTensor& w, const float* x, float* res,
+                      const float* gamma, std::uint32_t n_tokens, bool batch,
+                      std::string* error_msg) const;
   /// Runs a deferred decode MoE epilogue into s_.block_out.
   void FlushMoeEpilogue() const;
   /// Defers the routed epilogue of `rows` vector rows in the current
@@ -455,6 +461,7 @@ private:
     // moe
     float* router;
     std::uint32_t* router_done;  ///< RouterGemmTopKF16's block counter
+    std::uint32_t* norm_done;    ///< DenseQ6KVecAddNorm's block counter
     std::int32_t* ids;
     std::uint32_t* expert_counts;
     // Routed WMMA route: 16-row padded bucket bounds, scatter cursors, the

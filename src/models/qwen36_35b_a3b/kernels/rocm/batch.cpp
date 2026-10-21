@@ -811,12 +811,10 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
           return Fail(error, "batched GatedDeltaNet launch failed");
       }
       UseScratch(base);
-      if (!DenseBatch(l.linear ? l.ssm_out : l.attn_out,
-                      l.linear ? base.gdn_out : base.ctx, base.block_out, rows,
-                      error)) {
+      if (!ProjectCombine(l.linear ? l.ssm_out : l.attn_out,
+                          l.linear ? base.gdn_out : base.ctx, base.res,
+                          l.post_norm.f32(), rows, true, error))
         return false;
-      }
-      Combine(base.res, l.post_norm.f32(), rows);
       if (!MoeBatch(l, base.xn, base.block_out, rows, error))
         return false;
       Combine(base.res,
