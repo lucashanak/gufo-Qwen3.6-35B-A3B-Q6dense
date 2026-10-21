@@ -367,6 +367,17 @@ void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
                 std::uint32_t k, hipStream_t stream);
 
+/// The F16 router projection (SmallGemm's split-K arithmetic) and
+/// RouterTopK fused into one launch for 1-8 token rows: the last block to
+/// finish selects every row's experts. `logits` receives the projection as
+/// SmallGemm writes it. `done` is a device counter that must start at zero
+/// and is left at zero. Returns false, launching nothing, for other shapes.
+bool RouterGemmTopKF16(const void* w, const float* x, float* logits,
+                       std::uint32_t* done, std::int32_t* ids, float* weights,
+                       std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                       std::uint32_t n_experts, std::uint32_t used,
+                       hipStream_t stream);
+
 /// out[t][i] = sum_s weights[t][s] * expert_out[t*k + s][i]
 ///           + sigmoid(gate[t * gate_stride]) * shared[t][i].
 void MoeEpilogue(const float* expert_out, const float* weights,

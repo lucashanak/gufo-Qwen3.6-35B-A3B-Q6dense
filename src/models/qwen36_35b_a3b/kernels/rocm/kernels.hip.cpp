@@ -715,10 +715,11 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
 /// waves per row, each wave summing a quarter of k with 16-byte loads, the
 /// quarters added in wave order. Fills the device where one wave per row
 /// leaves it latency-bound. blockIdx.y selects a group of `tokens` rows.
+/// Waves past the fourth (a wider block reusing this body) stay idle.
 template<unsigned tokens>
-__launch_bounds__(128) __global__
-    void SmallGemmSplitF16Kernel(const __half* w, const float* x, float* out,
-                                 std::uint32_t m, std::uint32_t k) {
+__device__ void SmallGemmSplitF16Row(const __half* w, const float* x,
+                                     float* out, std::uint32_t m,
+                                     std::uint32_t k) {
   __shared__ float part[4][tokens];
   const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t wave = threadIdx.x / warpSize;
@@ -729,7 +730,8 @@ __launch_bounds__(128) __global__
   const auto* w8 = reinterpret_cast<const uint4*>(
       w + static_cast<std::size_t>(row) * k + wave * quarter);
   float acc[tokens] = {};
-  for (std::uint32_t i0 = lane * 8; i0 < quarter; i0 += warpSize * 8) {
+  for (std::uint32_t i0 = lane * 8; wave < 4 && i0 < quarter;
+       i0 += warpSize * 8) {
     const uint4 packed = w8[i0 / 8];
     const auto* h2 = reinterpret_cast<const __half2*>(&packed);
     float wv[8];
@@ -761,7 +763,7 @@ __launch_bounds__(128) __global__
 #pragma unroll
   for (unsigned j = 0; j < tokens; ++j) {
     const float total = WaveSum(acc[j]);
-    if (lane == 0)
+    if (lane == 0 && wave < 4)
       part[wave][j] = total;
   }
   __syncthreads();
@@ -770,6 +772,13 @@ __launch_bounds__(128) __global__
     out[static_cast<std::size_t>(j) * m + row] = __fadd_rn(
         __fadd_rn(__fadd_rn(part[0][j], part[1][j]), part[2][j]), part[3][j]);
   }
+}
+
+template<unsigned tokens>
+__launch_bounds__(128) __global__
+    void SmallGemmSplitF16Kernel(const __half* w, const float* x, float* out,
+                                 std::uint32_t m, std::uint32_t k) {
+  SmallGemmSplitF16Row<tokens>(w, x, out, m, k);
 }
 
 /// New history row j is row (n_tokens + j) of [history ; in].
@@ -2045,16 +2054,16 @@ __global__ void AttentionMergeKernel(const float* partials, float* out,
 
 // Keep the original block-wide softmax reduction. Selection then stays in
 // one wave's registers, retaining probability ordering and lowest-index ties.
+// Every thread of the block calls it for one row (`ids`/`weights` point at
+// the row's k slots); it ends on a barrier, so a block may run several rows.
 template<unsigned MaxExperts>
-__global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
-                                 std::int32_t* ids, float* weights,
-                                 std::uint32_t n_experts, std::uint32_t k) {
+__device__ void RouterTopKRow(const float* src, std::int32_t* ids,
+                              float* weights, std::uint32_t n_experts,
+                              std::uint32_t k) {
   __shared__ float probs[1024];
   __shared__ float shared[32];
   __shared__ std::uint32_t chosen[32];
   __shared__ float chosen_p[32];
-  const std::uint32_t t = blockIdx.x;
-  const float* src = logits + static_cast<std::size_t>(t) * stride;
   float local_max = -INFINITY;
   for (std::uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
     local_max = fmaxf(local_max, src[e]);
@@ -2071,8 +2080,7 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
   }
   __syncthreads();
 
-  if (threadIdx.x >= 32)
-    return;
+  if (threadIdx.x < 32) {
   constexpr unsigned Items = MaxExperts / 32;
   float values[Items];
 #pragma unroll
@@ -2117,10 +2125,47 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
     }
     sum = fmaxf(sum, 6.103515625e-5f);
     for (std::uint32_t slot = 0; slot < k; ++slot) {
-      ids[t * k + slot] = static_cast<std::int32_t>(chosen[slot]);
-      weights[t * k + slot] = chosen_p[slot] / sum;
+      ids[slot] = static_cast<std::int32_t>(chosen[slot]);
+      weights[slot] = chosen_p[slot] / sum;
     }
   }
+  }
+  __syncthreads();
+}
+
+template<unsigned MaxExperts>
+__global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
+                                 std::int32_t* ids, float* weights,
+                                 std::uint32_t n_experts, std::uint32_t k) {
+  const std::uint32_t t = blockIdx.x;
+  RouterTopKRow<MaxExperts>(logits + static_cast<std::size_t>(t) * stride,
+                            ids + t * k, weights + t * k, n_experts, k);
+}
+
+/// The router projection (SmallGemmSplitF16 arithmetic, one block per logit
+/// row) and RouterTopK in one launch: the last block to finish reads every
+/// logit back and selects each token's experts with RouterTopK's own
+/// 256-thread reductions. `done` starts at zero and is left at zero.
+template<unsigned tokens>
+__launch_bounds__(256) __global__ void RouterGemmTopKKernel(
+    const __half* w, const float* x, float* logits, std::uint32_t m,
+    std::uint32_t k, std::uint32_t* done, std::int32_t* ids, float* weights,
+    std::uint32_t n_experts, std::uint32_t used) {
+  SmallGemmSplitF16Row<tokens>(w, x, logits, m, k);
+  __shared__ bool last;
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0)
+    last = atomicAdd(done, 1u) == gridDim.x - 1;
+  __syncthreads();
+  if (!last)
+    return;
+  __threadfence();
+  for (unsigned j = 0; j < tokens; ++j)
+    RouterTopKRow<512>(logits + static_cast<std::size_t>(j) * m, ids + j * used,
+                       weights + j * used, n_experts, used);
+  if (threadIdx.x == 0)
+    *done = 0;
 }
 
 /// grid (tokens, dim chunks of kThreads).
@@ -5185,6 +5230,35 @@ void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
     hipLaunchKernelGGL((RouterTopKKernel<1024>), dim3(n_tokens), dim3(kThreads),
                        0, stream, logits, stride, ids, weights, n_experts, k);
   }
+}
+
+bool RouterGemmTopKF16(const void* w, const float* x, float* logits,
+                       std::uint32_t* done, std::int32_t* ids, float* weights,
+                       std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                       std::uint32_t n_experts, std::uint32_t used,
+                       hipStream_t stream) {
+  if (n_tokens == 0 || n_tokens > 8 || !SmallGemmSplitF16(m, k) ||
+      n_experts > 512 || n_experts >= m || used > 32 || kThreads != 256)
+    return false;
+  const auto* h = static_cast<const __half*>(w);
+  switch (n_tokens) {
+#define GUFO_ROUTER_TOPK(N)                                                   \
+  case N:                                                                     \
+    hipLaunchKernelGGL((RouterGemmTopKKernel<N>), dim3(m), dim3(256), 0,      \
+                       stream, h, x, logits, m, k, done, ids, weights,       \
+                       n_experts, used);                                      \
+    return true;
+    GUFO_ROUTER_TOPK(1)
+    GUFO_ROUTER_TOPK(2)
+    GUFO_ROUTER_TOPK(3)
+    GUFO_ROUTER_TOPK(4)
+    GUFO_ROUTER_TOPK(5)
+    GUFO_ROUTER_TOPK(6)
+    GUFO_ROUTER_TOPK(7)
+    GUFO_ROUTER_TOPK(8)
+#undef GUFO_ROUTER_TOPK
+  }
+  return false;
 }
 
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

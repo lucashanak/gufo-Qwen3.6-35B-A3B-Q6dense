@@ -454,6 +454,7 @@ private:
     float* attn_partials;  ///< split-key partials of a narrow batch
     // moe
     float* router;
+    std::uint32_t* router_done;  ///< RouterGemmTopKF16's block counter
     std::int32_t* ids;
     std::uint32_t* expert_counts;
     // Routed WMMA route: 16-row padded bucket bounds, scatter cursors, the

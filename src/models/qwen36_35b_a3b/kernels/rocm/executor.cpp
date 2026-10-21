@@ -347,6 +347,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
                         kAttnSplits * (c.head_dim + 2));
   s.router = f32(T * (c.num_experts + 1));
+  s.router_done = Alloc<std::uint32_t>(a, 1, error_msg);
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
   s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
   {
@@ -1275,12 +1276,18 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                    bool last_only) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
-  // Router logits and the shared-expert gate come out of one GEMM.
-  if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
-    return false;
+  // Router logits and the shared-expert gate come out of one GEMM. Decode
+  // rows run it and the expert selection in a single launch.
+  if (MatrixRows(n_tokens) || l.router.type != GgmlType::kF16 ||
+      !RouterGemmTopKF16(l.router.data, x, s_.router, s_.router_done, s_.ids,
+                         s_.weights, n_tokens, l.router.rows, l.router.cols,
+                         c.num_experts, used, stream_)) {
+    if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
+      return false;
+    }
+    RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
+               c.num_experts, used, stream_);
   }
-  RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
-             c.num_experts, used, stream_);
   if (ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
