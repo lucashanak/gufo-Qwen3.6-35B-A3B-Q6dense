@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <string_view>
@@ -181,7 +182,8 @@ struct Uploader {
     }
     // Routed Q6_K experts (a few down projections) have no routed WMMA
     // decoder; their Q8_0 copy keeps those layers on the WMMA route.
-    if (t.type == core::GgmlType::kQ6_K && d.experts > 1) {
+    if (t.type == core::GgmlType::kQ6_K && d.experts > 1 &&
+        std::getenv("GUFO_Q36_NO_Q6K_EXPERT_COPY") == nullptr) {
       const std::size_t count =
           static_cast<std::size_t>(d.rows) * d.experts * d.cols;
       std::vector<_Float16> host(count);
