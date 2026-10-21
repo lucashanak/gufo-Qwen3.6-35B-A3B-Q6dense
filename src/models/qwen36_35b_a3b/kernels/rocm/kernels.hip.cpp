@@ -404,8 +404,8 @@ __launch_bounds__(256) __global__
 /// res[row] += delta[row], then out[row] = rmsnorm(res[row]) * gamma. One
 /// block per row; a null gamma leaves only the residual update.
 __device__ void AddRmsNormRow(float* res, const float* delta,
-                              const float* gamma, float* out,
-                              std::uint32_t dim, float eps, std::size_t row) {
+                              const float* gamma, float* out, std::uint32_t dim,
+                              float eps, std::size_t row) {
   __shared__ float shared[32];
   float* r = res + row * dim;
   const float* dl = delta + row * dim;
@@ -435,10 +435,12 @@ __global__ void AddRmsNormKernel(float* res, const float* delta,
 /// of its kTokens rows (res += y; out = rmsnorm(res) * gamma) in the last
 /// block to finish. `done` starts at zero and is left at zero.
 template<unsigned kTokens, unsigned kRows>
-__launch_bounds__(256) __global__ void DenseQ6KVecAddNormKernel(
-    const std::uint8_t* __restrict__ w, const float* __restrict__ x, float* y,
-    std::uint32_t rows, std::uint32_t k, float* res, const float* gamma,
-    float* out, float eps, std::uint32_t* done) {
+__launch_bounds__(256) __global__
+    void DenseQ6KVecAddNormKernel(const std::uint8_t* __restrict__ w,
+                                  const float* __restrict__ x, float* y,
+                                  std::uint32_t rows, std::uint32_t k,
+                                  float* res, const float* gamma, float* out,
+                                  float eps, std::uint32_t* done) {
   DenseQ6KVecRows<kTokens, kRows>(w, nullptr, x, y, rows, k);
   __shared__ bool last;
   __threadfence();
@@ -2125,54 +2127,54 @@ __device__ void RouterTopKRow(const float* src, std::int32_t* ids,
   __syncthreads();
 
   if (threadIdx.x < 32) {
-  constexpr unsigned Items = MaxExperts / 32;
-  float values[Items];
-#pragma unroll
-  for (unsigned j = 0; j < Items; ++j) {
-    unsigned e = threadIdx.x + j * 32;
-    values[j] = e < n_experts ? probs[e] : -1.0f;
-  }
-  for (unsigned slot = 0; slot < k; ++slot) {
-    float best = -1.0f;
-    unsigned index = 0xffffffffu;
+    constexpr unsigned Items = MaxExperts / 32;
+    float values[Items];
 #pragma unroll
     for (unsigned j = 0; j < Items; ++j) {
       unsigned e = threadIdx.x + j * 32;
-      if (values[j] > best) {
-        best = values[j];
-        index = e;
-      }
+      values[j] = e < n_experts ? probs[e] : -1.0f;
     }
+    for (unsigned slot = 0; slot < k; ++slot) {
+      float best = -1.0f;
+      unsigned index = 0xffffffffu;
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      float other = __shfl_xor(best, offset);
-      unsigned oi = __shfl_xor(index, offset);
-      if (other > best || (other == best && oi < index)) {
-        best = other;
-        index = oi;
+      for (unsigned j = 0; j < Items; ++j) {
+        unsigned e = threadIdx.x + j * 32;
+        if (values[j] > best) {
+          best = values[j];
+          index = e;
+        }
+      }
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_xor(best, offset);
+        unsigned oi = __shfl_xor(index, offset);
+        if (other > best || (other == best && oi < index)) {
+          best = other;
+          index = oi;
+        }
+      }
+      if (threadIdx.x == 0) {
+        chosen[slot] = index;
+        chosen_p[slot] = best;
+      }
+#pragma unroll
+      for (unsigned j = 0; j < Items; ++j) {
+        if (threadIdx.x + j * 32 == index)
+          values[j] = -1.0f;
       }
     }
     if (threadIdx.x == 0) {
-      chosen[slot] = index;
-      chosen_p[slot] = best;
+      float sum = 0.0f;
+      for (std::uint32_t slot = 0; slot < k; ++slot) {
+        sum += chosen_p[slot];
+      }
+      sum = fmaxf(sum, 6.103515625e-5f);
+      for (std::uint32_t slot = 0; slot < k; ++slot) {
+        ids[slot] = static_cast<std::int32_t>(chosen[slot]);
+        weights[slot] = chosen_p[slot] / sum;
+      }
     }
-#pragma unroll
-    for (unsigned j = 0; j < Items; ++j) {
-      if (threadIdx.x + j * 32 == index)
-        values[j] = -1.0f;
-    }
-  }
-  if (threadIdx.x == 0) {
-    float sum = 0.0f;
-    for (std::uint32_t slot = 0; slot < k; ++slot) {
-      sum += chosen_p[slot];
-    }
-    sum = fmaxf(sum, 6.103515625e-5f);
-    for (std::uint32_t slot = 0; slot < k; ++slot) {
-      ids[slot] = static_cast<std::int32_t>(chosen[slot]);
-      weights[slot] = chosen_p[slot] / sum;
-    }
-  }
   }
   __syncthreads();
 }
@@ -2191,10 +2193,12 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
 /// logit back and selects each token's experts with RouterTopK's own
 /// 256-thread reductions. `done` starts at zero and is left at zero.
 template<unsigned tokens>
-__launch_bounds__(256) __global__ void RouterGemmTopKKernel(
-    const __half* w, const float* x, float* logits, std::uint32_t m,
-    std::uint32_t k, std::uint32_t* done, std::int32_t* ids, float* weights,
-    std::uint32_t n_experts, std::uint32_t used) {
+__launch_bounds__(256) __global__
+    void RouterGemmTopKKernel(const __half* w, const float* x, float* logits,
+                              std::uint32_t m, std::uint32_t k,
+                              std::uint32_t* done, std::int32_t* ids,
+                              float* weights, std::uint32_t n_experts,
+                              std::uint32_t used) {
   SmallGemmSplitF16Row<tokens>(w, x, logits, m, k);
   __shared__ bool last;
   __threadfence();
@@ -3723,16 +3727,16 @@ bool DenseQ6KVecAddNorm(const void* w, const float* x, float* y,
   const std::uint32_t per_wave = tokens >= 2 && rows >= 2048 ? 2 : 1;
   const dim3 grid((rows + 8 * per_wave - 1) / (8 * per_wave));
   switch (tokens) {
-#define Q6K_NORM_CASE(T)                                                     \
-  case T:                                                                    \
-    if (per_wave == 2)                                                       \
-      hipLaunchKernelGGL((DenseQ6KVecAddNormKernel<T, 2>), grid, dim3(256),  \
-                         0, stream, wb, x, y, rows, k, res, gamma, out, eps, \
-                         done);                                              \
-    else                                                                     \
-      hipLaunchKernelGGL((DenseQ6KVecAddNormKernel<T, 1>), grid, dim3(256),  \
-                         0, stream, wb, x, y, rows, k, res, gamma, out, eps, \
-                         done);                                              \
+#define Q6K_NORM_CASE(T)                                                       \
+  case T:                                                                      \
+    if (per_wave == 2)                                                         \
+      hipLaunchKernelGGL((DenseQ6KVecAddNormKernel<T, 2>), grid, dim3(256), 0, \
+                         stream, wb, x, y, rows, k, res, gamma, out, eps,      \
+                         done);                                                \
+    else                                                                       \
+      hipLaunchKernelGGL((DenseQ6KVecAddNormKernel<T, 1>), grid, dim3(256), 0, \
+                         stream, wb, x, y, rows, k, res, gamma, out, eps,      \
+                         done);                                                \
     break;
     Q6K_NORM_CASE(1)
     Q6K_NORM_CASE(2)
@@ -5315,16 +5319,16 @@ bool RouterGemmTopKF16(const void* w, const float* x, float* logits,
                        std::uint32_t n_experts, std::uint32_t used,
                        hipStream_t stream) {
   if (n_tokens == 0 || n_tokens > kLastBlockFusedRows ||
-      !SmallGemmSplitF16(m, k) ||
-      n_experts > 512 || n_experts >= m || used > 32 || kThreads != 256)
+      !SmallGemmSplitF16(m, k) || n_experts > 512 || n_experts >= m ||
+      used > 32 || kThreads != 256)
     return false;
   const auto* h = static_cast<const __half*>(w);
   switch (n_tokens) {
-#define GUFO_ROUTER_TOPK(N)                                                   \
-  case N:                                                                     \
-    hipLaunchKernelGGL((RouterGemmTopKKernel<N>), dim3(m), dim3(256), 0,      \
-                       stream, h, x, logits, m, k, done, ids, weights,       \
-                       n_experts, used);                                      \
+#define GUFO_ROUTER_TOPK(N)                                              \
+  case N:                                                                \
+    hipLaunchKernelGGL((RouterGemmTopKKernel<N>), dim3(m), dim3(256), 0, \
+                       stream, h, x, logits, m, k, done, ids, weights,   \
+                       n_experts, used);                                 \
     return true;
     GUFO_ROUTER_TOPK(1)
     GUFO_ROUTER_TOPK(2)

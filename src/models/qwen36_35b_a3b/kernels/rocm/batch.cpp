@@ -822,14 +822,15 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                                     : model_->output_norm().f32(),
               rows);
       if (feat_dev_ != nullptr && feat_tap_of_layer_[il] >= 0 &&
-          !Check(hipMemcpy2DAsync(
-                     feat_dev_ + static_cast<std::size_t>(feat_tap_of_layer_[il]) *
-                                     c.hidden_size,
-                     std::size_t{feat_width_} * sizeof(float), base.res,
-                     std::size_t{c.hidden_size} * sizeof(float),
-                     std::size_t{c.hidden_size} * sizeof(float), rows,
-                     hipMemcpyDeviceToDevice, stream_),
-                 error)) {
+          !Check(
+              hipMemcpy2DAsync(
+                  feat_dev_ + static_cast<std::size_t>(feat_tap_of_layer_[il]) *
+                                  c.hidden_size,
+                  std::size_t{feat_width_} * sizeof(float), base.res,
+                  std::size_t{c.hidden_size} * sizeof(float),
+                  std::size_t{c.hidden_size} * sizeof(float), rows,
+                  hipMemcpyDeviceToDevice, stream_),
+              error)) {
         return false;
       }
     }
