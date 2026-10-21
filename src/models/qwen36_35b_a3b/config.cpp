@@ -157,14 +157,22 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
   // These dimensions select specialized attention, DeltaNet and expert
   // kernels. Reject other profiles before allocating or launching;
   // satisfying divisibility alone does not make a shape executable.
-  if (c.num_layers != 40 || c.nextn_layers > 1 || c.hidden_size != 2048 ||
-      c.full_attention_interval != 4 || c.num_heads != 16 ||
-      c.num_kv_heads != 2 || c.head_dim != 256 || c.rotary_dim != 64 ||
+  // Two profiles share everything but width: Qwen3.6-35B-A3B and the
+  // Qwen3.5-122B-A10B shape (Ornith-1.5-122B), which doubles the query and
+  // value heads and the expert width.
+  const bool a3b = c.num_layers == 40 && c.hidden_size == 2048 &&
+                   c.num_heads == 16 && c.ssm_num_v_heads == 32 &&
+                   c.expert_ff == 512 && c.shared_expert_ff == 512;
+  const bool a10b = c.num_layers == 48 && c.hidden_size == 3072 &&
+                    c.num_heads == 32 && c.ssm_num_v_heads == 64 &&
+                    c.expert_ff == 1024 && c.shared_expert_ff == 1024;
+  if ((!a3b && !a10b) || c.nextn_layers > 1 ||
+      c.full_attention_interval != 4 || c.num_kv_heads != 2 ||
+      c.head_dim != 256 || c.rotary_dim != 64 ||
       c.rope_sections != std::array<std::uint32_t, 4>{11, 11, 10, 0} ||
       c.ssm_conv_kernel != 4 || c.ssm_head_dim != 128 ||
-      c.ssm_num_k_heads != 16 || c.ssm_num_v_heads != 32 ||
-      c.num_experts != 256 || c.num_experts_used != 8 || c.expert_ff != 512 ||
-      c.shared_expert_ff != 512) {
+      c.ssm_num_k_heads != 16 || c.num_experts != 256 ||
+      c.num_experts_used != 8) {
     r.Fail("unsupported Qwen3.6-35B-A3B kernel geometry");
     return std::nullopt;
   }
