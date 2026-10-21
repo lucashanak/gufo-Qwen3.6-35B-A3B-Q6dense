@@ -16,6 +16,7 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen36_35b_a3b/config.hpp"
+#include "src/models/qwen36_35b_a3b/lookup_draft.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_policy.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_sampling.hpp"
 
@@ -186,6 +187,10 @@ public:
     std::uint64_t cycles{0};
     std::uint64_t drafted{0};
     std::uint64_t accepted{0};
+    /// Cycles drafted from the token history instead of the MTP predictor.
+    std::uint64_t suffix_cycles{0};
+    std::uint64_t suffix_drafted{0};
+    std::uint64_t suffix_accepted{0};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
@@ -247,6 +252,11 @@ private:
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
+  /// Retrieval drafts over tokens_; extended lazily by SyncLookup.
+  LookupIndex lookup_;
+  /// Position until which history drafts need a long match to be trusted again.
+  std::size_t suffix_cooldown_until_{0};
+  void SyncLookup();
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
