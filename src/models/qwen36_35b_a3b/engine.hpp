@@ -196,8 +196,10 @@ public:
     std::uint64_t accepted{0};
     /// Cycles drafted from the token history instead of the MTP predictor.
     std::uint64_t suffix_cycles{0};
-    std::uint64_t suffix_drafted{0};
-    std::uint64_t suffix_accepted{0};
+    /// History tokens proposed and accepted, named as the upstream prompt
+    /// lookup counters so the shared CLI reports read them.
+    std::uint64_t lookup{0};
+    std::uint64_t lookup_accepted{0};
     std::uint64_t dflash_cycles{0};
     std::uint64_t dflash_drafted{0};
     std::uint64_t dflash_accepted{0};
