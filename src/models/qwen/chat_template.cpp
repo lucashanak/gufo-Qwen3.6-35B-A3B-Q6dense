@@ -89,7 +89,11 @@ bool IsQwen38ReasoningTemplate(std::string_view value) {
 bool IsQwen36Template(std::string_view value) {
   const std::string hash = TemplateSha256(value);
   return hash == QwenChatTemplate::Qwen36OfficialTemplateSha256() ||
-         hash == QwenChatTemplate::Qwen36UnslothTemplateSha256();
+         hash == QwenChatTemplate::Qwen36UnslothTemplateSha256() ||
+         // Local patch: Ornith-1.5-35B (Qwen3.6 fine-tune). Same wire format as
+         // the official template; only merges a second system/developer turn.
+         hash ==
+             "f55f52930aa8bf44ab5cb85f99370fcc3c56e9a85640b812086d5330bce5d86b";
 }
 
 bool IsQwen36Artifact(const core::GgufReader& reader) {
