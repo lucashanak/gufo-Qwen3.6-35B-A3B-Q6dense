@@ -789,6 +789,42 @@ void QwenDFlashGpuExecutor::Reset() noexcept {
   injected_context_len_ = 0;
 }
 
+bool QwenDFlashGpuExecutor::SkipTargetContext(std::uint32_t position,
+                                              std::uint32_t num_tokens) {
+  if (position != injected_context_len_ || position > max_context_ ||
+      num_tokens > max_context_ - position) {
+    return false;
+  }
+  injected_context_len_ = position + num_tokens;
+  return true;
+}
+
+bool QwenDFlashGpuExecutor::InjectTargetContextDevice(
+    const float* device_features, std::uint32_t position,
+    std::uint32_t num_tokens) {
+  const std::size_t width = GetTargetFeaturesSize();
+  if (device_features == nullptr || position != injected_context_len_ ||
+      position > max_context_ || num_tokens > max_context_ - position) {
+    return false;
+  }
+  const auto expired =
+      num_tokens > history_capacity_ ? num_tokens - history_capacity_ : 0U;
+  const auto first_chunk =
+      (expired / injection_capacity_) * injection_capacity_;
+  if (first_chunk > 0 && !SkipTargetContext(position, first_chunk))
+    return false;
+  for (std::uint32_t offset = first_chunk; offset < num_tokens;) {
+    const auto count = std::min(injection_capacity_, num_tokens - offset);
+    const std::span<const float> rows(
+        device_features + static_cast<std::size_t>(offset) * width,
+        static_cast<std::size_t>(count) * width);
+    if (!InjectTargetContextChunk(rows, position + offset, count, {}, true))
+      return false;
+    offset += count;
+  }
+  return true;
+}
+
 bool QwenDFlashGpuExecutor::InjectTargetContext(
     std::span<const float> target_features, std::uint32_t position,
     std::uint32_t num_tokens, const DFlashTrace& trace) {
@@ -821,7 +857,7 @@ bool QwenDFlashGpuExecutor::InjectTargetContext(
 
 bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
     std::span<const float> target_features, std::uint32_t position,
-    std::uint32_t num_tokens, const DFlashTrace& trace) {
+    std::uint32_t num_tokens, const DFlashTrace& trace, bool device_source) {
   const auto& weights = model_->GetWeights();
   const auto& cfg = model_->GetConfig();
   const std::size_t hidden_size = cfg.hidden_size;
@@ -838,7 +874,9 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
   const std::size_t bytes = target_features.size() * sizeof(float);
   const auto cpy_err =
       hipMemcpyAsync(d_target_features_, target_features.data(), bytes,
-                     hipMemcpyHostToDevice, stream_);
+                     device_source ? hipMemcpyDeviceToDevice
+                                   : hipMemcpyHostToDevice,
+                     stream_);
   if (cpy_err != hipSuccess) {
     return false;
   }

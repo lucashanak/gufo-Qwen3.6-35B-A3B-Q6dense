@@ -4,6 +4,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <hip/hip_runtime.h>
+#include <cstdio>
 #include <string_view>
 #include <cstdlib>
 #include <array>
@@ -146,6 +148,38 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->executor_) {
     return nullptr;
   }
+  if (const char* path = std::getenv("GUFO_Q36_DFLASH");
+      path != nullptr && *path != '\0' && m->mtp_weights_ != nullptr) {
+    std::string dferr;
+    std::shared_ptr<const core::GgufReader> reader(
+        core::GgufReader::OpenFile(path, &dferr));
+    const auto& out = m->weights_->output;
+    const std::size_t head_bytes = out.RowBytes() * out.rows * out.experts;
+    if (reader != nullptr &&
+        hipMalloc(&m->dflash_head_, head_bytes) == hipSuccess &&
+        hipMemcpy(m->dflash_head_, out.data, head_bytes,
+                  hipMemcpyHostToDevice) == hipSuccess) {
+      core::ModelConfig tc;
+      tc.num_layers = c.num_layers;
+      tc.hidden_size = c.hidden_size;
+      tc.vocab_size = c.vocab_size;
+      const auto& emb = m->device_->token_embd();
+      models::QwenTensorRef embd{.data = emb.data, .type = emb.type,
+                                 .num_elements = std::size_t{emb.rows} * emb.cols};
+      models::QwenTensorRef head{.data = m->dflash_head_, .type = out.type,
+                                 .num_elements = out.ElementCount()};
+      m->dflash_model_ = hip::QwenDFlashGpuModel::CreateForTarget(
+          std::move(reader), tc, embd, head, &dferr);
+      if (m->dflash_model_ != nullptr &&
+          !m->executor_->ConfigureFeatureTaps(
+              m->dflash_model_->GetDFlashConfig().target_layer_ids, &dferr)) {
+        m->dflash_model_ = nullptr;
+      }
+    }
+    std::fprintf(stderr, "[qwen36] DFlash2 draft %s%s%s\n",
+                 m->dflash_model_ != nullptr ? "enabled: " : "DISABLED: ",
+                 m->dflash_model_ != nullptr ? path : dferr.c_str(), "");
+  }
   return m;
 }
 
@@ -247,9 +281,120 @@ Session::Session(std::shared_ptr<Model> model,
       draft_length_(model_->options_.max_draft_tokens,
                     model_->DecodeConcurrency()) {
   logits_.resize(model_->VocabSize());
+  if (model_->dflash_model_ != nullptr) {
+    std::string err;
+    dflash_ = hip::QwenDFlashGpuExecutor::Create(model_->dflash_model_,
+                                                 session_->max_context(), &err);
+    ring_rows_ = std::max<std::uint32_t>(
+        1, model_->dflash_model_->GetDFlashConfig().sliding_window);
+    if (dflash_ != nullptr &&
+        hipMalloc(reinterpret_cast<void**>(&ring_),
+                  std::size_t{ring_rows_} * model_->executor_->FeatureWidth() *
+                      sizeof(float)) != hipSuccess) {
+      ring_ = nullptr;
+      dflash_ = nullptr;
+    }
+  }
 }
 
-Session::~Session() = default;
+Session::~Session() {
+  if (ring_ != nullptr)
+    (void)hipFree(ring_);
+}
+
+void Session::ResetDraftRates() noexcept {
+  dfl_tokens_ = dfl_seconds_ = mtp_tokens_ = mtp_seconds_ = 0.0F;
+  dfl_cycles_ = mtp_cycles_ = draft_cycles_ = 0;
+}
+
+bool Session::PreferDFlash() const noexcept {
+  constexpr std::uint32_t kProbe = 4;
+  constexpr std::uint32_t kPeriod = 50;
+  if (dfl_cycles_ < kProbe)
+    return true;
+  if (mtp_cycles_ < kProbe)
+    return false;
+  const bool faster =
+      dfl_tokens_ * mtp_seconds_ >= mtp_tokens_ * dfl_seconds_;
+  // The last cycles of every period re-measure the slower source.
+  return draft_cycles_ % kPeriod >= kPeriod - 2 ? !faster : faster;
+}
+
+bool Session::EnsureDFlashContext() {
+  const auto start = std::chrono::steady_clock::now();
+  const auto pos = static_cast<std::uint32_t>(tokens_.size());
+  if (ring_ == nullptr || ring_end_ != pos)
+    return false;
+  const std::uint32_t win_start = pos > ring_rows_ ? pos - ring_rows_ : 0;
+  if (ring_begin_ > win_start)
+    return false;  // the ring does not cover the attention window yet
+  std::uint32_t from = dflash_->GetInjectedContextLength();
+  if (from > pos) {
+    dflash_->Reset();
+    from = 0;
+  }
+  if (from < win_start) {
+    if (!dflash_->SkipTargetContext(from, win_start - from))
+      return false;
+    from = win_start;
+  }
+  if (from == pos)
+    return true;
+  rocm::Executor& exec = *model_->executor_;
+  if (!exec.SyncStream())
+    return false;
+  const std::size_t width = exec.FeatureWidth();
+  while (from < pos) {
+    const std::uint32_t slot = from % ring_rows_;
+    const std::uint32_t n = std::min(pos - from, ring_rows_ - slot);
+    if (!dflash_->InjectTargetContextDevice(ring_ + std::size_t{slot} * width,
+                                            from, n)) {
+      dflash_->Reset();
+      return false;
+    }
+    from += n;
+  }
+  catchup_seconds_ += std::chrono::duration<float>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+  return true;
+}
+
+void Session::InjectFeatures(std::uint32_t position, std::uint32_t rows,
+                             std::uint32_t end) {
+  if (ring_ == nullptr || rows == 0)
+    return;
+  if (!features_fresh_) {
+    ResetRing(position + rows);  // a gap: start over after these rows
+    return;
+  }
+  const std::uint32_t win_start = end > ring_rows_ ? end - ring_rows_ : 0;
+  if (position + rows <= win_start) {
+    ResetRing(position + rows);  // nothing here survives the window
+    return;
+  }
+  const std::uint32_t first = win_start > position ? win_start - position : 0;
+  const std::uint32_t p0 = position + first;
+  if (p0 != ring_end_)
+    ResetRing(p0);
+  rocm::Executor& exec = *model_->executor_;
+  const std::size_t width = exec.FeatureWidth();
+  for (std::uint32_t done = first; done < rows;) {
+    const std::uint32_t at = position + done;
+    const std::uint32_t slot = at % ring_rows_;
+    const std::uint32_t n = std::min(rows - done, ring_rows_ - slot);
+    if (!exec.CopyFeatures(feature_row_offset_ + done, n,
+                           ring_ + std::size_t{slot} * width)) {
+      ResetRing(position + rows);
+      return;
+    }
+    done += n;
+  }
+  ring_end_ = position + rows;
+  if (ring_end_ - ring_begin_ > ring_rows_)
+    ring_begin_ = ring_end_ - ring_rows_;
+}
+
 
 std::uint32_t Session::Position() const noexcept {
   return session_->position();
@@ -262,6 +407,10 @@ void Session::Reset() {
   valid_ = false;
   session_->Reset();
   tokens_.clear();
+  if (dflash_) {
+    dflash_->Reset();
+    ResetRing(0);
+  }
   lookup_ = LookupIndex{};
   suffix_cooldown_until_ = 0;
   hidden_base_ = 0;
@@ -432,6 +581,10 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     return false;
   }
   tokens_ = std::move(tokens);
+  if (dflash_) {
+    dflash_->Reset();  // the snapshot carries no draft context
+    ResetRing(static_cast<std::uint32_t>(tokens_.size()));
+  }
   lookup_ = LookupIndex{};
   suffix_cooldown_until_ = 0;
   logits_ = std::move(logits);
@@ -552,6 +705,11 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg)) {
       return false;
     }
+    features_fresh_ = true;
+    InjectFeatures(static_cast<std::uint32_t>(tokens_.size()),
+                   static_cast<std::uint32_t>(n),
+                   static_cast<std::uint32_t>(tokens_.size() + tokens.size() - off));
+    features_fresh_ = false;
     hidden_base_ = static_cast<std::uint32_t>(
         tokens_.size() + n - std::min<std::size_t>(n, exec.max_speculative()));
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
@@ -571,6 +729,9 @@ bool Session::Sync(std::span<const std::int32_t> prompt,
   }
   if (!valid_)
     Reset();
+  // Each request measures its own draft sources: code and prose favour
+  // different ones.
+  ResetDraftRates();
   // Recurrent state cannot be rewound, so any divergence restarts the
   // session; an extension only feeds the new tail.
   std::size_t common = 0;
@@ -644,6 +805,7 @@ void Session::SyncLookup() {
 
 struct Session::PendingDecode {
   bool suffix{false};  ///< chain came from the token history, not the predictor
+  bool dflash{false};  ///< chain came from the DFlash2 draft
   std::vector<std::int32_t> chain;
   std::vector<MtpProposal> proposals;
   std::uint32_t base{0};
@@ -721,12 +883,26 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     history_draft = lookup_.Draft(
         needed, std::min<std::size_t>(cap - 1, kMaxMtpDraftTokens), &matched);
   }
+  bool from_dflash = false;
+  if (history_draft.empty() && dflash_ && !defer_head && MtpEnabled() &&
+      cap > 1 && PreferDFlash() && EnsureDFlashContext()) {
+    const auto ids = dflash_->ForwardBlock(
+        static_cast<tokenization::TokenId>(anchor),
+        static_cast<std::uint32_t>(tokens_.size()),
+        static_cast<std::uint32_t>(
+            std::min<std::size_t>(cap - 1, kMaxMtpDraftTokens)),
+        0.0F);
+    for (const auto id : ids)
+      history_draft.push_back(static_cast<std::int32_t>(id));
+    from_dflash = !history_draft.empty();
+  }
   if (!history_draft.empty()) {
     const bool sampled = sampler.config().uses_random_sampling();
     const bool gpu_greedy = sampler.config().temperature == 0.0F;
     if (!defer_head && !DraftCatchUp(anchor, false, error_msg))
       return false;
-    pending->suffix = true;
+    pending->suffix = !from_dflash;
+    pending->dflash = from_dflash;
     pending->chain = {anchor};
     for (const auto token : history_draft) {
       pending->chain.push_back(token);
@@ -847,6 +1023,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
   if (!pending.speculative) {
     draft_length_.ObserveArToken();
     hidden_base_ = base;
+    InjectFeatures(base, 1, base + 1);
     tokens_.push_back(anchor);
     sampler.Accept(static_cast<sampling::TokenId>(anchor));
     result->tokens.push_back(anchor);
@@ -937,7 +1114,12 @@ bool Session::FinishDecode(const DecodeRequest& request,
   stats_.cycles += 1;
   stats_.drafted += k - 1;
   stats_.accepted += keep - 1;
-  if (pending.suffix) {
+  InjectFeatures(base, keep, base + keep);
+  if (pending.dflash) {
+    stats_.dflash_cycles += 1;
+    stats_.dflash_drafted += k - 1;
+    stats_.dflash_accepted += keep - 1;
+  } else if (pending.suffix) {
     stats_.suffix_cycles += 1;
     stats_.suffix_drafted += k - 1;
     stats_.suffix_accepted += keep - 1;
@@ -971,6 +1153,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   valid_ = false;
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
   PendingDecode pending;
+  const auto cycle_start = std::chrono::steady_clock::now();
   if (!PrepareDecode(request, &pending, error_msg)) {
     return false;
   }
@@ -988,7 +1171,38 @@ bool Session::DecodeStep(std::size_t max_tokens,
           error_msg)) {
     return false;
   }
+  features_fresh_ = true;
+  feature_row_offset_ = 0;
   const bool ok = FinishDecode(request, pending, error_msg);
+  features_fresh_ = false;
+  if (ok && dflash_ && pending.speculative && !pending.suffix &&
+      !result->tokens.empty()) {
+    const float seconds =
+        std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                     cycle_start)
+            .count() -
+        catchup_seconds_;
+    if (seconds > 0.0F) {
+      const auto tokens = static_cast<float>(result->tokens.size());
+      if (pending.dflash) {
+        dfl_tokens_ += tokens;
+        dfl_seconds_ += seconds;
+        ++dfl_cycles_;
+      } else {
+        mtp_tokens_ += tokens;
+        mtp_seconds_ += seconds;
+        ++mtp_cycles_;
+      }
+      // Keep the comparison recent: halve both sums every 64 cycles.
+      if (++draft_cycles_ % 64 == 0) {
+        dfl_tokens_ *= 0.5F;
+        dfl_seconds_ *= 0.5F;
+        mtp_tokens_ *= 0.5F;
+        mtp_seconds_ *= 0.5F;
+      }
+    }
+  }
+  catchup_seconds_ = 0.0F;
   valid_ = ok;
   return ok;
 }
@@ -1237,10 +1451,14 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
                     : p.gpu_verification ? nullptr
                                          : session.verify_logits_.data();
     try {
+      session.features_fresh_ = true;
+      session.feature_row_offset_ = row_offset;
       r.outcome->completed =
           exec.SelectBatchLogits(row_offset, p.chain.size(), logits,
                                  &r.outcome->error) &&
           session.FinishDecode(r, p, &r.outcome->error);
+      session.features_fresh_ = false;
+      session.feature_row_offset_ = 0;
     } catch (const std::exception& exception) {
       r.outcome->error = exception.what();
     }
@@ -1284,6 +1502,12 @@ bool Session::EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
       if (!exec.SelectBatchLogits(i, 1, session.logits_.data(), &outcome.error))
         continue;
       session.hidden_base_ = static_cast<std::uint32_t>(session.tokens_.size());
+      session.features_fresh_ = true;
+      session.feature_row_offset_ = static_cast<std::uint32_t>(i);
+      const auto at = static_cast<std::uint32_t>(session.tokens_.size());
+      session.InjectFeatures(at, 1, at + 1);
+      session.features_fresh_ = false;
+      session.feature_row_offset_ = 0;
       session.tokens_.push_back(requests[i].token);
       outcome.completed = true;
     } catch (const std::exception& exception) {

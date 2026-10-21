@@ -239,6 +239,7 @@ void Session::Reset() {
 }
 
 Executor::~Executor() {
+  (void)hipFree(feat_dev_);
   for (void* p : kv_half_allocations_)
     (void)hipFree(p);
   (void)hipFree(batch_logits_);
@@ -1645,6 +1646,62 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   return true;
 }
 
+bool Executor::ConfigureFeatureTaps(std::span<const std::uint32_t> layers,
+                                    std::string* error_msg) const {
+  const Config& c = config();
+  if (feat_dev_ != nullptr || layers.empty()) {
+    AssignError(error_msg, "feature taps are already configured or empty");
+    return false;
+  }
+  feat_tap_of_layer_.assign(c.num_layers, -1);
+  for (std::size_t t = 0; t < layers.size(); ++t) {
+    if (layers[t] >= c.num_layers) {
+      AssignError(error_msg, "feature tap beyond the layer count");
+      return false;
+    }
+    feat_tap_of_layer_[layers[t]] = static_cast<std::int32_t>(t);
+  }
+  feat_width_ = static_cast<std::uint32_t>(layers.size()) * c.hidden_size;
+  const std::size_t bytes =
+      std::size_t{options_.max_batch} * feat_width_ * sizeof(float);
+  if (!Check(hipMalloc(reinterpret_cast<void**>(&feat_dev_), bytes),
+             "feature buffer", error_msg)) {
+    feat_dev_ = nullptr;
+    return false;
+  }
+  return true;
+}
+
+bool Executor::CopyFeatures(std::uint32_t first, std::uint32_t rows,
+                            float* dst, std::string* error_msg) const {
+  if (feat_dev_ == nullptr || first + rows > options_.max_batch) {
+    AssignError(error_msg, "feature rows are unavailable");
+    return false;
+  }
+  return Check(hipMemcpyAsync(dst, feat_dev_ + std::size_t{first} * feat_width_,
+                              std::size_t{rows} * feat_width_ * sizeof(float),
+                              hipMemcpyDeviceToDevice, stream_),
+               "feature copy", error_msg);
+}
+
+bool Executor::SyncStream(std::string* error_msg) const {
+  return Check(hipStreamSynchronize(stream_), "stream sync", error_msg);
+}
+
+bool Executor::DownloadFeatures(std::uint32_t first, std::uint32_t rows,
+                                float* host, std::string* error_msg) const {
+  if (feat_dev_ == nullptr || first + rows > options_.max_batch) {
+    AssignError(error_msg, "feature rows are unavailable");
+    return false;
+  }
+  return Check(hipMemcpyAsync(host,
+                              feat_dev_ + std::size_t{first} * feat_width_,
+                              std::size_t{rows} * feat_width_ * sizeof(float),
+                              hipMemcpyDeviceToHost, stream_),
+               "feature download", error_msg) &&
+         Check(hipStreamSynchronize(stream_), "feature download", error_msg);
+}
+
 bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::uint32_t n_logits, bool download_logits,
                            bool speculative, std::uint32_t start_pos,
@@ -1694,6 +1751,17 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
             il + 1 < c.num_layers ? layers[il + 1].attn_norm.f32()
                                   : model_->output_norm().f32(),
             n);
+    if (feat_dev_ != nullptr && feat_tap_of_layer_[il] >= 0 &&
+        !Check(hipMemcpy2DAsync(
+                   feat_dev_ + static_cast<std::size_t>(feat_tap_of_layer_[il]) *
+                                   c.hidden_size,
+                   std::size_t{feat_width_} * sizeof(float), s_.res,
+                   std::size_t{c.hidden_size} * sizeof(float),
+                   std::size_t{c.hidden_size} * sizeof(float), n,
+                   hipMemcpyDeviceToDevice, stream_),
+               "feature capture", error_msg)) {
+      return false;
+    }
   }
   // Prefill catches up immediately from shared scratch. Only the short tail
   // needed across calls belongs to this session.
