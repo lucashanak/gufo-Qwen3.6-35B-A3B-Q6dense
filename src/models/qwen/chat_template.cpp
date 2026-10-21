@@ -93,7 +93,11 @@ bool IsQwen36Template(std::string_view value) {
          // Local patch: Ornith-1.5-35B (Qwen3.6 fine-tune). Same wire format as
          // the official template; only merges a second system/developer turn.
          hash ==
-             "f55f52930aa8bf44ab5cb85f99370fcc3c56e9a85640b812086d5330bce5d86b";
+             "f55f52930aa8bf44ab5cb85f99370fcc3c56e9a85640b812086d5330bce5d86b" ||
+         // Ornith-1.5-122B: the official template with every turn's
+         // reasoning kept (serve it with --preserve-thinking on).
+         hash ==
+             "8b4d21a1e70ccbc8849e5e5e6dd32f3acfb2e2060739475909edc6e9b27c7165";
 }
 
 bool IsQwen36Artifact(const core::GgufReader& reader) {
