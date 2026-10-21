@@ -135,10 +135,14 @@ struct Binder {
           Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, dense);
       l.ssm_conv1d = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
                          c.SsmConvChannels(), 1, norm);
-      l.ssm_alpha = Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1,
-                        {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0});
-      l.ssm_beta = Get(p + "ssm_beta.weight", hidden, c.ssm_num_v_heads, 1,
-                       {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0});
+      // K-quants (122B GGUFs) are widened to F16 at upload.
+      const auto gdn_gates = {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0,
+                              GgmlType::kQ4_K, GgmlType::kQ5_K,
+                              GgmlType::kQ6_K};
+      l.ssm_alpha =
+          Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1, gdn_gates);
+      l.ssm_beta =
+          Get(p + "ssm_beta.weight", hidden, c.ssm_num_v_heads, 1, gdn_gates);
       l.ssm_dt = Get(p + "ssm_dt.bias", c.ssm_num_v_heads, 1, 1, norm);
       l.ssm_a = Get(p + "ssm_a", c.ssm_num_v_heads, 1, 1, norm);
       l.ssm_norm = Get(p + "ssm_norm.weight", c.ssm_head_dim, 1, 1, norm);
