@@ -239,6 +239,8 @@ void Session::Reset() {
 }
 
 Executor::~Executor() {
+  for (void* p : kv_half_allocations_)
+    (void)hipFree(p);
   (void)hipFree(batch_logits_);
   (void)hipFree(verification_penalties_);
   (void)hipHostFree(batch_gdn_host_);
@@ -468,15 +470,22 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
                                   c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t kv_elems = static_cast<std::size_t>(max_context) * kv_row;
+  if (kv_half_elems_ < kv_elems) {
+    kv_half_k_ = Alloc<__half>(kv_half_allocations_, kv_elems, error_msg);
+    kv_half_v_ = Alloc<__half>(kv_half_allocations_, kv_elems, error_msg);
+    if (kv_half_k_ == nullptr || kv_half_v_ == nullptr)
+      return nullptr;
+    kv_half_elems_ = kv_elems;
+  }
   const auto AllocKv = [&](auto& kv) {
-    kv.k_cache = Alloc<__half>(a, kv_elems, error_msg, &s->allocated_bytes_);
-    kv.v_cache = Alloc<__half>(a, kv_elems, error_msg, &s->allocated_bytes_);
+    kv.k_cache = kv_half_k_;
+    kv.v_cache = kv_half_v_;
     kv.k_q8 = Alloc<std::int8_t>(a, kv_elems, error_msg, &s->allocated_bytes_);
     kv.v_q8 = Alloc<std::int8_t>(a, kv_elems, error_msg, &s->allocated_bytes_);
     kv.k_scale =
-        Alloc<__half>(a, kv_elems / 32, error_msg, &s->allocated_bytes_);
+        Alloc<__half>(a, kv_elems / 16, error_msg, &s->allocated_bytes_);
     kv.v_scale =
-        Alloc<__half>(a, kv_elems / 32, error_msg, &s->allocated_bytes_);
+        Alloc<__half>(a, kv_elems / 16, error_msg, &s->allocated_bytes_);
   };
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     if (c.IsLinearLayer(il)) {
@@ -558,12 +567,11 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
   const std::size_t state =
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
-  // F16 K and V for prefill plus the 8-bit copies decode reads (one F16
-  // scale per 32 values).
+  // The 8-bit K and V caches (one F16 scale per 16 values); the F16 staging
+  // pair is shared by the executor, not owned by a session.
   const std::size_t kv_elems = std::size_t{max_context} * c.AttentionKvDim();
   const std::size_t kv =
-      2 * (kv_elems * sizeof(__half) + kv_elems * sizeof(std::int8_t) +
-           kv_elems / 32 * sizeof(__half));
+      2 * (kv_elems * sizeof(std::int8_t) + kv_elems / 16 * sizeof(__half));
   const auto rollback_state =
       rollback_depth == 0
           ? 0
@@ -1227,6 +1235,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     return false;
   }
   if (MatrixRows(n_tokens)) {
+    // Only the Q8 cache persists: widen the prefix the kernel reads.
+    DequantizeKv(s.k_q8, s.k_scale, s.k_cache, start_pos, kv_row, stream_);
+    DequantizeKv(s.v_q8, s.v_scale, s.v_cache, start_pos, kv_row, stream_);
     if (!WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, s_.ctx,
                              n_tokens, start_pos, c.num_heads, c.num_kv_heads,
                              c.head_dim, stream_, last_only)) {
@@ -1855,15 +1866,13 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
-      if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache") ||
-          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache") ||
-          !region(at != nullptr ? at->k_q8 : nullptr, kv_bytes / 2,
+      if (!region(at != nullptr ? at->k_q8 : nullptr, kv_bytes / 2,
                   "8-bit K cache") ||
           !region(at != nullptr ? at->v_q8 : nullptr, kv_bytes / 2,
                   "8-bit V cache") ||
-          !region(at != nullptr ? at->k_scale : nullptr, kv_bytes / 32,
+          !region(at != nullptr ? at->k_scale : nullptr, kv_bytes / 16,
                   "K cache scales") ||
-          !region(at != nullptr ? at->v_scale : nullptr, kv_bytes / 32,
+          !region(at != nullptr ? at->v_scale : nullptr, kv_bytes / 16,
                   "V cache scales")) {
         return 0;
       }
@@ -1873,17 +1882,13 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
     const auto* mtp = session != nullptr ? &session->mtp_ : nullptr;
     const std::uint64_t mtp_kv_bytes =
         std::uint64_t{h.mtp_position} * h.kv_row * sizeof(__half);
-    if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_kv_bytes,
-                "draft K cache") ||
-        !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_kv_bytes,
-                "draft V cache") ||
-        !region(mtp != nullptr ? mtp->k_q8 : nullptr, mtp_kv_bytes / 2,
+    if (!region(mtp != nullptr ? mtp->k_q8 : nullptr, mtp_kv_bytes / 2,
                 "draft 8-bit K cache") ||
         !region(mtp != nullptr ? mtp->v_q8 : nullptr, mtp_kv_bytes / 2,
                 "draft 8-bit V cache") ||
-        !region(mtp != nullptr ? mtp->k_scale : nullptr, mtp_kv_bytes / 32,
+        !region(mtp != nullptr ? mtp->k_scale : nullptr, mtp_kv_bytes / 16,
                 "draft K cache scales") ||
-        !region(mtp != nullptr ? mtp->v_scale : nullptr, mtp_kv_bytes / 32,
+        !region(mtp != nullptr ? mtp->v_scale : nullptr, mtp_kv_bytes / 16,
                 "draft V cache scales") ||
         !region(
             mtp != nullptr ? mtp->h : nullptr,

@@ -79,7 +79,7 @@ private:
     /// F16 caches the wide prefill kernels read.
     std::int8_t* k_q8{nullptr};
     std::int8_t* v_q8{nullptr};
-    __half* k_scale{nullptr};  ///< [max_context][kv_heads*d/32]
+    __half* k_scale{nullptr};  ///< [max_context][kv_heads*d/16]
     __half* v_scale{nullptr};
     /// The draft block's cache: its attention never decides a committed
     /// token, so narrow rows may use a split count of their own.
@@ -473,6 +473,14 @@ private:
     float* mtp_scores;
   };
   mutable Scratch s_{};
+  /// Executor-wide F16 K/V staging shared by every session and layer: fresh
+  /// rows land here before QuantizeKv, and wide attention widens the Q8
+  /// prefix back into it. Larger sessions get a larger pair; older pairs stay
+  /// allocated for the sessions that hold them.
+  mutable __half* kv_half_k_{nullptr};
+  mutable __half* kv_half_v_{nullptr};
+  mutable std::size_t kv_half_elems_{0};
+  mutable std::vector<void*> kv_half_allocations_;
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;
