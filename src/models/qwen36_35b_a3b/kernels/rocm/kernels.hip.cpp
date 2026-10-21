@@ -18,9 +18,10 @@ namespace gufo::models::qwen36_35b_a3b::rocm {
 namespace {
 
 constexpr unsigned kThreads = 256;
-// Rows a fused projection + residual norm serves; its last block norms them
-// one after another, which loses to the parallel norm launch past this.
-constexpr unsigned kAddNormFusedRows = 2;
+// Rows the last-block fusions (router + top-k, projection + residual norm)
+// serve: the last block handles them one after another, which loses to the
+// parallel per-row launch past this.
+constexpr unsigned kLastBlockFusedRows = 2;
 
 __device__ __forceinline__ float SigmoidF(float x) {
   return 1.0f / (1.0f + __expf(-x));
@@ -3714,7 +3715,7 @@ bool DenseQ6KVecAddNorm(const void* w, const float* x, float* y,
                         std::uint32_t k, float* res, const float* gamma,
                         float* out, float eps, std::uint32_t* done,
                         hipStream_t stream) {
-  if (tokens == 0 || tokens > kAddNormFusedRows || k % 512 != 0 ||
+  if (tokens == 0 || tokens > kLastBlockFusedRows || k % 512 != 0 ||
       gamma == nullptr)
     return false;
   const auto* wb = static_cast<const std::uint8_t*>(w);
@@ -5313,7 +5314,8 @@ bool RouterGemmTopKF16(const void* w, const float* x, float* logits,
                        std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                        std::uint32_t n_experts, std::uint32_t used,
                        hipStream_t stream) {
-  if (n_tokens == 0 || n_tokens > 8 || !SmallGemmSplitF16(m, k) ||
+  if (n_tokens == 0 || n_tokens > kLastBlockFusedRows ||
+      !SmallGemmSplitF16(m, k) ||
       n_experts > 512 || n_experts >= m || used > 32 || kThreads != 256)
     return false;
   const auto* h = static_cast<const __half*>(w);
@@ -5326,12 +5328,6 @@ bool RouterGemmTopKF16(const void* w, const float* x, float* logits,
     return true;
     GUFO_ROUTER_TOPK(1)
     GUFO_ROUTER_TOPK(2)
-    GUFO_ROUTER_TOPK(3)
-    GUFO_ROUTER_TOPK(4)
-    GUFO_ROUTER_TOPK(5)
-    GUFO_ROUTER_TOPK(6)
-    GUFO_ROUTER_TOPK(7)
-    GUFO_ROUTER_TOPK(8)
 #undef GUFO_ROUTER_TOPK
   }
   return false;
