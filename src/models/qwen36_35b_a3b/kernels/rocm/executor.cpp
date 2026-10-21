@@ -1236,9 +1236,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     return false;
   }
   if (MatrixRows(n_tokens)) {
-    // Only the Q8 cache persists: widen the prefix the kernel reads.
-    DequantizeKv(s.k_q8, s.k_scale, s.k_cache, start_pos, kv_row, stream_);
-    DequantizeKv(s.v_q8, s.v_scale, s.v_cache, start_pos, kv_row, stream_);
+    // Only the Q8 cache persists: widen it back, this chunk's rows included,
+    // so every row reads the values decode reads and the result does not
+    // depend on where the scheduler split the prompt.
+    DequantizeKv(s.k_q8, s.k_scale, s.k_cache, start_pos + n_tokens, kv_row,
+                 stream_);
+    DequantizeKv(s.v_q8, s.v_scale, s.v_cache, start_pos + n_tokens, kv_row,
+                 stream_);
     if (!WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, s_.ctx,
                              n_tokens, start_pos, c.num_heads, c.num_kv_heads,
                              c.head_dim, stream_, last_only)) {
