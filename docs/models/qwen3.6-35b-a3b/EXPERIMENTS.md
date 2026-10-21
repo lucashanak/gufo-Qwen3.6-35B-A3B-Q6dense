@@ -25,3 +25,4 @@ kept only changes that repeated across runs. Exactness gates (operator tests,
 | In-kernel MoE grouping, 4-pair grouped blocks, 64-token Q5_K down tiles | Rejected: slower. |
 | Transposed int8 V, double-buffered K/V prefetch, 128 splits for every row | Rejected: no gain. |
 | Fused F16 norm output | Rejected: slower than the F32 path. |
+| Last-block fusion of the decode router with top-k, and of the Q6_K output projection with the residual norm | Rejected: byte-identical, but the last block runs every row's top-k/norm in turn. One row was within noise (C1 AR −0.4…+1.2 %, MTP C1 −0.6 %); two rows lost 11 % (AR C2) and 17 % (MTP C2), as the per-row parallel launch wins from the second row. Branch `fuse-router`. |
