@@ -3,6 +3,7 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <hipcub/block/block_radix_sort.hpp>
@@ -2482,12 +2483,9 @@ inline unsigned Blocks(std::size_t count) {
   return static_cast<unsigned>((count + kThreads - 1) / kThreads);
 }
 
-// Prefill attention geometry: 16 x 256 query heads over two KV heads.
+// Prefill attention geometry: 16 or 32 query heads of 256 over two KV heads.
 constexpr std::uint32_t kWmmaHeadDim = 256;
-constexpr std::uint32_t kWmmaQueryHeads = 16;
 constexpr std::uint32_t kWmmaKvHeads = 2;
-constexpr std::uint32_t kWmmaGqa = kWmmaQueryHeads / kWmmaKvHeads;
-constexpr std::uint32_t kWmmaAttnWidth = kWmmaQueryHeads * kWmmaHeadDim;
 constexpr std::uint32_t kWmmaKvWidth = kWmmaKvHeads * kWmmaHeadDim;
 // A prefill block owns 16 queries of four heads of one KV group (21.9
 // TFLOPS at 18K depth against 18.2 with two heads; 32-key rounds of four
@@ -4810,26 +4808,33 @@ bool GqaDecodeAttention(const float* q, const KvQ8& kv, float* out,
                         std::uint32_t n_tokens, const std::uint32_t* start_pos,
                         std::uint32_t heads, std::uint32_t kv_heads,
                         std::uint32_t d, hipStream_t stream) {
+  const std::uint32_t group = kv_heads == 0 ? 0 : heads / kv_heads;
   if (d != kGqaDim || kv_heads == 0 || heads % kv_heads != 0 ||
-      heads / kv_heads != 8 || n_tokens == 0 || n_tokens > 8 || splits == 0) {
+      (group != 8 && group != 16) || n_tokens == 0 || n_tokens > 8 ||
+      splits == 0) {
     return false;
   }
   const dim3 grid(kv_heads, splits);
   // Pair capacity rounds the batch up; every row keeps its own arithmetic
   // in the one WMMA kernel family, so verification matches decoding.
-  // Up to eight rows read each K/V tile once.
-  if (n_tokens <= 2) {
-    hipLaunchKernelGGL(GqaDecodeAttentionWmmaKernel<1>, grid, dim3(256), 0,
-                       stream, q, kv.k, kv.v, kv.k_scale, kv.v_scale, partials,
-                       start_pos, n_tokens, heads, kv_heads, 0u);
-  } else if (n_tokens <= 4) {
-    hipLaunchKernelGGL(GqaDecodeAttentionWmmaKernel<2>, grid, dim3(256), 0,
-                       stream, q, kv.k, kv.v, kv.k_scale, kv.v_scale, partials,
-                       start_pos, n_tokens, heads, kv_heads, 0u);
-  } else {
-    hipLaunchKernelGGL(GqaDecodeAttentionWmmaKernel<4>, grid, dim3(256), 0,
-                       stream, q, kv.k, kv.v, kv.k_scale, kv.v_scale, partials,
-                       start_pos, n_tokens, heads, kv_heads, 0u);
+  // A launch holds 64 (row, head) pairs: eight rows of a group of eight read
+  // each K/V tile once, a group of sixteen takes two launches past four rows.
+  const std::uint32_t pairs = n_tokens * group;
+  for (std::uint32_t row = 0; row < n_tokens; row += 64 / group) {
+    const std::uint32_t live = std::min(pairs - row * group, 64u);
+    if (live <= 16) {
+      hipLaunchKernelGGL(GqaDecodeAttentionWmmaKernel<1>, grid, dim3(256), 0,
+                         stream, q, kv.k, kv.v, kv.k_scale, kv.v_scale,
+                         partials, start_pos, n_tokens, heads, kv_heads, row);
+    } else if (live <= 32) {
+      hipLaunchKernelGGL(GqaDecodeAttentionWmmaKernel<2>, grid, dim3(256), 0,
+                         stream, q, kv.k, kv.v, kv.k_scale, kv.v_scale,
+                         partials, start_pos, n_tokens, heads, kv_heads, row);
+    } else {
+      hipLaunchKernelGGL(GqaDecodeAttentionWmmaKernel<4>, grid, dim3(256), 0,
+                         stream, q, kv.k, kv.v, kv.k_scale, kv.v_scale,
+                         partials, start_pos, n_tokens, heads, kv_heads, row);
+    }
   }
   hipLaunchKernelGGL(AttentionMergeKernel, dim3(heads, n_tokens),
                      dim3(kThreads), 0, stream, partials, out, heads, d,
@@ -4837,7 +4842,7 @@ bool GqaDecodeAttention(const float* q, const KvQ8& kv, float* out,
   return true;
 }
 
-/// Dense causal prefill attention for 16 query heads over two KV heads,
+/// Dense causal prefill attention for 16 or 32 query heads over two KV heads,
 /// head dim 256, on the WMMA cores. A block owns 16 queries x kRowBlocks
 /// heads (one 16-row block each) and sweeps kKeys keys per round: the S
 /// tiles (row block x 16-key block) are split over the eight waves along the
@@ -4848,13 +4853,16 @@ bool GqaDecodeAttention(const float* q, const KvQ8& kv, float* out,
 /// aligned to absolute positions and each (row, round) pair picks its PV
 /// arithmetic from those positions alone, so results do not depend on the
 /// prefill chunking. Measured fastest with 16-key rounds.
-template<std::uint32_t kKeys, std::uint32_t kRowBlocks>
+template<std::uint32_t kKeys, std::uint32_t kRowBlocks,
+         std::uint32_t kQueryHeads>
 __launch_bounds__(256, 2) __global__ void DenseCausalAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
     float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
     std::uint32_t first_query_group) {
   constexpr std::uint32_t kD = kWmmaHeadDim;
+  constexpr std::uint32_t kGqa = kQueryHeads / kWmmaKvHeads;
+  constexpr std::uint32_t kAttnWidth = kQueryHeads * kWmmaHeadDim;
   constexpr std::uint32_t kRows = 16 * kRowBlocks;
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
   constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
@@ -4877,9 +4885,9 @@ __launch_bounds__(256, 2) __global__ void DenseCausalAttentionKernel(
   const std::uint32_t half_id = lane >> 4u;
 
   const std::uint32_t query_start = (first_query_group + blockIdx.x) * 16;
-  const std::uint32_t kv_head = blockIdx.y / (kWmmaGqa / kRowBlocks);
+  const std::uint32_t kv_head = blockIdx.y / (kGqa / kRowBlocks);
   const std::uint32_t first_head =
-      kv_head * kWmmaGqa + (blockIdx.y % (kWmmaGqa / kRowBlocks)) * kRowBlocks;
+      kv_head * kGqa + (blockIdx.y % (kGqa / kRowBlocks)) * kRowBlocks;
   constexpr float kScale = 1.0F / 16.0F;
 
   constexpr std::uint32_t kKvHalves =
@@ -4900,7 +4908,7 @@ __launch_bounds__(256, 2) __global__ void DenseCausalAttentionKernel(
     const std::uint32_t query = query_start + sub;
     const bool live = query < n_tokens;
     const float* q_row =
-        q + static_cast<std::size_t>(live ? query : 0) * kWmmaAttnWidth +
+        q + static_cast<std::size_t>(live ? query : 0) * kAttnWidth +
         static_cast<std::size_t>(first_head + s_rb) * kD;
 #pragma unroll
     for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
@@ -5119,7 +5127,7 @@ __launch_bounds__(256, 2) __global__ void DenseCausalAttentionKernel(
           continue;
         const float denominator = row_sum[rb * 16 + row];
         const std::size_t offset =
-            static_cast<std::size_t>(query) * kWmmaAttnWidth +
+            static_cast<std::size_t>(query) * kAttnWidth +
             static_cast<std::size_t>(first_head + rb) * kD + dim_tile * 16 +
             sub;
         float value = denominator > 0.0F ? o_acc[rb][t][i] / denominator : 0.0F;
@@ -5137,7 +5145,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
                          hipStream_t stream, bool last_only) {
-  if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
+  if ((heads != 16 && heads != 32) || kv_heads != kWmmaKvHeads ||
       d != kWmmaHeadDim || n_tokens == 0) {
     return false;
   }
@@ -5145,10 +5153,16 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       last_only ? (n_tokens - 1) / kWmmaQueryRows : 0;
   const dim3 grid(
       (n_tokens + kWmmaQueryRows - 1) / kWmmaQueryRows - first_group,
-      kWmmaKvHeads * (kWmmaGqa / kWmmaHeads));
-  hipLaunchKernelGGL((DenseCausalAttentionKernel<16, kWmmaHeads>), grid,
-                     dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, out,
-                     start_pos, n_tokens, first_group);
+      heads / kWmmaHeads);
+  if (heads == 16) {
+    hipLaunchKernelGGL((DenseCausalAttentionKernel<16, kWmmaHeads, 16>), grid,
+                       dim3(kThreads), 0, stream, q, gate, k_cache, v_cache,
+                       out, start_pos, n_tokens, first_group);
+  } else {
+    hipLaunchKernelGGL((DenseCausalAttentionKernel<16, kWmmaHeads, 32>), grid,
+                       dim3(kThreads), 0, stream, q, gate, k_cache, v_cache,
+                       out, start_pos, n_tokens, first_group);
+  }
   return true;
 }
 

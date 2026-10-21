@@ -313,8 +313,9 @@ void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
              hipStream_t stream);
 
-/// Decode attention for 1-8 rows over GQA groups of eight query heads: each
-/// K/V tile is read once per (KV head, split). `partials` holds n_tokens *
+/// Decode attention for 1-8 rows over GQA groups of eight or sixteen query
+/// heads: each K/V tile is read once per (KV head, split) and 64 (row, head)
+/// pairs. `partials` holds n_tokens *
 /// heads * splits * (d + 2) floats. Row results are independent of the batch
 /// size. Returns false, launching nothing, for unsupported geometry.
 /// The 8-bit copy of a K/V cache that decode attention reads: values
@@ -345,7 +346,7 @@ bool GqaDecodeAttention(const float* q, const KvQ8& kv, float* out,
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. Returns false,
-/// launching nothing, when the geometry is not the model's 16 x 256 heads
+/// launching nothing, unless the geometry is 16 or 32 query heads of 256
 /// over two KV heads. `last_only` computes only the final query tile,
 /// retaining its key sweep and leaving earlier output rows untouched.
 bool WmmaCausalAttention(const float* q, const float* gate,
