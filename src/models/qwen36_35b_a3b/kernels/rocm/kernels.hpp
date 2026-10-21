@@ -318,14 +318,19 @@ void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
 /// heads * splits * (d + 2) floats. Row results are independent of the batch
 /// size. Returns false, launching nothing, for unsupported geometry.
 /// The 8-bit copy of a K/V cache that decode attention reads: values
-/// [context][kv_heads * d] with one F16 scale per 32 ([context][kv_heads *
-/// d / 32]), Q8_0-style (round to nearest, scale = max |x| / 127).
+/// [context][kv_heads * d] with one F16 scale per 16 ([context][kv_heads *
+/// d / 16]), Q8_0-style (round to nearest, scale = max |x| / 127).
 struct KvQ8 {
   const std::int8_t* k{nullptr};
   const std::int8_t* v{nullptr};
   const __half* k_scale{nullptr};
   const __half* v_scale{nullptr};
 };
+
+/// Widens 8-bit cache rows [0, n_rows) back to F16 (the inverse of QuantizeKv).
+void DequantizeKv(const std::int8_t* values, const __half* scales,
+                  __half* cache, std::uint32_t n_rows, std::uint32_t kv_row,
+                  hipStream_t stream);
 
 /// Writes the 8-bit copy of cache rows [*start_pos, *start_pos + n_tokens).
 void QuantizeKv(const __half* cache, std::int8_t* values, __half* scales,
