@@ -1121,8 +1121,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
     stats_.dflash_accepted += keep - 1;
   } else if (pending.suffix) {
     stats_.suffix_cycles += 1;
-    stats_.suffix_drafted += k - 1;
-    stats_.suffix_accepted += keep - 1;
+    stats_.lookup += k - 1;
+    stats_.lookup_accepted += keep - 1;
     if ((keep - 1) * 2 < k - 1)
       suffix_cooldown_until_ = base + keep + 32;
   } else {
