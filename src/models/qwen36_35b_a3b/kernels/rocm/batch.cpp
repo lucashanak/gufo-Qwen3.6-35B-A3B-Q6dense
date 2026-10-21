@@ -823,6 +823,17 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
               il + 1 < c.num_layers ? layers[il + 1].attn_norm.f32()
                                     : model_->output_norm().f32(),
               rows);
+      if (feat_dev_ != nullptr && feat_tap_of_layer_[il] >= 0 &&
+          !Check(hipMemcpy2DAsync(
+                     feat_dev_ + static_cast<std::size_t>(feat_tap_of_layer_[il]) *
+                                     c.hidden_size,
+                     std::size_t{feat_width_} * sizeof(float), base.res,
+                     std::size_t{c.hidden_size} * sizeof(float),
+                     std::size_t{c.hidden_size} * sizeof(float), rows,
+                     hipMemcpyDeviceToDevice, stream_),
+                 error)) {
+        return false;
+      }
     }
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());

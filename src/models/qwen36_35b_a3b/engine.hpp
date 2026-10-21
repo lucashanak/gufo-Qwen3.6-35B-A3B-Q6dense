@@ -16,6 +16,7 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen36_35b_a3b/config.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen36_35b_a3b/lookup_draft.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_policy.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_sampling.hpp"
@@ -105,6 +106,9 @@ private:
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
+  /// Optional DFlash2 draft (GUFO_Q36_DFLASH) and its private GGUF-layout head.
+  std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
+  void* dflash_head_{nullptr};
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
 
@@ -181,7 +185,10 @@ public:
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
-  void ResetDraftPolicy() noexcept { draft_length_.Reset(); }
+  void ResetDraftPolicy() noexcept {
+    draft_length_.Reset();
+    ResetDraftRates();
+  }
 
   struct SpeculativeStats {
     std::uint64_t cycles{0};
@@ -191,6 +198,9 @@ public:
     std::uint64_t suffix_cycles{0};
     std::uint64_t suffix_drafted{0};
     std::uint64_t suffix_accepted{0};
+    std::uint64_t dflash_cycles{0};
+    std::uint64_t dflash_drafted{0};
+    std::uint64_t dflash_accepted{0};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
@@ -258,6 +268,29 @@ private:
   std::size_t suffix_cooldown_until_{0};
   void SyncLookup();
   SpeculativeStats stats_;
+  /// DFlash2 draft. Committed target features go to a device ring holding
+  /// the last `ring_rows_` positions; the draft context catches up from it only
+  /// before a DFlash cycle, so MTP cycles pay a device copy and nothing else.
+  std::unique_ptr<hip::QwenDFlashGpuExecutor> dflash_;
+  float* ring_{nullptr};
+  std::uint32_t ring_rows_{0};
+  std::uint32_t ring_begin_{0};  ///< first position held contiguously
+  std::uint32_t ring_end_{0};    ///< next position to be written
+  bool features_fresh_{false};   ///< feature rows of the last Forward are ours
+  std::uint32_t feature_row_offset_{0};  ///< our first row in that Forward
+  /// Committed tokens and seconds of single-session cycles per draft source.
+  float dfl_tokens_{0.0F}, dfl_seconds_{0.0F}, mtp_tokens_{0.0F}, mtp_seconds_{0.0F};
+  std::uint32_t dfl_cycles_{0}, mtp_cycles_{0}, draft_cycles_{0};
+  float catchup_seconds_{0.0F};
+  [[nodiscard]] bool PreferDFlash() const noexcept;
+  void ResetDraftRates() noexcept;
+  bool EnsureDFlashContext();
+  void ResetRing(std::uint32_t position) noexcept {
+    ring_begin_ = position;
+    ring_end_ = position;
+  }
+  void InjectFeatures(std::uint32_t position, std::uint32_t rows,
+                      std::uint32_t end);
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
       std::size_t token_count) const;

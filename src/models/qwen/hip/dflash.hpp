@@ -96,6 +96,14 @@ public:
       std::shared_ptr<const QwenGpuModel> target_model,
       std::string* error_msg = nullptr);
 
+  /// Binds a draft to a target that is not a QwenGpuModel: its config and the
+  /// device copies of its token embedding and (GGUF-layout) output head.
+  [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> CreateForTarget(
+      std::shared_ptr<const core::GgufReader> dflash_reader,
+      const core::ModelConfig& target_config,
+      models::QwenTensorRef token_embedding, models::QwenTensorRef output,
+      std::string* error_msg = nullptr);
+
   [[nodiscard]] const speculative::QwenDFlashWeights& GetWeights()
       const noexcept {
     return weights_;
@@ -140,6 +148,17 @@ public:
       std::uint32_t max_context = 4096, std::string* error_msg = nullptr);
 
   void Reset() noexcept;
+
+  /// Advances the injected context over rows that would fall outside the
+  /// attention window anyway, without their features.
+  bool SkipTargetContext(std::uint32_t position, std::uint32_t num_tokens);
+
+  /// InjectTargetContext from device memory: `device_features` holds
+  /// num_tokens rows of GetTargetFeaturesSize() floats, written by a stream
+  /// that has completed.
+  bool InjectTargetContextDevice(const float* device_features,
+                                 std::uint32_t position,
+                                 std::uint32_t num_tokens);
 
   /// Ingests target multi-layer hidden states and injects K/V into the draft
   /// cache.
@@ -197,7 +216,8 @@ private:
   bool InjectTargetContextChunk(std::span<const float> target_features,
                                 std::uint32_t position,
                                 std::uint32_t num_tokens,
-                                const DFlashTrace& trace);
+                                const DFlashTrace& trace,
+                                bool device_source = false);
   void Allocate();
   void Free() noexcept;
   [[nodiscard]] static std::size_t BatchScratchBytes(
