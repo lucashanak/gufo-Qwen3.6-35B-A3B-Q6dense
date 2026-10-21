@@ -72,7 +72,7 @@ bool DenseQ45KVec(unsigned bits, const void* w, const float* x, float* y,
 /// all scales, all d) in place, the layout DenseQ6KVec reads. Synchronous.
 bool RepackQ6KRows(void* w, std::uint32_t rows, std::uint32_t k);
 
-/// DenseQ6KVec for one or two decode rows fused with AddRmsNormRows over
+/// DenseQ6KVec for one decode row fused with AddRmsNormRows over
 /// its output (res += y; out = rmsnorm(res) * gamma), both in their own
 /// arithmetic: the last block to finish runs the norms. `done` must start
 /// at zero and is left at zero. False, launching nothing, for other shapes.
@@ -378,7 +378,7 @@ void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 std::uint32_t k, hipStream_t stream);
 
 /// The F16 router projection (SmallGemm's split-K arithmetic) and
-/// RouterTopK fused into one launch for one or two token rows: the last block
+/// RouterTopK fused into one launch for a single token row: the last block
 /// to finish selects every row's experts. `logits` receives the projection as
 /// SmallGemm writes it. `done` is a device counter that must start at zero
 /// and is left at zero. Returns false, launching nothing, for other shapes.

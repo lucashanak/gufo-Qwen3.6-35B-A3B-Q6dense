@@ -19,9 +19,9 @@ namespace {
 
 constexpr unsigned kThreads = 256;
 // Rows the last-block fusions (router + top-k, projection + residual norm)
-// serve: the last block handles them one after another, which loses to the
-// parallel per-row launch past this.
-constexpr unsigned kLastBlockFusedRows = 2;
+// serve: the last block handles them one after another, which already lost
+// to the parallel per-row launch at two rows (C2 decode -11 %).
+constexpr unsigned kLastBlockFusedRows = 1;
 
 __device__ __forceinline__ float SigmoidF(float x) {
   return 1.0f / (1.0f + __expf(-x));
@@ -3739,7 +3739,6 @@ bool DenseQ6KVecAddNorm(const void* w, const float* x, float* y,
                          done);                                                \
     break;
     Q6K_NORM_CASE(1)
-    Q6K_NORM_CASE(2)
 #undef Q6K_NORM_CASE
     default:
       return false;
@@ -5331,7 +5330,6 @@ bool RouterGemmTopKF16(const void* w, const float* x, float* logits,
                        n_experts, used);                                 \
     return true;
     GUFO_ROUTER_TOPK(1)
-    GUFO_ROUTER_TOPK(2)
 #undef GUFO_ROUTER_TOPK
   }
   return false;

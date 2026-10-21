@@ -378,7 +378,7 @@ private:
   /// the next sub-block's RMSNorm of the updated residual into s_.xn.
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens) const;
   /// A mixer's output projection into s_.block_out followed by Combine:
-  /// one or two decode rows of a Q6_K projection fuse with the residual
+  /// a single decode row of a Q6_K projection fuses with the residual
   /// norm; anything else runs Dense (DenseBatch with `batch`) and Combine.
   bool ProjectCombine(const DeviceTensor& w, const float* x, float* res,
                       const float* gamma, std::uint32_t n_tokens, bool batch,
