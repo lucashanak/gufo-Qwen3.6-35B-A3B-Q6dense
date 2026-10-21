@@ -383,5 +383,56 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
   }
 }
 
+std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::CreateForTarget(
+    std::shared_ptr<const core::GgufReader> dflash_reader,
+    const core::ModelConfig& target_config,
+    models::QwenTensorRef token_embedding, models::QwenTensorRef output,
+    std::string* error_msg) {
+  if (dflash_reader == nullptr || token_embedding.empty() || output.empty()) {
+    if (error_msg != nullptr)
+      *error_msg = "DFlash reader and target embedding/head are required";
+    return nullptr;
+  }
+  auto raw_weights =
+      speculative::QwenDFlashWeights::LoadFromGguf(*dflash_reader, error_msg);
+  if (!raw_weights.has_value())
+    return nullptr;
+  const auto& draft_config = raw_weights->config;
+  if (target_config.hidden_size != draft_config.hidden_size ||
+      target_config.vocab_size != draft_config.vocab_size) {
+    if (error_msg != nullptr)
+      *error_msg = "DFlash-2 target hidden/vocabulary dimensions do not match the draft";
+    return nullptr;
+  }
+  if (raw_weights->dflash_config.target_layer_ids.empty() ||
+      raw_weights->dflash_config.target_layer_ids.back() >=
+          target_config.num_layers) {
+    if (error_msg != nullptr)
+      *error_msg = "DFlash-2 target layer taps exceed the target model layer count";
+    return nullptr;
+  }
+  std::vector<void*> allocations;
+  std::size_t packed_bytes = 0;
+  try {
+    speculative::QwenDFlashWeights weights = *raw_weights;
+    for (const auto& region : dflash_reader->GetMappedRegions())
+      core::PrefaultMappedRange(region.data, region.size);
+    PackDFlashWeights(weights, allocations, packed_bytes);
+    weights.token_embedding = token_embedding;
+    weights.output = output;
+    return std::shared_ptr<const QwenDFlashGpuModel>(new QwenDFlashGpuModel(
+        std::move(dflash_reader), nullptr, std::move(weights),
+        std::move(allocations), packed_bytes));
+  } catch (const std::exception& ex) {
+    for (void* ptr : allocations) {
+      if (ptr != nullptr)
+        (void)hipFree(ptr);
+    }
+    if (error_msg != nullptr)
+      *error_msg = ex.what();
+    return nullptr;
+  }
+}
+
 }  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

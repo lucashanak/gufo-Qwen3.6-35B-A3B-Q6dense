@@ -152,6 +152,22 @@ public:
       const DeviceModel& model, Options options,
       std::string* error_msg = nullptr);
 
+  /// Captures the residual after `layers` (in order) on every trunk Forward.
+  /// Call before the first Forward so captured graphs include the copies.
+  bool ConfigureFeatureTaps(std::span<const std::uint32_t> layers,
+                            std::string* error_msg = nullptr) const;
+  /// Copies rows [first, first + rows) of the latest Forward's features.
+  bool DownloadFeatures(std::uint32_t first, std::uint32_t rows, float* host,
+                        std::string* error_msg = nullptr) const;
+  [[nodiscard]] std::uint32_t FeatureWidth() const noexcept { return feat_width_; }
+  [[nodiscard]] const float* FeatureRows(std::uint32_t first) const noexcept {
+    return feat_dev_ + std::size_t{first} * feat_width_;
+  }
+  /// Queues a device copy of feature rows on the executor stream.
+  bool CopyFeatures(std::uint32_t first, std::uint32_t rows, float* dst,
+                    std::string* error_msg = nullptr) const;
+  /// Waits for the executor stream (queued feature copies included).
+  bool SyncStream(std::string* error_msg = nullptr) const;
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       core::SessionMode mode, std::uint32_t max_context,
       std::string* error_msg = nullptr) const;
@@ -473,6 +489,11 @@ private:
     float* mtp_scores;
   };
   mutable Scratch s_{};
+  /// Target-feature capture for a DFlash draft: the residual after each
+  /// tapped layer, rows of the latest trunk Forward, [row][tap * hidden].
+  mutable std::vector<std::int32_t> feat_tap_of_layer_;
+  mutable float* feat_dev_{nullptr};
+  mutable std::uint32_t feat_width_{0};
   /// Executor-wide F16 K/V staging shared by every session and layer: fresh
   /// rows land here before QuantizeKv, and wide attention widens the Q8
   /// prefix back into it. Larger sessions get a larger pair; older pairs stay
