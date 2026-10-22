@@ -771,6 +771,8 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
 }
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_Q3_K>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q5_1>(
