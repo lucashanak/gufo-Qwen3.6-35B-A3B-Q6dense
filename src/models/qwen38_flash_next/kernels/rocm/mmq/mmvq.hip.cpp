@@ -348,6 +348,95 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
     }
 }
 
+/// A dense K-quant projection for 1-8 tokens: every wave computes its rows for
+/// all tokens, so the weights are read from memory once and from cache for
+/// the later tokens. Each token's sum follows mul_mat_vec_q_moe's lane and
+/// block order, so a row's result does not depend on the batch width.
+template<ggml_type type, int c_rows_per_block, int tokens>
+__launch_bounds__(32, 1) static __global__
+    void mul_mat_vec_dense_kq(const void* __restrict__ vx,
+                              const void* __restrict__ vy,
+                              float* __restrict__ dst, const uint32_t ncols_x,
+                              const uint32_t nrows_x,
+                              const uint32_t stride_row_x,
+                              const uint32_t stride_col_y,
+                              const uint32_t stride_col_dst) {
+  constexpr int qk = ggml_hip_type_traits<type>::qk;
+  constexpr int qi = ggml_hip_type_traits<type>::qi;
+  constexpr int vdr = get_vdr_mmvq(type);
+  constexpr int warp_size = 32;
+  constexpr vec_dot_q_hip_t vec_dot_q_hip = get_vec_dot_q_hip(type);
+  const int row0 = c_rows_per_block * blockIdx.x;
+  const int blocks_per_row_x = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * warp_size / qi;
+  const block_q8_1* y = (const block_q8_1*)vy;
+  uint32_t row_offsets[c_rows_per_block];
+#pragma unroll
+  for (int i = 0; i < c_rows_per_block; ++i)
+    row_offsets[i] = min(uint32_t(row0 + i), nrows_x - 1) * stride_row_x;
+  float tmp[tokens][c_rows_per_block] = {};
+  for (int kbx = threadIdx.x / (qi / vdr); kbx < blocks_per_row_x;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    const int kqs = vdr * (threadIdx.x % (qi / vdr));
+#pragma unroll
+    for (int j = 0; j < tokens; ++j) {
+#pragma unroll
+      for (int i = 0; i < c_rows_per_block; ++i) {
+        tmp[j][i] += vec_dot_q_hip(vx, &y[j * stride_col_y + kby],
+                                   row_offsets[i] + kbx, kqs);
+      }
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < tokens; ++j) {
+#pragma unroll
+    for (int i = 0; i < c_rows_per_block; ++i) {
+      const float value = warp_reduce_sum<warp_size>(tmp[j][i]);
+      if (threadIdx.x == 0 && uint32_t(row0 + i) < nrows_x)
+        dst[j * stride_col_dst + row0 + i] = isfinite(value) ? value : 0.0f;
+    }
+  }
+}
+
+template<ggml_type type, int tokens = 1>
+static void launch_dense_kq(const void* weights, const block_q8_1* input,
+                            float* output, int k, int rows, int n_tokens,
+                            int input_stride, hipStream_t stream) {
+  if (n_tokens == tokens) {
+    constexpr int kRows = 2;
+    mul_mat_vec_dense_kq<type, kRows, tokens>
+        <<<dim3((rows + kRows - 1) / kRows), dim3(32), 0, stream>>>(
+            weights, input, output, k, rows, k / ggml_blck_size(type),
+            input_stride, rows);
+  } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
+    launch_dense_kq<type, tokens + 1>(weights, input, output, k, rows,
+                                      n_tokens, input_stride, stream);
+  } else {
+    GGML_ABORT("invalid dense vector batch width");
+  }
+}
+
+void mul_mat_vec_dense_kq_dispatch(const void* weights, ggml_type type,
+                                   const block_q8_1* input, float* output,
+                                   int k, int rows, int tokens,
+                                   int input_stride, hipStream_t stream) {
+  GGML_ASSERT(tokens > 0 && tokens <= MMVQ_MAX_BATCH_SIZE &&
+              k % ggml_blck_size(type) == 0 && rows > 0);
+  switch (type) {
+    case GGML_TYPE_Q4_K:
+      launch_dense_kq<GGML_TYPE_Q4_K>(weights, input, output, k, rows, tokens,
+                                      input_stride, stream);
+      break;
+    case GGML_TYPE_Q5_K:
+      launch_dense_kq<GGML_TYPE_Q5_K>(weights, input, output, k, rows, tokens,
+                                      input_stride, stream);
+      break;
+    default:
+      GGML_ABORT("unsupported dense vector weight format");
+  }
+}
+
 // Keep one anchor per expert and a slot mask for each token. Duplicate
 // experts share their weights; inactive slots still get explicit zeroes.
 // Two anchor lists follow the groups, each a count and then its anchors in

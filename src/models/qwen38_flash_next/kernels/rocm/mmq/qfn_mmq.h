@@ -36,6 +36,12 @@ int qfn_mmq_moe_vec(int weight_type, const void* W, const float* X_f32,
                     int n_experts, int n_expert_used, hipStream_t stream,
                     const void* W_b = nullptr, float* out_b = nullptr);
 
+// Dense Q4_K/Q5_K projection for 1–8 tokens, out [n_tokens][M]: each row is
+// read once for every token, and a token's sum matches qfn_mmq_moe_vec's.
+int qfn_mmq_dense_kq_vec(int weight_type, const void* W, const float* X_f32,
+                         float* out_f32, int M, int K, int n_tokens,
+                         hipStream_t stream);
+
 // Q4_K/Q5_K/Q8_0 gate/up for 1–8 tokens, with the SwiGLU result in out.
 // Q4_K also accepts up to 64 independent rows, grouped by expert.
 int qfn_mmq_moe_gated_vec(int weight_type, const void* gate, const void* up,

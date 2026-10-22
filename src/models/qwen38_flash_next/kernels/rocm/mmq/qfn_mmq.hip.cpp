@@ -508,6 +508,41 @@ extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
                                out_b, false);
 }
 
+extern "C" int qfn_mmq_dense_kq_vec(int weight_type, const void* W,
+                                    const float* X_f32, float* out_f32, int M,
+                                    int K, int n_tokens, hipStream_t stream) {
+  constexpr const char* tag = "qfn_mmq_dense_kq_vec";
+  const auto type = static_cast<ggml_type>(weight_type);
+  if ((type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K) || !W || !X_f32 ||
+      !out_f32 || M <= 0 || K <= 0 || K % ggml_blck_size(type) != 0 ||
+      n_tokens <= 0 || n_tokens > MMVQ_MAX_BATCH_SIZE) {
+    fprintf(stderr, "%s: unsupported type %d or shape M=%d K=%d ntok=%d\n",
+            tag, weight_type, M, K, n_tokens);
+    return -1;
+  }
+  ggml_backend_hip_context* ctx = get_ctx_for_device(ggml_hip_get_device());
+  if (!ctx) {
+    fprintf(stderr, "%s: failed to get HIP context\n", tag);
+    return -1;
+  }
+  const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+  ggml_hip_pool_alloc<char> q8(ctx->pool(), (size_t)n_tokens * ne10_padded *
+                                                sizeof(block_q8_1) / QK8_1);
+  quantize_row_q8_1_hip(X_f32, nullptr, (void*)q8.get(), type, K, (int64_t)K,
+                        (int64_t)K, (int64_t)K * n_tokens, ne10_padded, 1,
+                        n_tokens, 1, stream);
+  mul_mat_vec_dense_kq_dispatch(W, type,
+                                reinterpret_cast<const block_q8_1*>(q8.get()),
+                                out_f32, K, M, n_tokens, ne10_padded / QK8_1,
+                                stream);
+  const hipError_t err = hipGetLastError();
+  if (err != hipSuccess) {
+    fprintf(stderr, "%s: %s\n", tag, hipGetErrorString(err));
+    return -2;
+  }
+  return 0;
+}
+
 extern "C" int qfn_mmq_moe_gated_vec(int weight_type, const void* gate,
                                      const void* up, const float* x,
                                      const int32_t* ids, float* out, int m,
