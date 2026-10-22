@@ -7840,6 +7840,38 @@ void MtpAddEmbedding(const float* embedding, float* residual,
                      stream, embedding, residual, hidden, streams);
 }
 
+/// One block: the softmax probability of the argmax row[0] names, written
+/// as float bits into row[1]. Nonfinite logits contribute nothing.
+__launch_bounds__(1024) __global__
+    void ArgmaxConfidenceKernel(const float* logits, std::int32_t* row,
+                                std::uint32_t vocab) {
+  __shared__ float partial[32];
+  const float top = logits[row[0]];
+  float sum = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+    const float l = logits[i];
+    if (isfinite(l))
+      sum += __expf(l - top);
+  }
+  sum = WaveSum(sum);
+  if ((threadIdx.x & 31U) == 0)
+    partial[threadIdx.x >> 5U] = sum;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0F;
+    for (unsigned w = 0; w < blockDim.x / 32U; ++w)
+      total += partial[w];
+    const float p = isfinite(top) && total > 0.0F ? 1.0F / total : 0.0F;
+    row[1] = __float_as_int(p);
+  }
+}
+
+void ArgmaxConfidence(const float* logits, std::int32_t* row,
+                      std::uint32_t vocab, hipStream_t stream) {
+  hipLaunchKernelGGL(ArgmaxConfidenceKernel, dim3(1), dim3(1024), 0, stream,
+                     logits, row, vocab);
+}
+
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
             std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream) {
   hipLaunchKernelGGL(ArgmaxPartialKernel, dim3(kArgmaxParts, n_tokens),

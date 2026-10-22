@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <stdexcept>
 
@@ -442,8 +443,11 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           !Check(hipStreamSynchronize(stream_), error)) {
         return false;
       }
-      if (item.output.token != nullptr)
-        *item.output.token = *mtp_token_host_;
+      if (item.output.token != nullptr) {
+        *item.output.token = mtp_token_host_[0];
+        if (item.output.confidence != nullptr)
+          *item.output.confidence = std::bit_cast<float>(mtp_token_host_[1]);
+      }
       if (item.output.candidates != nullptr)
         *item.output.candidates = *mtp_candidates_host_;
     }

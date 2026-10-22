@@ -13,6 +13,11 @@
 namespace gufo::models::qwen38_flash_next {
 
 inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
+/// An unplanned chain drafts up to its budget and ends after the first
+/// proposal below its gate: the head's probability of a greedy draft, or the
+/// proposal probability q of a sampled one.
+inline constexpr float kMtpGateProbability = 0.9F;
+inline constexpr float kMtpSampledGateProbability = 0.95F;
 
 struct MtpLengthState {
   std::array<float, kMaxMtpDraftTokens> successes;

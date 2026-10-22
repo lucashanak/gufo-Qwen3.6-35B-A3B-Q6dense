@@ -1209,7 +1209,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_eproj = s.qkvz;
     s.mtp_res = s.res;
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
-    s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
+    // The draft token and its confidence (float bits), one host transfer.
+    s.mtp_token = Alloc<std::int32_t>(a, 2, error_msg);
     const auto candidate_ids = std::max<std::size_t>(
         MtpCandidateWorkspaceSize(c.vocab_size),
         e->options_.max_speculative * kArgmaxParts *
@@ -1220,7 +1221,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
     if (!Check(e->host_allocations_.Allocate(&e->mtp_token_host_,
-                                             sizeof(std::int32_t)),
+                                             2 * sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
         !Check(e->host_allocations_.Allocate(&e->mtp_candidates_host_,
                                              sizeof(MtpCandidateLogits)),
@@ -2907,12 +2908,13 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   }
   if (token) {
     Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+    ArgmaxConfidence(s_.logits, s_.mtp_token, rows, stream_);
     if (draft != nullptr)
       RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1, prefix,
                     draft->mtp_.draft_ids, stream_);
-    if (!Check(
-            hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
-                           hipMemcpyDeviceToHost, stream_),
+    if (!Check(hipMemcpyAsync(mtp_token_host_, s_.mtp_token,
+                              2 * sizeof(std::int32_t), hipMemcpyDeviceToHost,
+                              stream_),
             "draft token download", error_msg)) {
       return false;
     }
@@ -4283,7 +4285,9 @@ bool Executor::MtpForward(Session& session,
     return false;
   }
   if (output.token != nullptr) {
-    *output.token = *mtp_token_host_;
+    *output.token = mtp_token_host_[0];
+    if (output.confidence != nullptr)
+      *output.confidence = std::bit_cast<float>(mtp_token_host_[1]);
   }
   if (output.candidates != nullptr) {
     *output.candidates = *mtp_candidates_host_;
