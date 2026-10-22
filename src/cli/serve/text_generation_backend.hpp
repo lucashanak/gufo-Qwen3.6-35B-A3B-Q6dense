@@ -212,6 +212,7 @@ public:
     std::size_t dflash_rounds{0};
     std::size_t dflash_tokens{0};
     std::size_t dflash_accepted_tokens{0};
+    std::size_t dflash_mtp_rounds{0};
     /// Hashed n-gram embedding rows gathered for this request, split by how
     /// each was served.
     std::size_t ngram_rows{0};

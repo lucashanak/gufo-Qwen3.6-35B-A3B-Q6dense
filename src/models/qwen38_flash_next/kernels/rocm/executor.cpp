@@ -3208,7 +3208,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
                             (static_cast<std::uint64_t>(sparse) << 33) |
-                            (std::uint64_t{logits != nullptr} << 34);
+                            (std::uint64_t{logits != nullptr} << 34) |
+                            (std::uint64_t{taps_enabled_} << 36);
   // PLE first consumes the disk rows at its injection layer. Queue the
   // preceding layers before waiting, including on captured graph replay.
   // Both pieces use the same stream and arithmetic as the unsplit graph.
@@ -3476,7 +3477,7 @@ bool Executor::ConfigureFeatureTaps(std::span<const std::uint32_t> layers,
 
 void Executor::TapFeatures(std::uint32_t il, const float* res,
                            std::uint32_t rows) const {
-  if (feat_dev_ == nullptr || feat_tap_of_layer_[il] < 0)
+  if (!taps_enabled_ || feat_tap_of_layer_[il] < 0)
     return;
   const Config& c = config();
   HcMeanRows(res,

@@ -392,26 +392,11 @@ void Session::ForgetDFlashContext(std::uint32_t position) noexcept {
   ring_end_ = position;
 }
 
-void Session::ResetDraftRates() noexcept {
-  dfl_tokens_ = dfl_seconds_ = mtp_tokens_ = mtp_seconds_ = 0.0F;
-  dfl_cycles_ = mtp_cycles_ = draft_cycles_ = 0;
-}
-
-bool Session::PreferDFlash() const noexcept {
-  // Probe each source, then draft with the one committing more tokens per
-  // second; the last cycles of every period re-measure the slower one.
-  constexpr std::uint32_t kProbe = 4;
-  constexpr std::uint32_t kPeriod = 50;
-  if (dfl_cycles_ < kProbe)
-    return true;
-  if (mtp_cycles_ < kProbe)
-    return false;
-  const bool faster = dfl_tokens_ * mtp_seconds_ >= mtp_tokens_ * dfl_seconds_;
-  return draft_cycles_ % kPeriod >= kPeriod - 2 ? !faster : faster;
+bool Session::DFlashAvailable() const noexcept {
+  return model_->dflash_model_ != nullptr && MtpEnabled() && !dflash_failed_;
 }
 
 bool Session::EnsureDFlashContext() {
-  const auto start = std::chrono::steady_clock::now();
   const auto pos = static_cast<std::uint32_t>(tokens_.size());
   if (ring_ == nullptr || ring_end_ != pos)
     return false;
@@ -446,20 +431,19 @@ bool Session::EnsureDFlashContext() {
     }
     from += n;
   }
-  catchup_seconds_ +=
-      std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
-          .count();
   return true;
 }
 
 void Session::InjectFeatures(std::uint32_t position, std::uint32_t rows,
                              std::uint32_t end) {
-  if (rows == 0 || !EnsureDFlashState())
+  if (rows == 0)
     return;
   if (!features_fresh_) {
     ForgetDFlashContext(position + rows);  // a gap: start over after these
     return;
   }
+  if (!EnsureDFlashState())
+    return;
   const std::uint32_t win_start = end > ring_rows_ ? end - ring_rows_ : 0;
   if (position + rows <= win_start) {
     ring_begin_ = ring_end_ = position + rows;  // nothing survives the window
@@ -490,7 +474,7 @@ void Session::ResetDraftPolicy() {
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   draft_length_.Reset();
-  ResetDraftRates();
+  draft_source_.Reset();
   // A fully reused prompt can start decoding without SyncImpl. It still
   // starts a new request: do not inherit a copy cursor or widen its first step.
   lookup_.BeginRequest();
@@ -872,11 +856,20 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
         rest.size() <= exec.max_batch() ? exec.max_batch()
                                         : model_->PrefillCapacity(),
         rest.size()));
+    // Only rows inside the draft's attention window at the end of this
+    // feed are ever read; earlier chunks skip the taps.
+    // A decode-mode feed also needs to run alone, as DecodeStep does.
+    const bool taps =
+        DFlashAvailable() && (prefill || RanLastForward()) &&
+        off + n + model_->dflash_model_->GetDFlashConfig().sliding_window >
+            tokens.size();
+    exec.EnableFeatureTaps(taps);
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
                       capture.get(), next)) {
       return false;
     }
-    features_fresh_ = true;
+    NoteForward();
+    features_fresh_ = taps;
     InjectFeatures(
         static_cast<std::uint32_t>(tokens_.size()),
         static_cast<std::uint32_t>(n),
@@ -967,7 +960,7 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
   lookup_.BeginRequest();
   // Each request measures its own draft sources: code and prose favour
   // different ones.
-  ResetDraftRates();
+  draft_source_.Reset();
   if (!valid_)
     Reset();
   // Recurrent state cannot be rewound, so any divergence restarts the
@@ -1035,6 +1028,8 @@ struct Session::PendingDecode {
   std::size_t lookup_cap{0};
   std::uint32_t policy_concurrency{0};
   bool dflash{false};  ///< the drafts after the anchor came from DFlash2
+  /// The draft-source chooser decided this cycle (DecodeStep records it).
+  bool dflash_eligible{false};
 };
 
 bool Session::GateStops(const PendingDecode& pending) {
@@ -1159,13 +1154,16 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       drafts = std::min<std::uint32_t>(
           static_cast<std::uint32_t>(cap - 1), model_->options_.max_draft_tokens);
   }
-  // A single-session greedy cycle may draft with DFlash2 instead of MTP
-  // (PreferDFlash). Its proposals are verified as point masses, so sampled
-  // requests, whose seeded replay must not depend on timing, keep MTP.
-  const bool use_dflash = dflash_ && !defer_head && !batch_drafts &&
-                          MtpEnabled() && cap > 1 &&
-                          !sampler.config().uses_random_sampling() &&
-                          PreferDFlash() && EnsureDFlashContext();
+  // A greedy cycle of a session decoding alone may draft with DFlash2
+  // instead of MTP; the chooser decides from acceptance history. Sampled
+  // requests and every batch keep MTP, so their cost is unchanged.
+  pending->dflash_eligible =
+      dflash_ && !defer_head && !batch_drafts && MtpEnabled() && cap > 1 &&
+      !sampler.config().uses_random_sampling() && RanLastForward();
+  const bool use_dflash =
+      pending->dflash_eligible &&
+      draft_source_.PreferDFlash(static_cast<std::uint32_t>(tokens_.size())) &&
+      EnsureDFlashContext();
   const std::size_t width =
       MtpEnabled() && cap > 1
           ? 1 + (use_dflash ? std::min<std::size_t>(cap - 1, kMaxMtpDraftTokens)
@@ -1229,12 +1227,17 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     return defer_head || DraftCatchUp(anchor, false, error_msg);
   }
   if (use_dflash) {
+    std::vector<float> probabilities;
     const auto ids =
         dflash_->ForwardBlock(static_cast<tokenization::TokenId>(anchor), base,
-                              static_cast<std::uint32_t>(width - 1), 0.0F);
-    for (const auto id : ids) {
-      pending->chain.push_back(static_cast<std::int32_t>(id));
-      if (is_stop(pending->chain.back()))
+                              static_cast<std::uint32_t>(width - 1), 0.0F, {},
+                              nullptr, nullptr, nullptr, {}, &probabilities);
+    // Like a gated MTP chain, the block ends after its first unlikely
+    // proposal: each verified row costs a fresh set of routed experts.
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      pending->chain.push_back(static_cast<std::int32_t>(ids[i]));
+      if (is_stop(pending->chain.back()) ||
+          probabilities[i] < kDFlashGateProbability)
         break;
     }
     if (pending->chain.size() > 1) {
@@ -1453,8 +1456,6 @@ bool Session::DecodeStep(std::size_t max_tokens,
   valid_ = false;
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
   PendingDecode pending;
-  const auto cycle_start = std::chrono::steady_clock::now();
-  catchup_seconds_ = 0.0F;
   if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
                      occupancy)) {
     return false;
@@ -1463,49 +1464,37 @@ bool Session::DecodeStep(std::size_t max_tokens,
     valid_ = true;
     return true;
   }
-  if (pending.lookup != 0 || pending.dflash)
+  if (pending.lookup != 0)
     model_->batch_policy_.SkipCycle();
   float* logits = !pending.speculative       ? logits_.data()
                   : pending.gpu_verification ? nullptr
                                              : verify_logits_.data();
-  if (!model_->executor_->Forward(
-          *session_, pending.chain, pending.chain.size(), logits,
-          pending.speculative ? rocm::Executor::ForwardMode::kVerify
-                              : rocm::Executor::ForwardMode::kDecode,
-          error_msg)) {
+  // Feature rows only for a greedy session decoding alone: the only one that
+  // can draft with DFlash2. Everything else keeps the untapped graphs.
+  const bool taps = DFlashAvailable() &&
+                    !sampler.config().uses_random_sampling() &&
+                    RanLastForward();
+  auto& exec = *model_->executor_;
+  exec.EnableFeatureTaps(taps);
+  if (!exec.Forward(*session_, pending.chain, pending.chain.size(), logits,
+                    pending.speculative ? rocm::Executor::ForwardMode::kVerify
+                                        : rocm::Executor::ForwardMode::kDecode,
+                    error_msg)) {
     return false;
   }
-  features_fresh_ = true;
+  NoteForward();
+  features_fresh_ = taps;
   feature_row_offset_ = 0;
   const bool ok = FinishDecode(request, pending, error_msg);
   features_fresh_ = false;
-  // Rates of the two neural sources over greedy single-session cycles;
-  // lookup copies and the draft's context catch-up are not attributed.
-  if (ok && dflash_ && pending.speculative && pending.lookup == 0 &&
-      !pending.sampled && !result->tokens.empty()) {
-    const float seconds = std::chrono::duration<float>(
-                              std::chrono::steady_clock::now() - cycle_start)
-                              .count() -
-                          catchup_seconds_;
-    if (seconds > 0.0F) {
-      const auto tokens = static_cast<float>(result->tokens.size());
-      if (pending.dflash) {
-        dfl_tokens_ += tokens;
-        dfl_seconds_ += seconds;
-        ++dfl_cycles_;
-      } else {
-        mtp_tokens_ += tokens;
-        mtp_seconds_ += seconds;
-        ++mtp_cycles_;
-      }
-      // Keep the comparison recent: halve both sums every 64 cycles.
-      if (++draft_cycles_ % 64 == 0) {
-        dfl_tokens_ *= 0.5F;
-        dfl_seconds_ *= 0.5F;
-        mtp_tokens_ *= 0.5F;
-        mtp_seconds_ *= 0.5F;
-      }
-    }
+  // The chooser sees the neural cycles it decided; prompt-lookup copies
+  // say nothing about either source.
+  if (ok && pending.dflash_eligible && pending.lookup == 0 &&
+      !result->tokens.empty()) {
+    draft_source_.Observe(pending.dflash,
+                          static_cast<std::uint32_t>(result->tokens.size()),
+                          static_cast<std::uint32_t>(pending.chain.size()));
+    stats_.mtp_chosen += !pending.dflash;
   }
   valid_ = ok;
   return ok;
@@ -1770,6 +1759,8 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   }
   if (!items.empty() && !exec.ForwardBatch(items, error_msg))
     return false;
+  requests.front().session->model_->last_forward_.store(
+      nullptr, std::memory_order_relaxed);
   std::uint32_t offset = 0;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& p = pending[i];
@@ -1796,8 +1787,6 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
                     : p.gpu_verification ? nullptr
                                          : session.verify_logits_.data();
     try {
-      session.features_fresh_ = true;
-      session.feature_row_offset_ = row_offset;
       r.outcome->completed =
           exec.SelectBatchLogits(row_offset, p.chain.size(), logits,
                                  &r.outcome->error) &&
@@ -1805,8 +1794,6 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     } catch (const std::exception& exception) {
       r.outcome->error = exception.what();
     }
-    session.features_fresh_ = false;
-    session.feature_row_offset_ = 0;
   }
   const bool used_lookup =
       std::ranges::any_of(pending, [](const auto& p) { return p.lookup != 0; });
@@ -1840,6 +1827,8 @@ bool Session::EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
   if (!exec.ForwardBatch(items, error_msg)) {
     return false;
   }
+  requests.front().session->model_->last_forward_.store(
+      nullptr, std::memory_order_relaxed);
   for (std::size_t i = 0; i < requests.size(); ++i) {
     auto& session = *requests[i].session;
     auto& outcome = *requests[i].outcome;
@@ -1851,12 +1840,9 @@ bool Session::EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
       if (!exec.SelectBatchLogits(i, 1, session.logits_.data(), &outcome.error))
         continue;
       session.hidden_base_ = static_cast<std::uint32_t>(session.tokens_.size());
-      const auto at = static_cast<std::uint32_t>(session.tokens_.size());
-      session.features_fresh_ = true;
-      session.feature_row_offset_ = static_cast<std::uint32_t>(i);
-      session.InjectFeatures(at, 1, at + 1);
-      session.features_fresh_ = false;
-      session.feature_row_offset_ = 0;
+      // Batches write no feature rows: the draft context restarts later.
+      session.ForgetDFlashContext(
+          static_cast<std::uint32_t>(session.tokens_.size() + 1));
       session.tokens_.push_back(requests[i].token);
       outcome.completed = true;
     } catch (const std::exception& exception) {
