@@ -690,6 +690,8 @@ Session::~Session() {
     snapshots_->failure = std::current_exception();
   }
   TrimRollback(0);
+  if (owner_ != nullptr)
+    owner_->DropBatchGraphs(this);
   for (auto& [key, exec] : graphs_) {
     (void)hipGraphExecDestroy(exec);
   }

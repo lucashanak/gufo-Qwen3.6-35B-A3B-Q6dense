@@ -2,6 +2,7 @@
 #include <bit>
 #include <array>
 #include <stdexcept>
+#include <tuple>
 
 #include "qfn_mmq.h"
 #include "src/core/hip/managed_alloc.hpp"
@@ -15,6 +16,18 @@ namespace {
 
 constexpr std::uint32_t kBatchSessions = 8;
 constexpr std::uint32_t kDecodeRows = 8;
+// Captured batch graphs retain about a thousand nodes each; the warmed keys
+// only bound host memory for shapes that never repeat.
+constexpr std::size_t kMaxBatchGraphs = 32;
+constexpr std::size_t kMaxWarmedBatchKeys = 1024;
+
+// Launch-shape tags of the batched graph keys.
+enum BatchGraphKind : std::uint64_t {
+  kTrunkPrefix = 1,
+  kTrunkSuffix,
+  kMtpBody,
+  kMtpHeads,
+};
 
 bool Fail(std::string* error, const std::string& message) {
   if (error != nullptr) {
@@ -54,6 +67,130 @@ WeightType EmbeddingType(core::GgmlType type) {
 }
 
 }  // namespace
+
+Executor::BatchGraphs::~BatchGraphs() {
+  for (const auto& [key, entry] : graphs)
+    if (entry.exec != nullptr)
+      (void)hipGraphExecDestroy(entry.exec);
+}
+
+void Executor::DropBatchGraphs(const Session* session) const noexcept {
+  auto& graphs = batch_graphs_.graphs;
+  for (auto it = graphs.begin(); it != graphs.end();) {
+    if (std::ranges::find(it->second.sessions, session) ==
+        it->second.sessions.end()) {
+      ++it;
+      continue;
+    }
+    if (it->second.exec != nullptr)
+      (void)hipGraphExecDestroy(it->second.exec);
+    it = graphs.erase(it);
+  }
+}
+
+bool Executor::RunBatch(const std::vector<std::uint64_t>& shape,
+                        std::span<Session* const> sessions, bool graph,
+                        const std::function<bool()>& body,
+                        std::string* error) const {
+  auto& cache = batch_graphs_;
+  if (!graph || !cache.enabled)
+    return body();
+  // Recorded commands name each session's caches, which stay fixed for its
+  // lifetime, its vision rope and its rollback rows, which may be replaced.
+  auto key = shape;
+  for (const Session* session : sessions) {
+    key.push_back(reinterpret_cast<std::uintptr_t>(session));
+    key.push_back(
+        reinterpret_cast<std::uintptr_t>(session->vision_input_.rope()));
+    key.push_back(session->rollback_allocations_.size());
+    for (const float* rows : session->rollback_allocations_)
+      key.push_back(reinterpret_cast<std::uintptr_t>(rows));
+  }
+  if (const auto it = cache.graphs.find(key); it != cache.graphs.end()) {
+    it->second.used = ++cache.clock;
+    if (it->second.exec == nullptr)
+      return body();  // its capture failed; this key stays eager
+    if (!Check(hipGraphLaunch(it->second.exec, stream_), error))
+      return false;
+    it->second.restore();
+    ++cache.replays;
+    return true;
+  }
+  // The first pass of a key grows lazily allocated GEMM scratch, which
+  // capture forbids. Keys that never repeat are never recorded.
+  if (cache.warmed.size() >= kMaxWarmedBatchKeys)
+    cache.warmed.clear();
+  if (cache.warmed.insert(key).second)
+    return body();
+  // Queue this pass, then record identical commands while the GPU runs it.
+  // Producer readiness and alternating scratch must match when recording.
+  const auto fields = [this] {
+    return std::tie(moe_pending_, defer_residual_, res_deferred_,
+                    shexp_half_ready_, q8t_src_, q8t_rows_, q8t_cols_,
+                    half_src_, half_rows_, half_cols_, half_bf16_, xn_half_,
+                    inject_parts_, inject_fused_, q8_slot_, xn_q8_ready_,
+                    mixed_q8_ready_, pending_combine_);
+  };
+  const auto copy = [](const auto&... field) {
+    return std::make_tuple(field...);
+  };
+  const auto before = std::apply(copy, fields());
+  if (!body())
+    return false;
+  const auto after = std::apply(copy, fields());
+  // A row cancelled during the pass skipped commands its graph must keep.
+  if (std::ranges::any_of(sessions,
+                          [](const Session* s) { return s->Cancelled(); }))
+    return true;
+  fields() = before;
+  const std::string reported = error != nullptr ? *error : std::string();
+  hipGraph_t captured = nullptr;
+  bool recorded = hipStreamBeginCapture(
+                      stream_, hipStreamCaptureModeThreadLocal) == hipSuccess;
+  if (recorded) {
+    try {
+      recorded = body();
+    } catch (...) {
+      if (hipStreamEndCapture(stream_, &captured) == hipSuccess &&
+          captured != nullptr)
+        (void)hipGraphDestroy(captured);
+      fields() = after;
+      throw;
+    }
+    recorded = hipStreamEndCapture(stream_, &captured) == hipSuccess &&
+               captured != nullptr && recorded;
+  }
+  fields() = after;
+  // The executed pass completed every row. Cancellation observed while
+  // recording applies to the next batch, and the recording is incomplete.
+  for (Session* session : sessions) {
+    recorded = recorded && !session->cancelled_;
+    session->cancelled_ = false;
+  }
+  if (error != nullptr)
+    *error = reported;
+  hipGraphExec_t exec = nullptr;
+  if (recorded &&
+      hipGraphInstantiate(&exec, captured, nullptr, nullptr, 0) != hipSuccess)
+    exec = nullptr;
+  if (captured != nullptr)
+    (void)hipGraphDestroy(captured);
+  (void)hipGetLastError();  // a refused capture leaves the batch eager
+  if (cache.graphs.size() >= kMaxBatchGraphs) {
+    const auto oldest = std::ranges::min_element(
+        cache.graphs, {}, [](const auto& entry) { return entry.second.used; });
+    if (oldest->second.exec != nullptr)
+      (void)hipGraphExecDestroy(oldest->second.exec);
+    cache.graphs.erase(oldest);
+  }
+  cache.graphs.emplace(
+      std::move(key),
+      BatchGraphs::Entry{exec,
+                         {sessions.begin(), sessions.end()},
+                         ++cache.clock,
+                         [fields, after] { fields() = after; }});
+  return true;
+}
 
 Executor::Scratch Executor::RowScratch(const Scratch& b,
                                        std::uint32_t offset) const {
@@ -249,6 +386,25 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   }
   const Scratch base = s_;
   const auto& l = model_->mtp();
+  std::vector<Session*> sessions;
+  std::vector<std::uint64_t> shape{kMtpBody, items.size()};
+  bool graph = batch_graphs_.enabled;
+  for (const auto& item : items) {
+    auto& session = *item.session;
+    const auto n = static_cast<std::uint32_t>(item.tokens.size());
+    const auto end = session.mtp_.position + n;
+    const bool sparse = end > c.indexer_top_k;
+    const auto pool = sparse ? end / c.compress_ratio - session.mtp_.blocks : 0;
+    graph = graph && session.CheckCancellation(nullptr) &&
+            pool <= n / c.compress_ratio + 1;
+    sessions.push_back(&session);
+    shape.push_back(n | std::uint64_t{item.hidden_row < 0} << 8 |
+                    std::uint64_t{sparse} << 9);
+    if (!session.Cancelled()) {
+      ++session.mutation_epoch_;
+      session.mtp_.residual_valid = false;
+    }
+  }
   const auto body = [&]() {
     if (!AnyActive(items))
       return true;
@@ -313,8 +469,6 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
           return false;
         continue;
       }
-      ++session.mutation_epoch_;
-      session.mtp_.residual_valid = false;
       Session::AttentionState attention;
       attention.rope = session.vision_input_.rope();
       attention.k_cache = session.mtp_.k_cache;
@@ -323,7 +477,10 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       attention.block_k = session.mtp_.block_k;
       const bool sparse = session.mtp_.position + n > c.indexer_top_k;
       const auto complete = (session.mtp_.position + n) / c.compress_ratio;
-      const auto pool = sparse ? complete - session.mtp_.blocks : 0;
+      // A graph covers the widest grid it allows (see ForwardBatch).
+      const auto pool = graph    ? n / c.compress_ratio + 1
+                        : sparse ? complete - session.mtp_.blocks
+                                 : 0;
       if (!Attention(l, attention, s_.mixed, s_.block_out, n,
                      &session.control_->mtp_position,
                      &session.control_->mtp_blocks, session.mtp_.position, pool,
@@ -383,7 +540,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   };
   bool ok = false;
   try {
-    ok = body();
+    ok = RunBatch(shape, sessions, graph, body, error);
   } catch (...) {
     (void)hipStreamSynchronize(stream_);
     UseScratch(base);
@@ -584,13 +741,21 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                  error)) {
         return false;
       }
-      batch_candidates_host_[i].size = count;
     }
     return true;
   };
+  std::vector<Session*> sessions;
+  std::vector<std::uint64_t> shape{kMtpHeads, n, subset_rows};
+  bool graph = batch_graphs_.enabled;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    graph = graph && items[i].session->CheckCancellation(nullptr);
+    sessions.push_back(items[i].session);
+    shape.push_back(slot[i] |
+                    std::uint64_t{items[i].output.candidates != nullptr} << 8);
+  }
   bool ok = false;
   try {
-    ok = body();
+    ok = RunBatch(shape, sessions, graph, body, error);
   } catch (...) {
     (void)hipStreamSynchronize(stream_);
     UseScratch(base);
@@ -605,8 +770,11 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       continue;
     if (items[i].output.token != nullptr)
       *items[i].output.token = batch_candidates_host_[i].ids[0];
-    if (items[i].output.candidates != nullptr)
+    if (items[i].output.candidates != nullptr) {
+      batch_candidates_host_[i].size =
+          std::min<std::size_t>(rows_of(i), kMtpCandidates);
       *items[i].output.candidates = batch_candidates_host_[i];
+    }
   }
   return true;
 }
@@ -880,41 +1048,93 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   }
 
   const Scratch base = s_;
-  // Every exit restores the ordinary single-session scratch view. Enqueued
-  // work is drained before a caller can reuse its pinned staging buffers.
-  const auto body = [&]() -> bool {
+  const auto& layers = model_->layers();
+  // Mapped descriptors are read when the kernels run, so replayed graphs
+  // see the current recurrent state and rollback rows. Inactive entries
+  // are never read.
+  if (batch_gdn) {
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      const auto& l = layers[il];
+      if (!l.linear)
+        continue;
+      for (std::size_t i = 0; i < items.size(); ++i) {
+        const auto& item = items[i];
+        const auto& state = item.session->linear_[il];
+        const auto view = RowScratch(base, offsets[i]);
+        batch_gdn_host_[il * kBatchSessions + i] = {
+            l.ssm_in.empty() ? view.qkv : view.qkvz,
+            l.ssm_in.empty() ? view.z : view.qkvz + c.SsmConvChannels(),
+            view.alpha_beta, state.conv_state,
+            // Short convolution saves history in registers, so each
+            // request needs only its own token rows of staging.
+            base.conv_scratch + std::size_t{offsets[i]} * c.SsmConvChannels(),
+            view.qn, view.kn, view.gdn_raw, state.state, view.gdn_out,
+            item.speculative ? state.state_snapshots : RollbackRows{},
+            item.speculative ? state.conv_snapshots : RollbackRows{},
+            static_cast<std::uint32_t>(item.tokens.size())};
+      }
+    }
+  }
+  // Decode shapes of active rows replay graphs. Positions reach the kernels
+  // through each session's control block; a pooling backlog wider than one
+  // block per row (the first batch past the budget) needs the eager grid.
+  std::vector<Session*> sessions;
+  std::vector<std::uint64_t> shape{kTrunkPrefix, items.size(),
+                                   reinterpret_cast<std::uintptr_t>(feat_dev_),
+                                   feat_width_};
+  bool graph = batch_graphs_.enabled;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    auto& session = *items[i].session;
+    const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+    const auto pool = sparse[i] && complete[i] > session.blocks_
+                          ? complete[i] - session.blocks_
+                          : 0;
+    graph = graph && session.CheckCancellation(nullptr) &&
+            pool <= n / c.compress_ratio + 1 &&
+            session.position_ >= session.VisionLayout().PrefixLength();
+    sessions.push_back(&session);
+    shape.push_back(n | std::uint64_t{items[i].speculative} << 8 |
+                    std::uint64_t{sparse[i]} << 9 |
+                    std::uint64_t{session.mtp_enabled_} << 10);
+  }
+  // Enqueues layers [first, end). The eager pass waits for the n-gram rows
+  // at the PLE layer; graphs are split there so the host waits in between.
+  const auto body = [&](std::uint32_t first, std::uint32_t end) -> bool {
     if (!AnyActive(items))
       return true;
-    for (std::size_t i = 0; i < items.size(); ++i) {
-      if (!Check(hipMemcpyAsync(items[i].session->control_, batch_controls_ + i,
-                                sizeof(Session::Control), hipMemcpyHostToDevice,
-                                stream_),
+    if (first == 0) {
+      for (std::size_t i = 0; i < items.size(); ++i) {
+        if (!Check(hipMemcpyAsync(items[i].session->control_,
+                                  batch_controls_ + i, sizeof(Session::Control),
+                                  hipMemcpyHostToDevice, stream_),
+                   error)) {
+          return false;
+        }
+      }
+      if (!Check(hipMemcpyAsync(base.tokens, tokens_host_,
+                                rows * sizeof(std::int32_t),
+                                hipMemcpyHostToDevice, stream_),
                  error)) {
         return false;
       }
+      EmbedTokens(model_->token_embd().data,
+                  EmbeddingType(model_->token_embd().type), base.tokens,
+                  base.res, rows, c.hidden_size, c.hc_count, stream_);
+      for (std::size_t i = 0; i < items.size(); ++i) {
+        items[i].session->vision_input_.Inject(
+            base.res + std::size_t{offsets[i]} * c.HcDim(),
+            items[i].session->position_, items[i].tokens.size(), c.hidden_size,
+            c.hc_count, stream_);
+      }
     }
-    if (!Check(hipMemcpyAsync(base.tokens, tokens_host_,
-                              rows * sizeof(std::int32_t),
-                              hipMemcpyHostToDevice, stream_),
-               error)) {
-      return false;
-    }
-    EmbedTokens(model_->token_embd().data,
-                EmbeddingType(model_->token_embd().type), base.tokens, base.res,
-                rows, c.hidden_size, c.hc_count, stream_);
-    for (std::size_t i = 0; i < items.size(); ++i) {
-      items[i].session->vision_input_.Inject(
-          base.res + std::size_t{offsets[i]} * c.HcDim(),
-          items[i].session->position_, items[i].tokens.size(), c.hidden_size,
-          c.hc_count, stream_);
-    }
-    const auto& layers = model_->layers();
+    // Every piece starts at layer 0 or at the PLE layer, whose preceding
+    // combine leaves no grouped norm.
     bool normed = false;
-    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    for (std::uint32_t il = first; il < end; ++il) {
       if (!AnyActive(items))
         return true;
       const auto& l = layers[il];
-      if (c.IsPleLayer(il) && !WaitPle(error))
+      if (!graph && c.IsPleLayer(il) && !WaitPle(error))
         return false;
       for (std::size_t i = 0; i < items.size(); ++i) {
         const auto& item = items[i];
@@ -975,18 +1195,6 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         }
         if (l.linear) {
           if (batch_gdn) {
-            const auto& state = session.linear_[il];
-            batch_gdn_host_[il * kBatchSessions + i] = {
-                l.ssm_in.empty() ? view.qkv : view.qkvz,
-                l.ssm_in.empty() ? view.z : view.qkvz + c.SsmConvChannels(),
-                view.alpha_beta, state.conv_state,
-                // Short convolution saves history in registers, so each
-                // request needs only its own token rows of staging.
-                base.conv_scratch +
-                    std::size_t{offsets[i]} * c.SsmConvChannels(),
-                view.qn, view.kn, view.gdn_raw, state.state, view.gdn_out,
-                item.speculative ? state.state_snapshots : RollbackRows{},
-                item.speculative ? state.conv_snapshots : RollbackRows{}, n};
             gdn_active |= 1U << i;
           } else if (!LinearAttention(l, session.linear_[il], s_.mixed,
                                       s_.block_out, n, item.speculative, error,
@@ -994,7 +1202,10 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
             return false;
           }
         } else {
-          const auto pool = sparse[i] && complete[i] > session.blocks_
+          // A graph covers the widest grid it allows; pooling reads the
+          // device position and block count.
+          const auto pool = graph ? n / c.compress_ratio + 1
+                            : sparse[i] && complete[i] > session.blocks_
                                 ? complete[i] - session.blocks_
                                 : 0;
           if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
@@ -1038,6 +1249,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       TapFeatures(il, base.res, rows);
       normed = next_norm != nullptr;
     }
+    if (end < c.num_layers)
+      return true;
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
       UseScratch(RowScratch(base, offsets[i]));
@@ -1055,9 +1268,28 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                       rows, error) &&
            DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
   };
+  const auto run = [&]() -> bool {
+    if (!graph)
+      return body(0, c.num_layers);
+    // Queue the layers before PLE, then wait for its rows on the host. Both
+    // pieces keep the unsplit order on one stream.
+    const auto split =
+        c.ple_layer > 0 ? static_cast<std::uint32_t>(c.ple_layer) : 0U;
+    if (split > 0 &&
+        !RunBatch(shape, sessions, true, [&] { return body(0, split); }, error))
+      return false;
+    if (c.ple_layer >= 0 && !WaitPle(error))
+      return false;
+    shape.front() = kTrunkSuffix;
+    return RunBatch(
+        shape, sessions, true, [&] { return body(split, c.num_layers); },
+        error);
+  };
+  // Every exit restores the ordinary single-session scratch view. Enqueued
+  // work is drained before a caller can reuse its pinned staging buffers.
   bool ok = false;
   try {
-    ok = body();
+    ok = run();
   } catch (...) {
     (void)hipStreamSynchronize(stream_);
     UseScratch(base);
