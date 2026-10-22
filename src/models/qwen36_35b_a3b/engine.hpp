@@ -12,11 +12,11 @@
 
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen36_35b_a3b/config.hpp"
-#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen36_35b_a3b/lookup_draft.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_policy.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_sampling.hpp"
@@ -281,7 +281,8 @@ private:
   bool features_fresh_{false};   ///< feature rows of the last Forward are ours
   std::uint32_t feature_row_offset_{0};  ///< our first row in that Forward
   /// Committed tokens and seconds of single-session cycles per draft source.
-  float dfl_tokens_{0.0F}, dfl_seconds_{0.0F}, mtp_tokens_{0.0F}, mtp_seconds_{0.0F};
+  float dfl_tokens_{0.0F}, dfl_seconds_{0.0F}, mtp_tokens_{0.0F},
+      mtp_seconds_{0.0F};
   std::uint32_t dfl_cycles_{0}, mtp_cycles_{0}, draft_cycles_{0};
   float catchup_seconds_{0.0F};
   [[nodiscard]] bool PreferDFlash() const noexcept;
