@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -107,15 +108,25 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   t->cache_rows_.resize(t->cache_count_ * t->row_bytes_);
   t->rows_ = rows;
   t->base_offset_ = file_offset;
-  // A buffered descriptor maps the table; the mapping is reclaimable cache,
-  // so memory pressure only sends rows back to the disk.
+  // A table larger than the row cache is mapped through a buffered
+  // descriptor: the mapping is reclaimable cache, so memory pressure only
+  // sends rows back to the disk. Unlike the row cache it needs the file for
+  // as long as the table is open (truncating it in place would fault).
   const auto map_path = "/proc/self/fd/" + std::to_string(file_descriptor);
-  if (const int map_fd = ::open(map_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (const int map_fd = rows * t->row_bytes_ > kCacheBytes
+                             ? ::open(map_path.c_str(), O_RDONLY | O_CLOEXEC)
+                             : -1;
       map_fd >= 0) {
     const std::uint64_t begin = file_offset & ~std::uint64_t{kPage - 1};
     const std::uint64_t end = file_offset + rows * t->row_bytes_;
-    void* p = ::mmap(nullptr, end - begin, PROT_READ, MAP_SHARED, map_fd,
-                     static_cast<off_t>(begin));
+    // Pages past the end of a short file would fault: such a table keeps
+    // the readers, which report the failed row.
+    struct stat st{};
+    void* p = ::fstat(map_fd, &st) == 0 &&
+                      static_cast<std::uint64_t>(st.st_size) >= end
+                  ? ::mmap(nullptr, end - begin, PROT_READ, MAP_SHARED, map_fd,
+                           static_cast<off_t>(begin))
+                  : MAP_FAILED;
     ::close(map_fd);
     if (p != MAP_FAILED) {
       (void)::madvise(p, end - begin, MADV_RANDOM);
