@@ -145,8 +145,9 @@ struct Binder {
     const auto projection = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
                              GgmlType::kF32,  GgmlType::kQ3_K, GgmlType::kQ4_K,
                              GgmlType::kQ5_K};
-    const auto experts = {GgmlType::kQ3_K, GgmlType::kQ4_K, GgmlType::kQ5_K,
-                          GgmlType::kQ6_K, GgmlType::kQ5_1, GgmlType::kQ8_0};
+    const auto experts = {GgmlType::kQ3_K,  GgmlType::kQ4_K, GgmlType::kQ5_K,
+                          GgmlType::kQ6_K,  GgmlType::kQ5_1, GgmlType::kIQ4_NL,
+                          GgmlType::kQ8_0};
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
