@@ -186,9 +186,9 @@ std::optional<QwenDFlashWeights> Load(
   b.Tensor("blk.0.ffn_conv_proj.weight", dynamic * kHidden);
 
   const auto bytes = b.Build();
-  const auto path = std::filesystem::temp_directory_path() /
-                    ("gufo_dflash_weights_test_" + std::to_string(getpid()) +
-                     ".gguf");
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("gufo_dflash_weights_test_" + std::to_string(getpid()) + ".gguf");
   {
     std::ofstream file(path, std::ios::binary);
     file.write(reinterpret_cast<const char*>(bytes.data()),
@@ -227,8 +227,7 @@ void CheckRotarySources() {
          "degenerate M-RoPE sections give twice the first section");
 
   auto count = Load(
-      [](GgufBuilder& b) { b.U32("dflash.rope.dimension_count", 12); },
-      &error);
+      [](GgufBuilder& b) { b.U32("dflash.rope.dimension_count", 12); }, &error);
   Expect(count.has_value() && count->config.rotary_dim == 12,
          "explicit rotary dimension wins");
 

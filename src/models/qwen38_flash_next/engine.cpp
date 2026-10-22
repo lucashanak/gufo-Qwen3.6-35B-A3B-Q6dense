@@ -185,9 +185,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     const auto& out = m->device_->output();
     // A K-quant head keeps its file rows beside the Q8_0 copy; the draft's
     // GEMM reads Q4_K/Q6_K rows directly, about half the bytes per block.
-    const bool raw = out.decode != nullptr &&
-                     (out.decode_type == core::GgmlType::kQ4_K ||
-                      out.decode_type == core::GgmlType::kQ6_K);
+    const bool raw =
+        out.decode != nullptr && (out.decode_type == core::GgmlType::kQ4_K ||
+                                  out.decode_type == core::GgmlType::kQ6_K);
     core::ModelConfig tc;
     tc.num_layers = c.num_layers;
     tc.hidden_size = c.hidden_size;
@@ -446,9 +446,9 @@ bool Session::EnsureDFlashContext() {
     }
     from += n;
   }
-  catchup_seconds_ += std::chrono::duration<float>(
-                          std::chrono::steady_clock::now() - start)
-                          .count();
+  catchup_seconds_ +=
+      std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
+          .count();
   return true;
 }
 
@@ -877,10 +877,10 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
       return false;
     }
     features_fresh_ = true;
-    InjectFeatures(static_cast<std::uint32_t>(tokens_.size()),
-                   static_cast<std::uint32_t>(n),
-                   static_cast<std::uint32_t>(tokens_.size() + tokens.size() -
-                                              off));
+    InjectFeatures(
+        static_cast<std::uint32_t>(tokens_.size()),
+        static_cast<std::uint32_t>(n),
+        static_cast<std::uint32_t>(tokens_.size() + tokens.size() - off));
     features_fresh_ = false;
     const auto kept = capture && capture->tokens < n ? n - capture->tokens : n;
     hidden_base_ = static_cast<std::uint32_t>(
@@ -1229,9 +1229,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     return defer_head || DraftCatchUp(anchor, false, error_msg);
   }
   if (use_dflash) {
-    const auto ids = dflash_->ForwardBlock(
-        static_cast<tokenization::TokenId>(anchor), base,
-        static_cast<std::uint32_t>(width - 1), 0.0F);
+    const auto ids =
+        dflash_->ForwardBlock(static_cast<tokenization::TokenId>(anchor), base,
+                              static_cast<std::uint32_t>(width - 1), 0.0F);
     for (const auto id : ids) {
       pending->chain.push_back(static_cast<std::int32_t>(id));
       if (is_stop(pending->chain.back()))
