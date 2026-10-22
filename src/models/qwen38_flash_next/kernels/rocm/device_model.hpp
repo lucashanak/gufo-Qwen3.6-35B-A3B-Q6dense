@@ -20,6 +20,10 @@ struct DeviceTensor {
   std::uint32_t cols{0};
   std::uint32_t rows{0};
   std::uint32_t experts{1};
+  /// A K-quant trunk projection: `data` is its Q8_0 copy (prefill, fused
+  /// Q8 paths) and these are the file's compact rows, read by decode.
+  const void* decode{nullptr};
+  core::GgmlType decode_type{core::GgmlType::kF32};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] const float* f32() const noexcept {

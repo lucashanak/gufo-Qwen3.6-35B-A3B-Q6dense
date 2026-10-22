@@ -140,6 +140,10 @@ struct Binder {
     const std::uint64_t hc_dim = c.HcDim();
     const auto dense = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
                         GgmlType::kF32};
+    // The large trunk projections may also be K-quants: the device keeps a
+    // Q8_0 copy for prefill and the compact rows for decode.
+    const auto projection = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                             GgmlType::kF32,  GgmlType::kQ4_K, GgmlType::kQ5_K};
     const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
                           GgmlType::kQ5_1, GgmlType::kQ8_0};
 
@@ -148,9 +152,9 @@ struct Binder {
 
     if (linear) {
       l.ssm_qkv =
-          Get(p + "attn_qkv.weight", hidden, c.SsmConvChannels(), 1, dense);
+          Get(p + "attn_qkv.weight", hidden, c.SsmConvChannels(), 1, projection);
       l.ssm_gate =
-          Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, dense);
+          Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, projection);
       l.ssm_conv1d = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
                          c.SsmConvChannels(), 1, {GgmlType::kF32});
       l.ssm_alpha = Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1,
@@ -162,14 +166,14 @@ struct Binder {
       l.ssm_a = Get(p + "ssm_a", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
       l.ssm_norm =
           Get(p + "ssm_norm.weight", c.ssm_head_dim, 1, 1, {GgmlType::kF32});
-      l.ssm_out = Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, dense);
+      l.ssm_out = Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, projection);
     } else {
       l.attn_q =
-          Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1, dense);
-      l.attn_k = Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1, dense);
-      l.attn_v = Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, dense);
+          Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1, projection);
+      l.attn_k = Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1, projection);
+      l.attn_v = Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, projection);
       l.attn_out =
-          Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1, dense);
+          Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1, projection);
       l.attn_q_norm =
           Get(p + "attn_q_norm.weight", c.head_dim, 1, 1, {GgmlType::kF32});
       l.attn_k_norm =
@@ -209,11 +213,11 @@ struct Binder {
     l.shexp_gate_inp =
         Get(p + "ffn_gate_inp_shexp.weight", hidden, 1, 1, {GgmlType::kF32});
     l.shexp_gate =
-        Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
+        Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff, 1, projection);
     l.shexp_up =
-        Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
+        Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1, projection);
     l.shexp_down =
-        Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden, 1, dense);
+        Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden, 1, projection);
 
     if (nextn) {
       l.nextn_enorm =

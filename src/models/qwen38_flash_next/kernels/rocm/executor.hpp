@@ -646,6 +646,9 @@ private:
     // moe
     float* router;
     std::int32_t* ids;
+    /// Zero expert ids: a K-quant projection's decode GEMV is a
+    /// one-expert routed vector product.
+    std::int32_t* dense_ids;
     std::uint32_t* expert_counts;
     // Routed WMMA route: 16-row padded bucket bounds, scatter cursors, the
     // compact row -> (token, slot) maps and the tiled Q8 gathered rows.

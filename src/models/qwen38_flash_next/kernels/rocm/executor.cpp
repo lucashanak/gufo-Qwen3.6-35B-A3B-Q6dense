@@ -1137,6 +1137,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
+  s.dense_ids = Alloc<std::int32_t>(a, kVecBatch, error_msg);
   s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
   {
     const std::size_t compact = RoutedCompactRows(slots, c.num_experts);
@@ -1577,6 +1578,9 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
 
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
+  if (w.decode != nullptr && !MatrixRows(q.n)) {
+    return Dense(w, q.x, out, q.n, error_msg);
+  }
   if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
     if (w.cols != q.k) {
       AssignError(error_msg, "quantized input width mismatch");
@@ -1599,6 +1603,19 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           std::string* error_msg) const {
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
+  if (!MatrixRows(n_tokens) && up.decode != nullptr &&
+      gate.decode != nullptr && up.decode_type == gate.decode_type &&
+      up.rows == gate.rows && up.cols == gate.cols) {
+    if (qfn_mmq_moe_gated_vec(static_cast<int>(up.decode_type), gate.decode,
+                              up.decode, x, s_.dense_ids, out,
+                              static_cast<int>(up.rows),
+                              static_cast<int>(up.cols),
+                              static_cast<int>(n_tokens), 1, 1, stream_) != 0) {
+      AssignError(error_msg, "gated K-quant GEMV failed");
+      return false;
+    }
+    return true;
+  }
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
       gate.type == GgmlType::kQ8_0 && up.rows == gate.rows &&
       up.cols == gate.cols) {
@@ -1670,6 +1687,17 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
+  // K-quant projections decode from their compact rows.
+  if (w.decode != nullptr && !MatrixRows(n_tokens)) {
+    if (qfn_mmq_moe_vec(static_cast<int>(w.decode_type), w.decode, x,
+                        s_.dense_ids, out, static_cast<int>(w.rows),
+                        static_cast<int>(w.cols), static_cast<int>(n_tokens),
+                        1, 1, stream_) != 0) {
+      AssignError(error_msg, "K-quant GEMV failed");
+      return false;
+    }
+    return true;
+  }
   if (w.type == GgmlType::kQ8_0) {
     if (!MatrixRows(n_tokens)) {
       Q8Input q;

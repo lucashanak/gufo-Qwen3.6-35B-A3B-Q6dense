@@ -4,11 +4,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstring>
 #include <initializer_list>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -70,10 +75,119 @@ struct Uploader {
     return weights->Allocate(pointer, size);
   }
 
+  static bool DecodeKQuant(core::GgmlType type) {
+    return type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K;
+  }
+
+  /// Q8_0 blocks of `n` floats, as ggml's quantize_row_q8_0_ref.
+  static void QuantizeQ8_0Row(const float* x, std::uint8_t* out,
+                              std::size_t n) {
+    for (std::size_t b = 0; b < n / 32; ++b) {
+      float amax = 0.0F;
+      for (int j = 0; j < 32; ++j)
+        amax = std::max(amax, std::fabs(x[b * 32 + j]));
+      const float d = amax / 127.0F;
+      const float id = d != 0.0F ? 1.0F / d : 0.0F;
+      const _Float16 dh = static_cast<_Float16>(d);
+      std::memcpy(out + b * 34, &dh, 2);
+      for (int j = 0; j < 32; ++j)
+        reinterpret_cast<std::int8_t*>(out + b * 34 + 2)[j] =
+            static_cast<std::int8_t>(std::round(x[b * 32 + j] * id));
+    }
+  }
+
+  /// K-quant trunk projections stacked along rows: the file's rows go to
+  /// `decode` unchanged and a Q8_0 re-encoding of them to `data`, so every
+  /// Q8_0 path (prefill GEMMs, fused decode kernels) keeps its arithmetic
+  /// while decode GEMVs read the compact rows.
+  DeviceTensor KQuantProjection(std::initializer_list<const TensorRef*> parts) {
+    DeviceTensor d;
+    const TensorRef& first = **parts.begin();
+    std::size_t rows = 0;
+    std::size_t raw = 0;
+    for (const TensorRef* t : parts) {
+      if (t->empty() || t->type != first.type || t->cols != first.cols ||
+          t->experts != 1 || t->cols % 256 != 0) {
+        Fail("K-quant projection parts must share one type and shape");
+        return d;
+      }
+      rows += t->rows;
+      raw += t->SizeBytes();
+    }
+    const std::size_t q8_row = first.cols / 32 * 34;
+    const std::size_t q8 = rows * q8_row;
+    void* raw_ptr = nullptr;
+    void* q8_ptr = nullptr;
+    if (Allocate(&raw_ptr, raw + kTailMargin) != hipSuccess ||
+        Allocate(&q8_ptr, q8 + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(first.name));
+      return d;
+    }
+    if (Measuring()) {
+      return d;
+    }
+    allocations.push_back(raw_ptr);
+    allocations.push_back(q8_ptr);
+    bytes += raw + q8 + 2 * kTailMargin;
+    std::vector<std::uint8_t> host(q8);
+    std::size_t offset = 0;
+    std::size_t row0 = 0;
+    for (const TensorRef* t : parts) {
+      if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
+                       static_cast<std::uint8_t*>(raw_ptr) + offset, error)) {
+        Fail("upload failed for " + std::string(t->name));
+        return d;
+      }
+      offset += t->SizeBytes();
+      const auto* src = static_cast<const std::uint8_t*>(t->data);
+      const std::size_t row_bytes = t->RowBytes();
+      const unsigned workers =
+          std::max(1U, std::min(16U, std::thread::hardware_concurrency()));
+      std::vector<std::thread> threads;
+      for (unsigned w = 0; w < workers; ++w) {
+        threads.emplace_back([&, w] {
+          std::vector<float> row(t->cols);
+          for (std::size_t r = w; r < t->rows; r += workers) {
+            const auto* in = src + r * row_bytes;
+            if (t->type == core::GgmlType::kQ4_K)
+              gufo::quant::DequantizeQ4_K(in, row.data(), t->cols);
+            else
+              gufo::quant::DequantizeQ5_K(in, row.data(), t->cols);
+            QuantizeQ8_0Row(row.data(), host.data() + (row0 + r) * q8_row,
+                            t->cols);
+          }
+        });
+      }
+      for (auto& th : threads)
+        th.join();
+      row0 += t->rows;
+    }
+    if (hipMemcpy(q8_ptr, host.data(), q8, hipMemcpyHostToDevice) !=
+        hipSuccess) {
+      Fail("Q8_0 copy upload failed for " + std::string(first.name));
+      return d;
+    }
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(raw_ptr) + raw, 0,
+                         kTailMargin, nullptr);
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(q8_ptr) + q8, 0,
+                         kTailMargin, nullptr);
+    d.data = q8_ptr;
+    d.type = core::GgmlType::kQ8_0;
+    d.cols = static_cast<std::uint32_t>(first.cols);
+    d.rows = static_cast<std::uint32_t>(rows);
+    d.decode = raw_ptr;
+    d.decode_type = first.type;
+    max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
+    return d;
+  }
+
   DeviceTensor Copy(const TensorRef& t) {
     DeviceTensor d;
     if (t.empty() || !ok) {
       return d;
+    }
+    if (t.experts == 1 && DecodeKQuant(t.type)) {
+      return KQuantProjection({&t});
     }
     const std::size_t size = t.SizeBytes();
     void* ptr = nullptr;
@@ -165,6 +279,9 @@ struct Uploader {
     std::size_t rows = 0;
     std::size_t size = 0;
     const core::GgmlType type = (*parts.begin())->type;
+    if (DecodeKQuant(type)) {
+      return KQuantProjection(parts);
+    }
     for (const TensorRef* t : parts) {
       if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
           (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
@@ -242,8 +359,10 @@ struct Uploader {
     // Projections of one input are stacked into one Q8_0 GEMV where the
     // quantization allows; otherwise they stay separate.
     const auto stackable = [](std::initializer_list<const TensorRef*> parts) {
+      const core::GgmlType type = (*parts.begin())->type;
       for (const TensorRef* t : parts) {
-        if (t->empty() || t->type != core::GgmlType::kQ8_0 ||
+        if (t->empty() || t->type != type ||
+            (type != core::GgmlType::kQ8_0 && !DecodeKQuant(type)) ||
             t->cols != (*parts.begin())->cols) {
           return false;
         }
