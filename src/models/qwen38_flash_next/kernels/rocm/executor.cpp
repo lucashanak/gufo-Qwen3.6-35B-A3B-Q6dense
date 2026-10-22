@@ -81,6 +81,11 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+// Rows a K-quant projection decodes from its compact rows. The vector
+// kernel re-reads the weights per row; from four rows the Q8_0 copy's
+// shared-read kernel is faster (16384 x 2560: 250 vs 207 us at four rows,
+// 140 vs 200 us at three).
+constexpr std::uint32_t kKQuantDecodeRows = 3;
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -1578,7 +1583,7 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
 
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
-  if (w.decode != nullptr && !MatrixRows(q.n)) {
+  if (w.decode != nullptr && q.n <= kKQuantDecodeRows && !MatrixRows(q.n)) {
     return Dense(w, q.x, out, q.n, error_msg);
   }
   if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
@@ -1603,7 +1608,8 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           std::string* error_msg) const {
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
-  if (!MatrixRows(n_tokens) && up.decode != nullptr &&
+  if (!MatrixRows(n_tokens) && n_tokens <= kKQuantDecodeRows &&
+      up.decode != nullptr &&
       gate.decode != nullptr && up.decode_type == gate.decode_type &&
       up.rows == gate.rows && up.cols == gate.cols) {
     if (qfn_mmq_moe_gated_vec(static_cast<int>(up.decode_type), gate.decode,
@@ -1688,7 +1694,8 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
   // K-quant projections decode from their compact rows.
-  if (w.decode != nullptr && !MatrixRows(n_tokens)) {
+  if (w.decode != nullptr && n_tokens <= kKQuantDecodeRows &&
+      !MatrixRows(n_tokens)) {
     if (qfn_mmq_moe_vec(static_cast<int>(w.decode_type), w.decode, x,
                         s_.dense_ids, out, static_cast<int>(w.rows),
                         static_cast<int>(w.cols), static_cast<int>(n_tokens),
