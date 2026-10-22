@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next experiments
 
+## Output and draft heads (October 22, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| Q4_K/Q5_K head GEMV for 2–8 rows: four rows per wave (two up to three tokens), codes decoded once per block, each token's Q8_1 words loaded once for every row, exact FP32 products in place of 32-bit integer multiplies, one scatter butterfly for all sums, and a scheduling barrier after the iteration's loads | Component result; end-to-end qualification pending. Every row is byte-identical to its one-token launch at 1–8 rows for Q3_K–Q6_K, Q5_1 and IQ4_NL (`head_ops`), and the 248,320-row logits hash as before. Release microbenchmark, synthetic rows × 2560, alternating with 6588562d, ms at N = 1/2/4/6/8: Q5_K 1.94/2.20/2.94/4.17/5.20 → 1.93/1.94/1.97/2.02/2.38 (+0.47 → +0.06 ms per extra row); Q4_K 1.59/1.59/1.82/2.52/3.23 (N=7 3.69) → 1.60/1.60/1.62/1.84/2.25. Batched draft heads over the 99,328-row prefix at N=8: Q5_K 2.11 → 0.97, Q4_K 1.22 → 0.89. Without the barrier the scheduler interleaved loads and products from six tokens on, cutting VGPRs and exposing latency (N=8 Q5_K 3.2 ms, with 24-bit integer multiplies or FP32 products alike). Rejected: eight rows per wave up to four tokens (slower at 2–3), a lower occupancy target (identical code). |
+| Grouped loads in the draft head's argmax confidence | Retained: one block issues 16 loads per thread before adding them in the original order; the bits are unchanged. 23 → 9 µs over 99,328 draft logits, 48 → 14 µs over 248,320, per draft step and per batched session. |
+| A smaller draft-vocabulary prefix | Rejected for now. IDs below 98,304 are 89–97% ASCII per 16K range and [98,304, 151,643) is 95% CJK, so the prefix is already the Latin/code part; shrinking it drops lower-ranked English and code words. Replaying `MtpDraftVocab` with the tokenizer over local text (C++ 2.0M tokens, Python 0.42M, English Markdown 0.44M, Czech Markdown 49K), as small-head cycles / uncovered targets on them / mean projected rows: C++ at 98,304 100% / 0.01% / 99K, at 49,152 96% / 0.60% / 57K, at 32,768 92% / 0.93% / 51K; English 99.5% / 0.13% / 100K, 80% / 2.2% / 89K, 63% / 3.2% / 114K; Czech 38% / 5.0% / 191K at 98,304 and worse below. Fewer quiet windows send more cycles to the 248,320-row head, so prose gains little and loses up to 2–3% of draftable targets. A frequency-ranked subset (gathered rows) or a two-tier prefix remains untested. |
+
 ## One-launch decode HC mixer (October 22, 2026)
 
 | Experiment | Outcome |
