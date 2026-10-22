@@ -1989,19 +1989,26 @@ const float* InjectWeights(const DeviceMixer& m) {
                                                               : nullptr;
 }
 
+/// The rows a decode mixer projection reads: the compact decode rows when
+/// there are any (Dense's route), else Q8_0 data (F32 marks anything else).
+WeightType MixerFormat(const DeviceTensor& w) {
+  if (w.decode != nullptr)
+    return static_cast<WeightType>(w.decode_type);
+  return w.type == GgmlType::kQ8_0 ? WeightType::kQ8_0 : WeightType::kF32;
+}
+
 }  // namespace
 
 bool Executor::FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const {
-  // Model geometry and Q8_0 projections only: a mixer decoded from another
-  // format keeps the separate kernels.
+  // Model geometry, and the formats and widths for which the fused kernel
+  // wins; other mixers keep the separate kernels.
   const Config& c = config();
   return hc_fused_state_ != nullptr && !MatrixRows(n_tokens) &&
          n_tokens <= kVecBatch && c.hc_count == 4 && c.hidden_size == 2560 &&
-         c.hc_low_rank == 320 && m.down.type == GgmlType::kQ8_0 &&
-         m.down.decode == nullptr && m.down.rows == c.hc_low_rank &&
-         m.down.cols == c.HcDim() && m.up.type == GgmlType::kQ8_0 &&
-         m.up.decode == nullptr && m.up.rows == c.HcDim() &&
-         m.up.cols == c.hc_low_rank;
+         c.hc_low_rank == 320 && m.down.rows == c.hc_low_rank &&
+         m.down.cols == c.HcDim() && m.up.rows == c.HcDim() &&
+         m.up.cols == c.hc_low_rank &&
+         n_tokens <= HcFusedMaxTokens(MixerFormat(m.down), MixerFormat(m.up));
 }
 
 void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
@@ -2101,8 +2108,8 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       // The combine, both projections, SiLU and the epilogue in one launch,
       // with the outputs and producer-written Q8_1 rows of the kernels below.
       const HcFusedMix mix{
-          m.down.data,
-          m.up.data,
+          m.down.decode != nullptr ? m.down.decode : m.down.data,
+          m.up.decode != nullptr ? m.up.decode : m.up.data,
           p.res,
           p.block_out,
           p.inject,
@@ -2122,7 +2129,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
           c.hc_count,
           c.hc_low_rank,
           c.rms_eps,
-          1.0F / static_cast<float>(c.hc_count)};
+          1.0F / static_cast<float>(c.hc_count),
+          MixerFormat(m.down),
+          MixerFormat(m.up)};
       if (!HcMixQ8Fused(hc_fused_state_, mix, n_tokens, stream_)) {
         AssignError(error_msg, "fused HC mixer failed");
         return false;

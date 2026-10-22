@@ -44,6 +44,7 @@ enum class WeightType : std::uint32_t {
   kQ3_K = 11,
   kQ4_K = 12,
   kQ5_K = 13,
+  kQ6_K = 14,
   kIQ4_NL = 20,
   kBF16 = 30,
 };
@@ -112,8 +113,8 @@ bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
 /// projections with its SiluScaleQ8_1 rows (lo, lo_q8 of `lo_q8_cols`), and
 /// HcMixEpilogue's outputs; a null `inject_w` writes no inject partials.
 struct HcFusedMix {
-  const void* down;  ///< Q8_0 [rank][streams * hidden]
-  const void* up;    ///< Q8_0 [streams * hidden][rank]
+  const void* down;  ///< [rank][streams * hidden] rows of `down_type`
+  const void* up;    ///< [streams * hidden][rank] rows of `up_type`
   float* res;
   const float* block_out;
   const float* inject;
@@ -133,7 +134,17 @@ struct HcFusedMix {
   std::uint32_t rank;
   float eps;
   float scale;  ///< the SiLU input scale, 1 / streams
+  /// Q8_0 (the qfn_q8_hc_down / mul_mat_vec_q8 arithmetic) or a decode
+  /// format's compact rows (qfn_mmq_dense_kq_vec_preq's); see HcFusedFormats.
+  WeightType down_type{WeightType::kQ8_0};
+  WeightType up_type{WeightType::kQ8_0};
 };
+/// Whether HcMixQ8Fused takes these projection formats: Q8_0 / Q8_0,
+/// Q6_K / Q5_1 and IQ4_NL / IQ4_NL.
+bool HcFusedFormats(WeightType down, WeightType up);
+/// The widest decode batch for which one HcMixQ8Fused launch of these formats
+/// beats the separate kernels (0 when it does not take them).
+std::uint32_t HcFusedMaxTokens(WeightType down, WeightType up);
 /// Device bytes of HcMixQ8Fused's counters and intermediates. Allocate them
 /// zeroed once; every launch leaves its counters zero again, so captured
 /// graphs replay it. Launches sharing one state must be stream-ordered.
@@ -141,7 +152,8 @@ std::size_t HcMixQ8FusedStateBytes();
 /// A decode batch's (1..8 tokens) HcCombineQ8_1, down projection, SiLU
 /// scale, up projection and HcMixEpilogue in one launch, byte for byte their
 /// outputs (the up projection's gate rows are not stored). Only the model's
-/// 4 x 2560 streams and rank 320; false, with nothing launched, otherwise.
+/// 4 x 2560 streams, rank 320 and HcFusedFormats; false, with nothing
+/// launched, otherwise.
 bool HcMixQ8Fused(void* state, const HcFusedMix& mix, std::uint32_t n_tokens,
                   hipStream_t stream);
 /// HcCombine writing the normalized output as F16, the width the next
