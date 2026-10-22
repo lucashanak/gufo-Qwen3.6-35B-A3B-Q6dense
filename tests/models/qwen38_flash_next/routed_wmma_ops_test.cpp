@@ -336,7 +336,7 @@ struct Result {
 };
 
 const char* TypeName(q::WeightType type) {
-  return static_cast<int>(type) == 20  ? "IQ4_NL"
+  return type == q::WeightType::kIQ4_NL  ? "IQ4_NL"
          : type == q::WeightType::kQ3_K ? "Q3_K"
          : type == q::WeightType::kQ4_K ? "Q4_K"
          : type == q::WeightType::kQ5_K ? "Q5_K"
@@ -353,8 +353,9 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
            std::uint32_t seed, std::uint32_t tile_rows = 48,
            float input_scale = 2.0F) {
   const Experts w =
-      type == q::WeightType::kQ3_K   ? MakeQ3K(experts, m, k, seed)
-      : type == q::WeightType::kQ4_K ? MakeQ4K(experts, m, k, seed)
+      type == q::WeightType::kQ3_K     ? MakeQ3K(experts, m, k, seed)
+      : type == q::WeightType::kIQ4_NL ? MakeIQ4NL(experts, m, k, seed)
+      : type == q::WeightType::kQ4_K   ? MakeQ4K(experts, m, k, seed)
       : type == q::WeightType::kQ5_K ? MakeQ5K(experts, m, k, seed)
       : type == q::WeightType::kQ5_1 ? MakeQ5_1(experts, m, k, seed)
                                      : MakeQ8_0(experts, m, k, seed);
@@ -400,7 +401,8 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   std::vector<float> zero_out(slots * m, 0.0F);
   float* d_mmq = Upload(zero_out);
 
-  const auto mmq_raw = type == q::WeightType::kQ3_K   ? qfn_mmq_q3_K_moe_raw
+  const auto mmq_raw = type == q::WeightType::kIQ4_NL ? qfn_mmq_iq4_nl_moe_raw
+                       : type == q::WeightType::kQ3_K ? qfn_mmq_q3_K_moe_raw
                        : type == q::WeightType::kQ4_K ? qfn_mmq_q4_K_moe_raw
                        : type == q::WeightType::kQ5_K ? qfn_mmq_q5_K_moe_raw
                        : type == q::WeightType::kQ5_1 ? qfn_mmq_q5_1_moe_raw
@@ -691,7 +693,7 @@ void ReportVectorAccuracy() {
     const std::vector<Case> cases =
         down ? std::vector<Case>{{q::WeightType::kQ5_1, false},
                                  {q::WeightType::kQ5_1, true},
-                                 {static_cast<q::WeightType>(20), false},
+                                 {q::WeightType::kIQ4_NL, false},
                                  {q::WeightType::kQ8_0, false}}
              : std::vector<Case>{{q::WeightType::kQ3_K, false},
                                  {q::WeightType::kQ4_K, false},
@@ -705,7 +707,7 @@ void ReportVectorAccuracy() {
             0x7EC70000U + 256U * static_cast<int>(type) + (down ? 64U : 0U) + n;
         const Experts w =
             quantized ? MakeQuantizedQ5_1(experts, rows, cols, seed)
-            : static_cast<int>(type) == 20 ? MakeIQ4NL(experts, rows, cols, seed)
+            : type == q::WeightType::kIQ4_NL ? MakeIQ4NL(experts, rows, cols, seed)
             : type == q::WeightType::kQ3_K ? MakeQ3K(experts, rows, cols, seed)
             : type == q::WeightType::kQ4_K ? MakeQ4K(experts, rows, cols, seed)
             : type == q::WeightType::kQ5_K ? MakeQ5K(experts, rows, cols, seed)
@@ -772,7 +774,7 @@ void CheckVectorGrouping(bool down = false) {
   constexpr std::size_t guard = 16;
   constexpr float poison = -1234567.0F;
   const std::vector<q::WeightType> formats =
-      down ? std::vector{q::WeightType::kQ5_1, static_cast<q::WeightType>(20),
+      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kIQ4_NL,
                          q::WeightType::kQ8_0}
            : std::vector{q::WeightType::kQ3_K, q::WeightType::kQ4_K,
                          q::WeightType::kQ5_K, q::WeightType::kQ5_1,
@@ -1032,6 +1034,12 @@ int main() {
     }
     // Q5_K gate/up view (one layer).
     ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 640, 2560, 0x5A5A0001U)) &&
+         ok;
+    // IQ4_NL down view, full and ragged.
+    ok = Ok(Run(q::WeightType::kIQ4_NL, 3000, 1, 64, 2560, 640, 0x14A40001U,
+                64)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kIQ4_NL, 97, 1, 8, 129, 640, 0x14A40002U, 16)) &&
          ok;
     // Q8_0 down view (five layers keep Q8_0 down projections).
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,

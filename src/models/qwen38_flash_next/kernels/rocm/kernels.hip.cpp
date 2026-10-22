@@ -4974,6 +4974,22 @@ __device__ __forceinline__ float Q3KScale(uint4 h, int is) {
   return d * static_cast<float>(static_cast<int>(lo | (hi << 4U)) - 32);
 }
 
+/// ggml's kvalues_iq4nl, four signed bytes per word.
+__device__ __forceinline__ std::uint32_t IQ4NLWord(int i) {
+  constexpr std::uint32_t kWords[4] = {0xBFAD9881U, 0xF6EADDCFU, 0x26190D01U,
+                                       0x71594535U};
+  return kWords[i];
+}
+
+/// The signed table values of the four nibbles in `nib` (one per byte).
+__device__ __forceinline__ std::uint32_t IQ4NLBytes(std::uint32_t nib) {
+  const std::uint32_t sel = nib & 0x07070707U;
+  const std::uint32_t lo = __builtin_amdgcn_perm(IQ4NLWord(1), IQ4NLWord(0), sel);
+  const std::uint32_t hi = __builtin_amdgcn_perm(IQ4NLWord(3), IQ4NLWord(2), sel);
+  return __builtin_amdgcn_perm(hi, lo,
+                               0x03020100U | ((nib & 0x08080808U) >> 1U));
+}
+
 /// (scale, 0) as packed F16: Q3_K codes enter WMMA as c - 4 (see magic).
 __device__ __forceinline__ std::uint32_t Q3KScaleBias(uint4 h, int is,
                                                       bool live) {
@@ -4986,6 +5002,7 @@ __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
   return kType == WeightType::kQ4_K   ? (k / 256) * sizeof(Q4KBlock)
          : kType == WeightType::kQ5_K ? (k / 256) * kQ5KBlockBytes
          : kType == WeightType::kQ3_K ? (k / 256) * kQ3KBlockBytes
+         : kType == WeightType::kIQ4_NL ? (k / 32) * 18
          : kType == WeightType::kQ5_1 ? (k / 32) * sizeof(Q5_1Block)
                                       : (k / 32) * sizeof(Q8_0Block);
 }
@@ -5038,7 +5055,9 @@ __launch_bounds__(256) __global__
   constexpr int kWaveRowTiles = BM / 128;  // 16-row tiles per wave
   constexpr bool kQ5 = kType == WeightType::kQ5_1;
   constexpr bool kQ5K = kType == WeightType::kQ5_K;
-  constexpr bool kQ8 = kType == WeightType::kQ8_0;
+  // IQ4_NL takes the Q8_0 route once its table values are expanded to bytes.
+  constexpr bool kIQ4 = kType == WeightType::kIQ4_NL;
+  constexpr bool kQ8 = kType == WeightType::kQ8_0 || kIQ4;
   constexpr bool kQ3K = kType == WeightType::kQ3_K;
   // 16-byte code chunks per row and stage: Q4_K's nibble pair and Q5_1's
   // two nibble blocks are two, Q8_0's two byte blocks are four.
@@ -5196,7 +5215,18 @@ __launch_bounds__(256) __global__
     }
 #pragma unroll
     for (int u = 0; u < (kQ5 ? 0 : kWaveRowTiles); ++u) {
-      if constexpr (kQ8) {
+      if constexpr (kIQ4) {
+        // block_iq4_nl: d, then elements 0-15 / 16-31 as low / high nibbles.
+        const auto* blk = f_ptr[u] + ((kb0 + f_c) * 18);
+        f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
+        uint4 qs;
+        __builtin_memcpy(&qs, blk + 2, 16);
+        f_codes[u] = make_uint4(IQ4NLBytes(qs.x), IQ4NLBytes(qs.y),
+                                IQ4NLBytes(qs.z), IQ4NLBytes(qs.w));
+        f_codes_hi[u] =
+            make_uint4(IQ4NLBytes(qs.x >> 4U), IQ4NLBytes(qs.y >> 4U),
+                       IQ4NLBytes(qs.z >> 4U), IQ4NLBytes(qs.w >> 4U));
+      } else if constexpr (kQ8) {
         // block_q8_0 is 34 bytes, so the code loads are 2-byte aligned.
         const auto* blk = f_ptr[u] + ((kb0 + f_c) * 34);
         f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
@@ -6279,6 +6309,12 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
                          pad_bounds, rows_in, rows_out, swiglu_gate, out,
                          out_half, m, k, nullptr);
+      return true;
+    case WeightType::kIQ4_NL:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ4_NL, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
+          rows_out, swiglu_gate, out, out_half, m, k, nullptr);
       return true;
     case WeightType::kQ5_K:
       if constexpr (BN > 48) {
