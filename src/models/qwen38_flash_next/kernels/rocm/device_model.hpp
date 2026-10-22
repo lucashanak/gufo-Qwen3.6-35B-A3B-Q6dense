@@ -117,6 +117,8 @@ public:
   }
 
 private:
+  /// Builds small synthetic models for operator-level executor tests.
+  friend struct DeviceModelTestAccess;
   DeviceModel() = default;
 
   Config config_;

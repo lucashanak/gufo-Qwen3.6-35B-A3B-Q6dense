@@ -8,8 +8,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -299,6 +301,15 @@ public:
   [[nodiscard]] bool SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
                                        float* logits,
                                        std::string* error_msg) const;
+  /// Repeated batch shapes of the same sessions replay captured graphs.
+  /// Disabling them runs every batch eagerly (a qualification reference).
+  void SetBatchGraphs(bool enabled) const noexcept {
+    batch_graphs_.enabled = enabled;
+  }
+  /// Batched graph launches so far (ForwardBatch pieces, MTP bodies, heads).
+  [[nodiscard]] std::uint64_t BatchGraphReplays() const noexcept {
+    return batch_graphs_.replays;
+  }
   [[nodiscard]] bool ReadVerificationRows(std::uint32_t row,
                                           std::span<float> logits,
                                           std::string* error_msg) const;
@@ -447,6 +458,7 @@ public:
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
 
 private:
+  friend class Session;
   Executor() = default;
 
   /// Visits every device region of a snapshot in payload order with
@@ -602,6 +614,14 @@ private:
   bool Run(Session& session, std::uint64_t key, bool graph,
            const std::function<bool()>& body, std::string* error_msg,
            bool synchronize = true) const;
+  /// Runs `body` eagerly, or replays its graph for `key`: shape words then
+  /// the identity of every session whose buffers the commands name. A key
+  /// runs eagerly once, then eagerly again while its graph is recorded.
+  bool RunBatch(const std::vector<std::uint64_t>& key,
+                std::span<Session* const> sessions, bool graph,
+                const std::function<bool()>& body, std::string* error) const;
+  /// Forgets every batched graph that names `session`'s buffers.
+  void DropBatchGraphs(const Session* session) const noexcept;
 
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
@@ -741,6 +761,23 @@ private:
   mutable GdnBatchItem* batch_gdn_host_{nullptr};
   mutable GdnBatchItem* batch_gdn_{nullptr};
   mutable std::uint32_t batch_rows_{0};
+  /// Captured batched graphs, least recently used evicted beyond a bound.
+  struct BatchGraphs {
+    struct Entry {
+      hipGraphExec_t exec{nullptr};
+      std::vector<const Session*> sessions;
+      std::uint64_t used{0};
+      /// Restores the host dispatch state the recorded pass left behind.
+      std::function<void()> restore;
+    };
+    std::map<std::vector<std::uint64_t>, Entry> graphs;
+    std::set<std::vector<std::uint64_t>> warmed;
+    std::uint64_t clock{0};
+    std::uint64_t replays{0};
+    bool enabled{true};
+    ~BatchGraphs();
+  };
+  mutable BatchGraphs batch_graphs_;
   mutable const float* selected_logits_{nullptr};
   [[nodiscard]] const float* VerificationLogits() const {
     return selected_logits_ != nullptr ? selected_logits_ : s_.logits;
