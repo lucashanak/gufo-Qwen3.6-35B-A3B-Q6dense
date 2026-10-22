@@ -120,12 +120,13 @@ struct Binder {
     HcMixer m;
     const std::uint64_t hc_dim = c.HcDim();
     m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, {GgmlType::kF32});
-    m.down =
-        Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
-    m.up =
-        Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
+    // IQ4_NL mixers decode from their compact rows (see KQuantProjection).
+    m.down = Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
+                 {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                  GgmlType::kF32, GgmlType::kIQ4_NL});
+    m.up = Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
+               {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                GgmlType::kF32, GgmlType::kIQ4_NL});
     if (with_inject) {
       m.inject = Get(prefix + "_inject.weight", hc_dim, c.hc_count, 1,
                      {GgmlType::kF32, GgmlType::kQ8_0, GgmlType::kBF16});

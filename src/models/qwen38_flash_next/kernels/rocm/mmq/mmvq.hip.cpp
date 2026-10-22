@@ -440,6 +440,10 @@ void mul_mat_vec_dense_kq_dispatch(const void* weights, ggml_type type,
       launch_dense_kq<GGML_TYPE_Q5_K>(weights, input, output, k, rows, tokens,
                                       input_stride, stream);
       break;
+    case GGML_TYPE_IQ4_NL:
+      launch_dense_kq<GGML_TYPE_IQ4_NL>(weights, input, output, k, rows,
+                                        tokens, input_stride, stream);
+      break;
     default:
       GGML_ABORT("unsupported dense vector weight format");
   }

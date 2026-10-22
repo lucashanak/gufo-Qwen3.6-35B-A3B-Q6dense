@@ -1580,7 +1580,18 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
   if (w.decode != nullptr && !MatrixRows(q.n)) {
-    return Dense(w, q.x, out, q.n, error_msg);
+    if (q.data == nullptr) {
+      return Dense(w, q.x, out, q.n, error_msg);
+    }
+    if (w.cols != q.k ||
+        qfn_mmq_dense_kq_vec_preq(static_cast<int>(w.decode_type), w.decode,
+                                  q.data, out, static_cast<int>(w.rows),
+                                  static_cast<int>(w.cols),
+                                  static_cast<int>(q.n), stream_) != 0) {
+      AssignError(error_msg, "K-quant GEMV failed");
+      return false;
+    }
+    return true;
   }
   if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
     if (w.cols != q.k) {
@@ -1688,8 +1699,12 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
-  // K-quant projections decode from their compact rows.
+  // K-quant projections decode from their compact rows, reading Q8_1 rows
+  // a producer already wrote when there are any.
   if (w.decode != nullptr && !MatrixRows(n_tokens)) {
+    if (const void* ready = ReadyQ8(x, n_tokens, w.cols)) {
+      return Dense(w, Q8Input{x, ready, n_tokens, w.cols}, out, error_msg);
+    }
     if (qfn_mmq_dense_kq_vec(static_cast<int>(w.decode_type), w.decode, x,
                              out, static_cast<int>(w.rows),
                              static_cast<int>(w.cols),

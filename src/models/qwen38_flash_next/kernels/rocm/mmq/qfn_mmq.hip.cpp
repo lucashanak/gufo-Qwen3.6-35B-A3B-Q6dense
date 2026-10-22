@@ -517,7 +517,7 @@ extern "C" int qfn_mmq_dense_kq_vec(int weight_type, const void* W,
   constexpr const char* tag = "qfn_mmq_dense_kq_vec";
   const auto type = static_cast<ggml_type>(weight_type);
   if ((type != GGML_TYPE_Q3_K && type != GGML_TYPE_Q4_K &&
-       type != GGML_TYPE_Q5_K) ||
+       type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_NL) ||
       !W || !X_f32 ||
       !out_f32 || M <= 0 || K <= 0 || K % ggml_blck_size(type) != 0 ||
       n_tokens <= 0 || n_tokens > MMVQ_MAX_BATCH_SIZE) {
@@ -546,6 +546,31 @@ extern "C" int qfn_mmq_dense_kq_vec(int weight_type, const void* W,
     return -2;
   }
   return 0;
+}
+
+extern "C" int qfn_mmq_dense_kq_vec_preq(int weight_type, const void* W,
+                                         const void* X_q8, float* out_f32,
+                                         int M, int K, int n_tokens,
+                                         hipStream_t stream) {
+  const auto type = static_cast<ggml_type>(weight_type);
+  if ((type != GGML_TYPE_Q3_K && type != GGML_TYPE_Q4_K &&
+       type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_NL) ||
+      !W || !X_q8 || !out_f32 || M <= 0 || K <= 0 ||
+      K % ggml_blck_size(type) != 0 || n_tokens <= 0 ||
+      n_tokens > MMVQ_MAX_BATCH_SIZE) {
+    fprintf(stderr,
+            "qfn_mmq_dense_kq_vec_preq: unsupported type %d or shape M=%d "
+            "K=%d ntok=%d\n",
+            weight_type, M, K, n_tokens);
+    return -1;
+  }
+  // The rows qfn_mmq_quantize_q8_1 writes: ne10_padded elements per token.
+  const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+  mul_mat_vec_dense_kq_dispatch(W, type,
+                                reinterpret_cast<const block_q8_1*>(X_q8),
+                                out_f32, K, M, n_tokens, ne10_padded / QK8_1,
+                                stream);
+  return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
 extern "C" int qfn_mmq_moe_gated_vec(int weight_type, const void* gate,

@@ -77,7 +77,7 @@ struct Uploader {
 
   static bool DecodeKQuant(core::GgmlType type) {
     return type == core::GgmlType::kQ3_K || type == core::GgmlType::kQ4_K ||
-           type == core::GgmlType::kQ5_K;
+           type == core::GgmlType::kQ5_K || type == core::GgmlType::kIQ4_NL;
   }
 
   /// Q8_0 blocks of `n` floats, as ggml's quantize_row_q8_0_ref.
@@ -150,7 +150,9 @@ struct Uploader {
           std::vector<float> row(t->cols);
           for (std::size_t r = w; r < t->rows; r += workers) {
             const auto* in = src + r * row_bytes;
-            if (t->type == core::GgmlType::kQ3_K)
+            if (t->type == core::GgmlType::kIQ4_NL)
+              gufo::quant::DequantizeIQ4_NL(in, row.data(), t->cols);
+            else if (t->type == core::GgmlType::kQ3_K)
               gufo::quant::DequantizeQ3_K(in, row.data(), t->cols);
             else if (t->type == core::GgmlType::kQ4_K)
               gufo::quant::DequantizeQ4_K(in, row.data(), t->cols);
