@@ -283,14 +283,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       options.max_logit_rows, 1, e->options_.max_batch);
   e->options_.max_speculative = std::clamp<std::uint32_t>(
       options.max_speculative, 1, e->options_.max_logit_rows);
-  if (const char* kv = std::getenv("GUFO_Q36_KV"); kv != nullptr) {
-    if (std::string_view(kv) == "f16") {
-      e->kv_f16_ = true;
-    } else if (std::string_view(kv) != "q8") {
-      AssignError(error_msg, "GUFO_Q36_KV must be f16 or q8");
-      return nullptr;
-    }
-  }
   if (q36_mmq_init(0) != 0) {
     AssignError(error_msg, "quantized GEMM tier initialization failed");
     return nullptr;
@@ -479,7 +471,7 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
                                   c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t kv_elems = static_cast<std::size_t>(max_context) * kv_row;
-  if (!kv_f16_ && kv_half_elems_ < kv_elems) {
+  if (kv_half_elems_ < kv_elems) {
     kv_half_k_ = Alloc<__half>(kv_half_allocations_, kv_elems, error_msg);
     kv_half_v_ = Alloc<__half>(kv_half_allocations_, kv_elems, error_msg);
     if (kv_half_k_ == nullptr || kv_half_v_ == nullptr)
@@ -487,15 +479,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     kv_half_elems_ = kv_elems;
   }
   const auto AllocKv = [&](auto& kv) {
-    if (kv_f16_) {
-      kv.k_cache =
-          Alloc<__half>(a, kv_elems, error_msg, &s->allocated_bytes_);
-      kv.v_cache =
-          Alloc<__half>(a, kv_elems, error_msg, &s->allocated_bytes_);
-    } else {
-      kv.k_cache = kv_half_k_;
-      kv.v_cache = kv_half_v_;
-    }
+    kv.k_cache = kv_half_k_;
+    kv.v_cache = kv_half_v_;
     kv.k_q8 = Alloc<std::int8_t>(a, kv_elems, error_msg, &s->allocated_bytes_);
     kv.v_q8 = Alloc<std::int8_t>(a, kv_elems, error_msg, &s->allocated_bytes_);
     kv.k_scale =
@@ -583,13 +568,11 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
   const std::size_t state =
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
-  // The 8-bit K and V caches (one F16 scale per 16 values), plus their F16
-  // values with kv_f16_; otherwise the F16 staging pair is shared by the
-  // executor, not owned by a session.
+  // The 8-bit K and V caches (one F16 scale per 16 values); the F16 staging
+  // pair is shared by the executor, not owned by a session.
   const std::size_t kv_elems = std::size_t{max_context} * c.AttentionKvDim();
   const std::size_t kv =
-      2 * (kv_elems * sizeof(std::int8_t) + kv_elems / 16 * sizeof(__half) +
-           (kv_f16_ ? kv_elems * sizeof(__half) : 0));
+      2 * (kv_elems * sizeof(std::int8_t) + kv_elems / 16 * sizeof(__half));
   const auto rollback_state =
       rollback_depth == 0
           ? 0
@@ -1255,14 +1238,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   if (MatrixRows(n_tokens)) {
     // Only the Q8 cache persists: widen it back, this chunk's rows included,
     // so every row reads the values decode reads and the result does not
-    // depend on where the scheduler split the prompt. Persistent F16 caches
-    // already hold every row unrounded.
-    if (!kv_f16_) {
+    // depend on where the scheduler split the prompt.
     DequantizeKv(s.k_q8, s.k_scale, s.k_cache, start_pos + n_tokens, kv_row,
                  stream_);
     DequantizeKv(s.v_q8, s.v_scale, s.v_cache, start_pos + n_tokens, kv_row,
                  stream_);
-    }
     if (!WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, s_.ctx,
                              n_tokens, start_pos, c.num_heads, c.num_kv_heads,
                              c.head_dim, stream_, last_only)) {
@@ -1888,7 +1868,6 @@ struct SnapshotHeader {
   std::uint32_t mtp_residual_valid;
   std::uint32_t hidden_rows;
   std::uint32_t image_count;
-  std::uint32_t kv_f16;
   std::uint64_t payload_bytes;
 };
 static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
@@ -1896,7 +1875,7 @@ static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
 namespace {
 
 SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
-                                  const Session& session, bool kv_f16) {
+                                  const Session& session) {
   SnapshotHeader h{};
   h.magic = kSnapshotMagic;
   h.num_layers = c.num_layers;
@@ -1906,7 +1885,6 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.kv_row = c.AttentionKvDim();
   h.hidden = c.hidden_size;
   h.has_mtp = has_mtp ? 1 : 0;
-  h.kv_f16 = kv_f16 ? 1 : 0;
   h.position = session.position();
   h.image_count = std::ranges::count_if(
       session.VisionLayout().images,
@@ -1920,7 +1898,7 @@ bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
          h.full_attention_interval == mine.full_attention_interval &&
          h.conv_elems == mine.conv_elems && h.state_elems == mine.state_elems &&
          h.kv_row == mine.kv_row && h.hidden == mine.hidden &&
-         h.has_mtp == mine.has_mtp && h.kv_f16 == mine.kv_f16;
+         h.has_mtp == mine.has_mtp;
 }
 
 }  // namespace
@@ -1960,12 +1938,7 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
-      const std::uint64_t f16_bytes = h.kv_f16 != 0 ? kv_bytes : 0;
-      if (!region(at != nullptr ? at->k_cache : nullptr, f16_bytes,
-                  "K cache") ||
-          !region(at != nullptr ? at->v_cache : nullptr, f16_bytes,
-                  "V cache") ||
-          !region(at != nullptr ? at->k_q8 : nullptr, kv_bytes / 2,
+      if (!region(at != nullptr ? at->k_q8 : nullptr, kv_bytes / 2,
                   "8-bit K cache") ||
           !region(at != nullptr ? at->v_q8 : nullptr, kv_bytes / 2,
                   "8-bit V cache") ||
@@ -1981,12 +1954,7 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
     const auto* mtp = session != nullptr ? &session->mtp_ : nullptr;
     const std::uint64_t mtp_kv_bytes =
         std::uint64_t{h.mtp_position} * h.kv_row * sizeof(__half);
-    const std::uint64_t mtp_f16_bytes = h.kv_f16 != 0 ? mtp_kv_bytes : 0;
-    if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_f16_bytes,
-                "draft K cache") ||
-        !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_f16_bytes,
-                "draft V cache") ||
-        !region(mtp != nullptr ? mtp->k_q8 : nullptr, mtp_kv_bytes / 2,
+    if (!region(mtp != nullptr ? mtp->k_q8 : nullptr, mtp_kv_bytes / 2,
                 "draft 8-bit K cache") ||
         !region(mtp != nullptr ? mtp->v_q8 : nullptr, mtp_kv_bytes / 2,
                 "draft 8-bit V cache") ||
@@ -2011,7 +1979,7 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
 std::uint64_t Executor::SnapshotBytes(const Session& session,
                                       std::uint32_t hidden_rows) const {
   SnapshotHeader h =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session, kv_f16_);
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
   h.mtp_position = session.mtp_.position;
   h.mtp_residual_valid = session.mtp_.residual_valid;
   h.hidden_rows = hidden_rows;
@@ -2038,7 +2006,7 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     return false;
   }
   SnapshotHeader h =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session, kv_f16_);
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
   h.mtp_position = session.mtp_.position;
   h.mtp_residual_valid = session.mtp_.residual_valid;
   h.hidden_rows = hidden_rows;
@@ -2080,7 +2048,7 @@ bool Executor::RestoreSnapshot(Session& session,
   SnapshotHeader h{};
   std::memcpy(&h, payload.data(), sizeof(h));
   const SnapshotHeader mine =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session, kv_f16_);
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
   if (!SameGeometry(h, mine)) {
     AssignError(error_msg, "snapshot was taken with another model geometry");
     return false;

@@ -498,10 +498,6 @@ private:
   /// rows land here before QuantizeKv, and wide attention widens the Q8
   /// prefix back into it. Larger sessions get a larger pair; older pairs stay
   /// allocated for the sessions that hold them.
-  /// GUFO_Q36_KV=f16: every session keeps F16 K/V next to the 8-bit copy, so
-  /// wide attention reads the unrounded values (the 8-bit copy alone saves
-  /// half the KV memory, the default for 8 x 262144-token contexts).
-  bool kv_f16_{false};
   mutable __half* kv_half_k_{nullptr};
   mutable __half* kv_half_v_{nullptr};
   mutable std::size_t kv_half_elems_{0};
