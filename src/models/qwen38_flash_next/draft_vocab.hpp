@@ -36,14 +36,14 @@ inline constexpr std::size_t kMtpDraftVocabWindow = 32;
 /// session count, with penalties and constraints: verification corrects
 /// their proposals against the full target distribution, and the choice
 /// reads only the request's own tokens, so seeded output does not depend on
-/// overlapping requests. Greedy penalties/constraints keep the full head.
-/// Other greedy requests use the small head while decoding alone or in a
+/// overlapping requests. Greedy requests (penalties and constraints apply
+/// only to verification) use the small head while decoding alone or in a
 /// jointly planned batch; unplanned multi-request greedy cycles keep the
 /// full head.
 [[nodiscard]] constexpr bool MtpDraftSubsetAllowed(
-    bool sampled, bool plain_greedy, std::uint32_t sessions,
+    bool sampled, bool greedy, std::uint32_t sessions,
     bool planned_batch) noexcept {
-  return sampled || (plain_greedy && (sessions == 1 || planned_batch));
+  return sampled || (greedy && (sessions == 1 || planned_batch));
 }
 
 /// The request's draft vocabulary and when to use it. A token is a miss when

@@ -1123,14 +1123,15 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // jointly planned (DecodeBatchImpl), so a sampled request decides the same
   // way alone and in any batch. Every request keeps the established length
   // controller and AR backoff.
-  const bool unmodified = !sampler.config().uses_random_sampling() &&
-                          !sampler.config().penalties_enabled() &&
-                          !sampler.config().constraint;
-  // A greedy request decoding alone drafts as on a one-session server: its
-  // proposals do not change its output, whatever the configured capacity.
-  const bool allow_subset =
-      MtpDraftSubsetAllowed(sampler.config().uses_random_sampling(), unmodified,
-                            occupancy, batch_drafts.has_value());
+  // Greedy proposals never change the output: the target verifies them over
+  // the full vocabulary with its penalties and grammar, and the draft argmax
+  // applies neither. A greedy request decoding alone therefore drafts as on a
+  // one-session server, with or without penalties (the Qwen3.8 non-thinking
+  // preset sets presence penalty 1.5), whatever the configured capacity.
+  const bool allow_subset = MtpDraftSubsetAllowed(
+      sampler.config().uses_random_sampling(),
+      !sampler.config().uses_random_sampling(), occupancy,
+      batch_drafts.has_value());
   // Unplanned greedy cycles are priced at the requests decoding now. Sampled
   // ones keep the configured concurrency so a seeded request replays the same
   // widths, and a planned batch keeps the row its plan used.
