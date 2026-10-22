@@ -488,8 +488,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   }
   const auto AllocKv = [&](auto& kv) {
     if (kv_f16_) {
-      kv.k_cache = Alloc<__half>(a, kv_elems, error_msg, &s->allocated_bytes_);
-      kv.v_cache = Alloc<__half>(a, kv_elems, error_msg, &s->allocated_bytes_);
+      kv.k_cache =
+          Alloc<__half>(a, kv_elems, error_msg, &s->allocated_bytes_);
+      kv.v_cache =
+          Alloc<__half>(a, kv_elems, error_msg, &s->allocated_bytes_);
     } else {
       kv.k_cache = kv_half_k_;
       kv.v_cache = kv_half_v_;
@@ -1256,10 +1258,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     // depend on where the scheduler split the prompt. Persistent F16 caches
     // already hold every row unrounded.
     if (!kv_f16_) {
-      DequantizeKv(s.k_q8, s.k_scale, s.k_cache, start_pos + n_tokens, kv_row,
-                   stream_);
-      DequantizeKv(s.v_q8, s.v_scale, s.v_cache, start_pos + n_tokens, kv_row,
-                   stream_);
+    DequantizeKv(s.k_q8, s.k_scale, s.k_cache, start_pos + n_tokens, kv_row,
+                 stream_);
+    DequantizeKv(s.v_q8, s.v_scale, s.v_cache, start_pos + n_tokens, kv_row,
+                 stream_);
     }
     if (!WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, s_.ctx,
                              n_tokens, start_pos, c.num_heads, c.num_kv_heads,
@@ -1694,8 +1696,8 @@ bool Executor::ConfigureFeatureTaps(std::span<const std::uint32_t> layers,
   return true;
 }
 
-bool Executor::CopyFeatures(std::uint32_t first, std::uint32_t rows, float* dst,
-                            std::string* error_msg) const {
+bool Executor::CopyFeatures(std::uint32_t first, std::uint32_t rows,
+                            float* dst, std::string* error_msg) const {
   if (feat_dev_ == nullptr || first + rows > options_.max_batch) {
     AssignError(error_msg, "feature rows are unavailable");
     return false;
@@ -1716,11 +1718,11 @@ bool Executor::DownloadFeatures(std::uint32_t first, std::uint32_t rows,
     AssignError(error_msg, "feature rows are unavailable");
     return false;
   }
-  return Check(
-             hipMemcpyAsync(host, feat_dev_ + std::size_t{first} * feat_width_,
-                            std::size_t{rows} * feat_width_ * sizeof(float),
-                            hipMemcpyDeviceToHost, stream_),
-             "feature download", error_msg) &&
+  return Check(hipMemcpyAsync(host,
+                              feat_dev_ + std::size_t{first} * feat_width_,
+                              std::size_t{rows} * feat_width_ * sizeof(float),
+                              hipMemcpyDeviceToHost, stream_),
+               "feature download", error_msg) &&
          Check(hipStreamSynchronize(stream_), "feature download", error_msg);
 }
 
@@ -1774,15 +1776,14 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                                   : model_->output_norm().f32(),
             n);
     if (feat_dev_ != nullptr && feat_tap_of_layer_[il] >= 0 &&
-        !Check(
-            hipMemcpy2DAsync(
-                feat_dev_ + static_cast<std::size_t>(feat_tap_of_layer_[il]) *
-                                c.hidden_size,
-                std::size_t{feat_width_} * sizeof(float), s_.res,
-                std::size_t{c.hidden_size} * sizeof(float),
-                std::size_t{c.hidden_size} * sizeof(float), n,
-                hipMemcpyDeviceToDevice, stream_),
-            "feature capture", error_msg)) {
+        !Check(hipMemcpy2DAsync(
+                   feat_dev_ + static_cast<std::size_t>(feat_tap_of_layer_[il]) *
+                                   c.hidden_size,
+                   std::size_t{feat_width_} * sizeof(float), s_.res,
+                   std::size_t{c.hidden_size} * sizeof(float),
+                   std::size_t{c.hidden_size} * sizeof(float), n,
+                   hipMemcpyDeviceToDevice, stream_),
+               "feature capture", error_msg)) {
       return false;
     }
   }
