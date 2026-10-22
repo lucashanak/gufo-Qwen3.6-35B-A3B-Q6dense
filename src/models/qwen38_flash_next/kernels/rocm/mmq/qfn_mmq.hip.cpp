@@ -517,7 +517,8 @@ extern "C" int qfn_mmq_dense_kq_vec(int weight_type, const void* W,
   constexpr const char* tag = "qfn_mmq_dense_kq_vec";
   const auto type = static_cast<ggml_type>(weight_type);
   if ((type != GGML_TYPE_Q3_K && type != GGML_TYPE_Q4_K &&
-       type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_NL) ||
+       type != GGML_TYPE_Q5_K && type != GGML_TYPE_Q6_K &&
+       type != GGML_TYPE_Q5_1 && type != GGML_TYPE_IQ4_NL) ||
       !W || !X_f32 ||
       !out_f32 || M <= 0 || K <= 0 || K % ggml_blck_size(type) != 0 ||
       n_tokens <= 0 || n_tokens > MMVQ_MAX_BATCH_SIZE) {
@@ -554,7 +555,8 @@ extern "C" int qfn_mmq_dense_kq_vec_preq(int weight_type, const void* W,
                                          hipStream_t stream) {
   const auto type = static_cast<ggml_type>(weight_type);
   if ((type != GGML_TYPE_Q3_K && type != GGML_TYPE_Q4_K &&
-       type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_NL) ||
+       type != GGML_TYPE_Q5_K && type != GGML_TYPE_Q6_K &&
+       type != GGML_TYPE_Q5_1 && type != GGML_TYPE_IQ4_NL) ||
       !W || !X_q8 || !out_f32 || M <= 0 || K <= 0 ||
       K % ggml_blck_size(type) != 0 || n_tokens <= 0 ||
       n_tokens > MMVQ_MAX_BATCH_SIZE) {

@@ -176,6 +176,9 @@ float DotProductQ8_K(const void* row_data, std::span<const float> vec,
 // Dequantize row of Q8_0 to float
 void DequantizeQ8_0(const void* src, float* dst, std::size_t k);
 
+// Dequantize row of Q5_1 to float
+void DequantizeQ5_1(const void* src, float* dst, std::size_t k);
+
 // Dequantize row of IQ4_NL to float
 void DequantizeIQ4_NL(const void* src, float* dst, std::size_t k);
 

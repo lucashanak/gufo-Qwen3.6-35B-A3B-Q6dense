@@ -12,11 +12,14 @@
 #include <string>
 #include <vector>
 
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
+
+using gufo::core::GgmlType;
 
 void CheckHip(hipError_t error, const char* operation) {
   if (error != hipSuccess) {
@@ -846,6 +849,143 @@ void CheckDecodeGrouping(int rows, int cols, int grouped_tokens = 0) {
     CheckHip(hipFree(ptr), "decode test free");
 }
 
+/// The dense K-quant GEMV (mixer down Q6_K, mixer up Q5_1 / IQ4_NL) for
+/// 1–8 tokens, from F32 and from pre-quantized Q8_1 rows, against F64 dots of
+/// the CPU-dequantized rows with the activations as quantize_q8_1 rounds
+/// them. Odd row counts exercise the two-row tile's last row.
+void CheckDenseKQuant(GgmlType type, int rows, int cols, std::uint32_t seed) {
+  constexpr int tokens = 8;
+  const std::size_t block = type == GgmlType::kQ6_K ? 256 : 32;
+  const std::size_t block_bytes = type == GgmlType::kQ6_K   ? 210
+                                  : type == GgmlType::kQ5_1 ? 24
+                                                            : 18;
+  const std::size_t row_bytes = cols / block * block_bytes;
+  std::vector<std::uint8_t> packed(rows * row_bytes);
+  for (auto& b : packed)
+    b = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+  // Sane F16 scales (Q6_K keeps d at the block's end), and a Q5_1 minimum
+  // that centres the 5-bit codes as a model's weights are.
+  for (std::size_t b = 0; b < packed.size() / block_bytes; ++b) {
+    std::uint8_t* blk = packed.data() + b * block_bytes;
+    const float d = (Uniform(&seed, 0.2F) + 1.0F) *
+                    (type == GgmlType::kQ6_K ? 2e-4F : 2e-3F);
+    const __half dh = __float2half(d);
+    std::memcpy(type == GgmlType::kQ6_K ? blk + 208 : blk, &dh, 2);
+    if (type == GgmlType::kQ5_1) {
+      const __half mh =
+          __float2half(-16.0F * d * (Uniform(&seed, 0.2F) + 1.0F));
+      std::memcpy(blk + 2, &mh, 2);
+    }
+  }
+  std::vector<float> w(static_cast<std::size_t>(rows) * cols);
+  for (int r = 0; r < rows; ++r) {
+    const auto* in = packed.data() + r * row_bytes;
+    float* row = w.data() + static_cast<std::size_t>(r) * cols;
+    if (type == GgmlType::kQ6_K)
+      gufo::quant::DequantizeQ6_K(in, row, cols);
+    else if (type == GgmlType::kQ5_1)
+      gufo::quant::DequantizeQ5_1(in, row, cols);
+    else
+      gufo::quant::DequantizeIQ4_NL(in, row, cols);
+  }
+  std::vector<float> x(static_cast<std::size_t>(tokens) * cols);
+  for (auto& v : x)
+    v = Uniform(&seed, 2.0F);
+  // x as quantize_q8_1 hands it to the dot products.
+  std::vector<float> xq(x.size());
+  for (std::size_t b = 0; b < x.size(); b += 32) {
+    float amax = 0.0F;
+    for (std::size_t i = b; i < b + 32; ++i)
+      amax = std::max(amax, std::abs(x[i]));
+    const float d = amax / 127.0F;
+    const float dh = __half2float(__float2half(d));
+    for (std::size_t i = b; i < b + 32; ++i)
+      xq[i] = amax == 0.0F ? 0.0F : dh * std::round(x[i] / d);
+  }
+  std::vector<double> ref(static_cast<std::size_t>(tokens) * rows);
+  std::vector<double> mag(ref.size());
+  for (int t = 0; t < tokens; ++t) {
+    for (int r = 0; r < rows; ++r) {
+      double acc = 0.0, abs_acc = 0.0;
+      for (int i = 0; i < cols; ++i) {
+        const double p = static_cast<double>(w[std::size_t(r) * cols + i]) *
+                         xq[std::size_t(t) * cols + i];
+        acc += p;
+        abs_acc += std::abs(p);
+      }
+      ref[std::size_t(t) * rows + r] = acc;
+      mag[std::size_t(t) * rows + r] = abs_acc;
+    }
+  }
+  void* dw = nullptr;
+  float* dx = nullptr;
+  void* dq = nullptr;
+  float* out = nullptr;
+  const std::size_t out_count = std::size_t(rows) * tokens + 4;
+  CheckHip(hipMalloc(&dw, packed.size() + 4096), "K-quant weights");
+  CheckHip(hipMalloc(&dx, x.size() * sizeof(float)), "K-quant inputs");
+  CheckHip(hipMalloc(&dq, qfn_mmq_q8_1_bytes(tokens, cols)),
+           "K-quant quantized inputs");
+  CheckHip(hipMalloc(&out, out_count * sizeof(float)), "K-quant output");
+  CheckHip(hipMemcpy(dw, packed.data(), packed.size(), hipMemcpyHostToDevice),
+           "K-quant weights upload");
+  CheckHip(
+      hipMemcpy(dx, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "K-quant input upload");
+  if (qfn_mmq_quantize_q8_1(dx, dq, tokens, cols, nullptr))
+    throw std::runtime_error("K-quant input quantization failed");
+  const std::string shape = "type=" + std::to_string(static_cast<int>(type)) +
+                            " M=" + std::to_string(rows) +
+                            " K=" + std::to_string(cols);
+  double worst = 0.0;
+  for (int n = 1; n <= tokens; ++n) {
+    std::vector<float> f32(out_count), preq(out_count);
+    for (const bool pre : {false, true}) {
+      CheckHip(hipMemset(out, 0xA5, out_count * sizeof(float)),
+               "K-quant output guard");
+      // The last n tokens, so the reads end at the inputs' allocation.
+      const int status =
+          pre ? qfn_mmq_dense_kq_vec_preq(
+                    static_cast<int>(type), dw,
+                    static_cast<const std::uint8_t*>(dq) +
+                        qfn_mmq_q8_1_bytes(tokens - n, cols),
+                    out, rows, cols, n, nullptr)
+              : qfn_mmq_dense_kq_vec(static_cast<int>(type), dw,
+                                     dx + std::size_t(tokens - n) * cols, out,
+                                     rows, cols, n, nullptr);
+      if (status != 0)
+        throw std::runtime_error("K-quant GEMV launch failed: " + shape);
+      CheckHip(hipMemcpy((pre ? preq : f32).data(), out,
+                         out_count * sizeof(float), hipMemcpyDeviceToHost),
+               "K-quant output");
+    }
+    if (std::memcmp(f32.data(), preq.data(), out_count * sizeof(float)) != 0)
+      throw std::runtime_error("K-quant GEMV differs between F32 and Q8_1 "
+                               "inputs: " + shape + " N=" + std::to_string(n));
+    for (std::size_t i = std::size_t(n) * rows; i < out_count; ++i) {
+      if (std::bit_cast<std::uint32_t>(f32[i]) != 0xA5A5A5A5U)
+        throw std::runtime_error("K-quant GEMV overwrote its guard: " + shape);
+    }
+    for (int t = 0; t < n; ++t) {
+      for (int r = 0; r < rows; ++r) {
+        const std::size_t k = std::size_t(tokens - n + t) * rows + r;
+        const double e = std::abs(f32[std::size_t(t) * rows + r] - ref[k]) /
+                         (mag[k] + 1e-30);
+        worst = std::max(worst, e);
+      }
+    }
+  }
+  // What remains is F32 accumulation and the F16 block sums that Q5_1's
+  // minimum reads.
+  if (!(worst < 2e-3))
+    throw std::runtime_error("K-quant GEMV error " + std::to_string(worst) +
+                             ": " + shape);
+  std::cout << "dense K-quant " << shape
+            << " N=1..8: worst |GEMV - F64| / sum|w x| " << worst << '\n';
+  for (void* ptr : {dw, static_cast<void*>(dx), dq, static_cast<void*>(out)})
+    CheckHip(hipFree(ptr), "K-quant test free");
+}
+
 void CheckMtpOutputHead(float input_scale) {
   constexpr int rows = 65, cols = 2560, blocks = cols / 32;
   auto weights = MakeWeights(rows, cols, 73);
@@ -951,6 +1091,13 @@ int main() {
     CheckMtpOutputHead(1.0F);
     // Small activations must retain products below F16's normal range.
     CheckMtpOutputHead(0.0001F);
+    // Mixer down (Q6_K) and up (Q5_1, IQ4_NL) at the model's shapes, and
+    // ragged row counts.
+    CheckDenseKQuant(GgmlType::kQ6_K, 320, 10240, 0x6C320U);
+    CheckDenseKQuant(GgmlType::kQ6_K, 37, 2560, 0x6C037U);
+    CheckDenseKQuant(GgmlType::kQ5_1, 10240, 320, 0x51A320U);
+    CheckDenseKQuant(GgmlType::kQ5_1, 333, 320, 0x51A333U);
+    CheckDenseKQuant(GgmlType::kIQ4_NL, 10241, 320, 0x14A320U);
     CheckW8A8Tail(320, 10240, 0x7A1320U);
     CheckW8A8Tail(640, 2560, 0x7A1640U);
     bool ok = true;
