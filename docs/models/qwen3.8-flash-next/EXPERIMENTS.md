@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next experiments
 
+## Batched decode graphs (October 29, 2026)
+
+Upstream `main` 34ebb5fe against the branch, Strix Halo (ROCm 7.2.4), UD-Q4_K_XL + shared Q8_0 MTP, `gufo serve --sessions 1 --context 65536`, greedy, thinking off, five fixed prompts (CPU caches, a Python red-black tree, TCP congestion control, Czech railway history, a C++ ISO 8601 parser) of 384 generated tokens; one server process per arm, means of the five decode rates. The first process after another workload reads cold PLE rows and runs 2-4% slower, so every hold started with a discarded warm-up and main ran before and after the candidates.
+
+| Experiment | Outcome |
+| --- | --- |
+| Record `ForwardBatch` (prefix and suffix), `MtpForwardBatch` and `MtpHeads` per shape and session set on the second sighting, replay later ones | Not established: `batch_graph` matches eager execution bit for bit at 2/4/6 requests, but C4 MTP wall throughput (4 × 32,768, four unique 256-token prompts) was 80.5 against 80.0 tok/s on the one-launch mixer it stacks on. |
+
 ## One-launch decode HC mixer (October 29, 2026)
 
 Upstream `main` 34ebb5fe against the branch, Strix Halo (ROCm 7.2.4), UD-Q4_K_XL + shared Q8_0 MTP, `gufo serve --sessions 1 --context 65536`, greedy, thinking off, five fixed prompts (CPU caches, a Python red-black tree, TCP congestion control, Czech railway history, a C++ ISO 8601 parser) of 384 generated tokens; one server process per arm, means of the five decode rates. The first process after another workload reads cold PLE rows and runs 2-4% slower, so every hold started with a discarded warm-up and main ran before and after the candidates.
