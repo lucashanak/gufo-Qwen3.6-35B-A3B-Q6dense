@@ -1119,7 +1119,6 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
-  const auto concurrency = model_->DecodeConcurrency();
   // Head eligibility is MtpDraftSubsetAllowed. Sampled cohorts are never
   // jointly planned (DecodeBatchImpl), so a sampled request decides the same
   // way alone and in any batch. Every request keeps the established length
@@ -1127,9 +1126,11 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool unmodified = !sampler.config().uses_random_sampling() &&
                           !sampler.config().penalties_enabled() &&
                           !sampler.config().constraint;
+  // A greedy request decoding alone drafts as on a one-session server: its
+  // proposals do not change its output, whatever the configured capacity.
   const bool allow_subset =
       MtpDraftSubsetAllowed(sampler.config().uses_random_sampling(), unmodified,
-                            concurrency, batch_drafts.has_value());
+                            occupancy, batch_drafts.has_value());
   // Unplanned greedy cycles are priced at the requests decoding now. Sampled
   // ones keep the configured concurrency so a seeded request replays the same
   // widths, and a planned batch keeps the row its plan used.
