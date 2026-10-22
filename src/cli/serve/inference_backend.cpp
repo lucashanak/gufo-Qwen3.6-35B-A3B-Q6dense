@@ -2810,6 +2810,7 @@ public:
         stats_after.dflash_drafted - stats_before.dflash_drafted;
     step.dflash_accepted_tokens =
         stats_after.dflash_accepted - stats_before.dflash_accepted;
+    step.dflash_mtp_rounds = stats_after.mtp_chosen - stats_before.mtp_chosen;
     return step;
   }
 
@@ -2906,6 +2907,7 @@ public:
       step.dflash_tokens = stats.dflash_drafted - before[i].dflash_drafted;
       step.dflash_accepted_tokens =
           stats.dflash_accepted - before[i].dflash_accepted;
+      step.dflash_mtp_rounds = stats.mtp_chosen - before[i].mtp_chosen;
     }
     return steps;
   }

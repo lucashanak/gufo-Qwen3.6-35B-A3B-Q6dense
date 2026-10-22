@@ -212,6 +212,8 @@ struct TextDecodeStep {
   std::size_t dflash_rounds{0};
   std::size_t dflash_tokens{0};
   std::size_t dflash_accepted_tokens{0};
+  /// Rounds the draft-source chooser gave to MTP while DFlash2 was eligible.
+  std::size_t dflash_mtp_rounds{0};
   bool stop{false};
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.

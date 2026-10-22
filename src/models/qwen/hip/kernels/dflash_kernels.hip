@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cfloat>
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -919,6 +920,64 @@ void LaunchDFlashSelectorBatch(
       static_cast<const hip_bfloat16*>(successor_codebook_bf16), tokens,
       confidences, uniforms, candidate_ids, candidate_probabilities, batch,
       partial_count, selector_rank, selector_top_k);
+}
+
+namespace {
+
+constexpr unsigned kProbabilityThreads = 256;
+
+__global__ void dflash_token_probability_kernel(
+    const float* __restrict__ logits, const uint32_t* __restrict__ tokens,
+    float* __restrict__ probabilities, uint32_t vocab_size) {
+  __shared__ float shared[kProbabilityThreads];
+  const float* row =
+      logits + static_cast<std::size_t>(blockIdx.x) * vocab_size;
+  float maximum = -INFINITY;
+  for (uint32_t i = threadIdx.x; i < vocab_size; i += kProbabilityThreads)
+    maximum = fmaxf(maximum, row[i]);
+  shared[threadIdx.x] = maximum;
+  __syncthreads();
+  for (unsigned stride = kProbabilityThreads / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride)
+      shared[threadIdx.x] =
+          fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+    __syncthreads();
+  }
+  maximum = shared[0];
+  __syncthreads();
+  float sum = 0.0F;
+  for (uint32_t i = threadIdx.x; i < vocab_size; i += kProbabilityThreads)
+    sum += expf(row[i] - maximum);
+  shared[threadIdx.x] = sum;
+  __syncthreads();
+  for (unsigned stride = kProbabilityThreads / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride)
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const uint32_t token = tokens[blockIdx.x];
+    probabilities[blockIdx.x] =
+        token < vocab_size && shared[0] > 0.0F && isfinite(maximum)
+            ? expf(row[token] - maximum) / shared[0]
+            : 0.0F;
+  }
+}
+
+}  // namespace
+
+void LaunchDFlashTokenProbabilities(const float* logits,
+                                    const std::uint32_t* tokens,
+                                    float* probabilities, std::uint32_t rows,
+                                    std::uint32_t vocab_size,
+                                    hipStream_t stream) {
+  if (rows == 0)
+    return;
+  if (logits == nullptr || tokens == nullptr || probabilities == nullptr ||
+      vocab_size == 0)
+    throw std::invalid_argument("invalid DFlash token probability request");
+  dflash_token_probability_kernel<<<rows, kProbabilityThreads, 0, stream>>>(
+      logits, tokens, probabilities, vocab_size);
 }
 
 }  // namespace gufo::hip::kernels

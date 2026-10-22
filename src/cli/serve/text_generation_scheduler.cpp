@@ -1507,6 +1507,7 @@ struct TextGenerationScheduler::Impl {
       request->result.dflash_rounds += step.dflash_rounds;
       request->result.dflash_tokens += step.dflash_tokens;
       request->result.dflash_accepted_tokens += step.dflash_accepted_tokens;
+      request->result.dflash_mtp_rounds += step.dflash_mtp_rounds;
 
       CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
@@ -1818,6 +1819,7 @@ struct TextGenerationScheduler::Impl {
       item.request->result.dflash_tokens += step.dflash_tokens;
       item.request->result.dflash_accepted_tokens +=
           step.dflash_accepted_tokens;
+      item.request->result.dflash_mtp_rounds += step.dflash_mtp_rounds;
 
       bool published = true;
       try {

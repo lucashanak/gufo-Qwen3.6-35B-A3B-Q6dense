@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_ENGINE_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_ENGINE_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -16,6 +17,7 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/dflash_choice.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
@@ -122,6 +124,9 @@ private:
   /// Optional DFlash2 draft (GUFO_FN_DFLASH) over the target's embedding and
   /// head; single-session greedy cycles only, MTP stays loaded beside it.
   std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
+  /// The session whose trunk forward ran last; null after a batch. A session
+  /// drafts with DFlash2 only after consecutive forwards of its own.
+  std::atomic<const Session*> last_forward_{nullptr};
   MtpBatchController batch_policy_;
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
@@ -233,6 +238,10 @@ public:
     std::uint64_t dflash_cycles{0};
     std::uint64_t dflash_drafted{0};
     std::uint64_t dflash_accepted{0};
+    /// Neural cycles drafted by MTP while DFlash2 was eligible (the chooser
+    /// preferred MTP or the draft context was not ready); DFlash2 drafted
+    /// dflash_cycles.
+    std::uint64_t mtp_chosen{0};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
@@ -359,13 +368,18 @@ private:
   std::uint32_t ring_end_{0};    ///< next position to be written
   bool features_fresh_{false};   ///< the latest Forward's feature rows are ours
   std::uint32_t feature_row_offset_{0};  ///< our first row in that Forward
-  /// Committed tokens and seconds of single-session cycles per draft source.
-  float dfl_tokens_{0.0F}, dfl_seconds_{0.0F};
-  float mtp_tokens_{0.0F}, mtp_seconds_{0.0F};
-  std::uint32_t dfl_cycles_{0}, mtp_cycles_{0}, draft_cycles_{0};
-  float catchup_seconds_{0.0F};
-  [[nodiscard]] bool PreferDFlash() const noexcept;
-  void ResetDraftRates() noexcept;
+  /// Per-request choice between DFlash2 and MTP (dflash_choice.hpp).
+  DraftSourceChooser draft_source_;
+  /// Whether DFlash2 can draft for this session at all.
+  [[nodiscard]] bool DFlashAvailable() const noexcept;
+  /// Whether this session ran the latest trunk forward: no peer decoded or
+  /// prefilled since, so it is decoding alone.
+  [[nodiscard]] bool RanLastForward() const noexcept {
+    return model_->last_forward_.load(std::memory_order_relaxed) == this;
+  }
+  void NoteForward() noexcept {
+    model_->last_forward_.store(this, std::memory_order_relaxed);
+  }
   /// Allocates the draft executor and ring on first use; false without DFlash.
   bool EnsureDFlashState();
   /// Injects ring rows up to the committed position; false when the ring

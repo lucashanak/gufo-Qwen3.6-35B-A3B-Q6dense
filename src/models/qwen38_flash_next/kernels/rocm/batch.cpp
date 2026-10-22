@@ -1035,7 +1035,6 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
               : model_->hc_head().norm.f32();
       UseScratch(base);
       CombineBatch(base.res, next_norm, rows);
-      TapFeatures(il, base.res, rows);
       normed = next_norm != nullptr;
     }
     for (std::size_t i = 0; i < items.size(); ++i) {

@@ -278,6 +278,40 @@ void TestSelector(std::uint32_t vocab) {
   }
 }
 
+// Greedy truncation gates on the draft head's full-vocabulary probability of
+// each selected token; compare with an independent FP64 softmax, including a
+// ragged vocabulary, a dominant logit and a token that is not the argmax.
+void TestTokenProbabilities() {
+  using gufo::test::DeviceBuffer;
+  for (const std::uint32_t vocab : {7U, 2065U, 248320U}) {
+    constexpr std::uint32_t kRows = 3;
+    std::vector<float> logits(std::size_t{kRows} * vocab);
+    for (std::size_t i = 0; i < logits.size(); ++i)
+      logits[i] = Sample(i, vocab) * 8.0F;
+    logits[vocab / 2] = 40.0F;  // row 0: one dominant candidate
+    const std::vector<std::uint32_t> tokens{vocab / 2, 1, vocab - 1};
+    DeviceBuffer<float> d_logits(logits), d_probabilities(kRows);
+    DeviceBuffer<std::uint32_t> d_tokens(tokens);
+    gufo::hip::kernels::LaunchDFlashTokenProbabilities(
+        d_logits.data(), d_tokens.data(), d_probabilities.data(), kRows, vocab,
+        nullptr);
+    const auto actual = d_probabilities.CopyToHost();
+    for (std::uint32_t r = 0; r < kRows; ++r) {
+      const float* row = logits.data() + std::size_t{r} * vocab;
+      const double maximum = *std::max_element(row, row + vocab);
+      double sum = 0;
+      for (std::uint32_t i = 0; i < vocab; ++i)
+        sum += std::exp(static_cast<double>(row[i]) - maximum);
+      const double expected =
+          std::exp(static_cast<double>(row[tokens[r]]) - maximum) / sum;
+      gufo::test::Expect(
+          std::isfinite(actual[r]) &&
+              std::abs(actual[r] - expected) <= 1e-5 + 1e-4 * expected,
+          "DFlash token probability differs from the FP64 softmax");
+    }
+  }
+}
+
 void TestSelectorZeroUniform() {
   using gufo::test::DeviceBuffer;
   const auto bf16 = [](float value) {
@@ -602,6 +636,7 @@ int main() {
   }
 
   TestDynamicConvolution();
+  TestTokenProbabilities();
   TestSelectorZeroUniform();
   TestSelector(2065);
   TestSelector(248320);

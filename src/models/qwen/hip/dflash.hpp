@@ -179,7 +179,10 @@ public:
       std::vector<float>* out_confidences = nullptr,
       std::vector<tokenization::TokenId>* out_candidate_ids = nullptr,
       std::vector<float>* out_candidate_probabilities = nullptr,
-      const DFlashTrace& trace = {});
+      const DFlashTrace& trace = {},
+      std::vector<float>* out_token_probabilities = nullptr);
+  // out_token_probabilities (greedy only): the draft head's full-vocabulary
+  // softmax probability of each returned token.
 
   /// Shared projections with independent attention, convolution and selector
   /// boundaries. A single request retains the ordinary block execution.

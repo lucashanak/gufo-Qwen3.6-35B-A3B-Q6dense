@@ -311,11 +311,16 @@ public:
                               float* logits = nullptr) const;
 
   /// DFlash target features: after each layer in `layers` (in order, the
-  /// final layer excluded), every trunk Forward and ForwardBatch writes the
-  /// mean of the residual streams into [row][tap * hidden]. Call before the
-  /// first Forward so captured graphs include the taps.
+  /// final layer excluded), a trunk Forward with taps enabled writes the
+  /// mean of the residual streams into [row][tap * hidden]. ForwardBatch
+  /// never taps.
   bool ConfigureFeatureTaps(std::span<const std::uint32_t> layers,
                             std::string* error_msg = nullptr) const;
+  /// Whether the following Forward calls write feature rows. Tapped and
+  /// untapped decode shapes capture separate graphs.
+  void EnableFeatureTaps(bool enabled) const noexcept {
+    taps_enabled_ = enabled && feat_dev_ != nullptr;
+  }
   [[nodiscard]] std::uint32_t FeatureWidth() const noexcept {
     return feat_width_;
   }
@@ -709,6 +714,7 @@ private:
   mutable std::vector<std::int32_t> feat_tap_of_layer_;
   mutable float* feat_dev_{nullptr};
   mutable std::uint32_t feat_width_{0};
+  mutable bool taps_enabled_{false};
   /// Writes layer `il`'s feature slice from `res` when it is tapped.
   void TapFeatures(std::uint32_t il, const float* res,
                    std::uint32_t rows) const;

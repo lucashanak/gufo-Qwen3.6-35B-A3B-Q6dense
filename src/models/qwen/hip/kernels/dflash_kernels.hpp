@@ -90,6 +90,15 @@ void LaunchDFlashSelectorBatch(
     std::uint32_t selector_rank, std::uint32_t selector_top_k,
     hipStream_t stream);
 
+// probabilities[r] = softmax(logits[r])[tokens[r]] over the full vocabulary:
+// the draft head's probability of each selected greedy proposal, whose
+// selector confidence is one by definition.
+void LaunchDFlashTokenProbabilities(const float* logits,
+                                    const std::uint32_t* tokens,
+                                    float* probabilities, std::uint32_t rows,
+                                    std::uint32_t vocab_size,
+                                    hipStream_t stream);
+
 }  // namespace gufo::hip::kernels
 #endif  // defined(ENGINE_ENABLE_HIP)
 
