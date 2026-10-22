@@ -28,7 +28,7 @@ set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2"
 if (ENGINE_ENABLE_HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops hc_mean_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
-      select_ops snapshot_copy batch_graph)
+      select_ops snapshot_copy batch_graph head_ops)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
 
@@ -60,6 +60,10 @@ if (ENGINE_ENABLE_HIP)
   add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL
     dense_gemm_bench.cpp)
   target_link_libraries(qwen38_flash_next_dense_gemm_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
+  add_executable(qwen38_flash_next_head_bench EXCLUDE_FROM_ALL head_bench.cpp)
+  target_link_libraries(qwen38_flash_next_head_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   add_executable(qwen38_flash_next_hc_mix_bench EXCLUDE_FROM_ALL

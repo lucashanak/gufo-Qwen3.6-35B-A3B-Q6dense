@@ -8726,7 +8726,23 @@ __launch_bounds__(1024) __global__
   __shared__ float partial[32];
   const float top = logits[row[0]];
   float sum = 0.0F;
-  for (std::uint32_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+  // One block reads the whole row: issue a thread's next 16 loads together,
+  // then add them in the same order. One load per step waited on memory
+  // latency: 23 us over the draft head's 99,328 logits (now 9 us) and 48 us
+  // over the full head (now 14 us), with the same sums.
+  constexpr std::uint32_t kBatch = 16;
+  std::uint32_t i = threadIdx.x;
+  for (; i + (kBatch - 1) * blockDim.x < vocab; i += kBatch * blockDim.x) {
+    float l[kBatch];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k)
+      l[k] = logits[i + k * blockDim.x];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k)
+      if (isfinite(l[k]))
+        sum += __expf(l[k] - top);
+  }
+  for (; i < vocab; i += blockDim.x) {
     const float l = logits[i];
     if (isfinite(l))
       sum += __expf(l - top);

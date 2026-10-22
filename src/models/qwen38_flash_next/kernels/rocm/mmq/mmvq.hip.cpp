@@ -405,10 +405,269 @@ __launch_bounds__(32, 1) static __global__
   }
 }
 
+/// One lane's Q8_1 activations for a Q4_K/Q5_K block quarter, as
+/// vec_dot_q{4,5}_K_q8_1 read them. Load issues the reads; Finish forms the
+/// scales and the code sums the minimum term multiplies (shared by every
+/// row).
+struct KHeadInput {
+  int u[4];
+  half2 ds[2];
+  float d8[2];
+  float sum[2];
+
+  __device__ __forceinline__ void Load(const block_q8_1* y, int iqs) {
+    const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const block_q8_1* b = y + offset + i;
+      ds[i] = b->ds;
+      const int* q8 = (const int*)b->qs + ((iqs / 2) % 4);
+      u[2 * i + 0] = q8[0];
+      u[2 * i + 1] = q8[4];
+    }
+  }
+
+  __device__ __forceinline__ void Finish() {
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      d8[i] = __low2float(ds[i]);
+      // Converted once per token: every row's product is then a plain FP32
+      // FMA instead of a mixed-precision one (the same single rounding).
+      asm("" : "+v"(d8[i]));
+      sum[i] = ggml_hip_dp4a(0x01010101, u[2 * i + 1],
+                             ggml_hip_dp4a(0x01010101, u[2 * i + 0], 0));
+    }
+  }
+};
+
+/// One lane's codes of a Q4_K/Q5_K block quarter, unpacked once for every
+/// token. Dot gives vec_dot_q{4,5}_K_q8_1_impl_vmmq's integer sums and
+/// float expression.
+template<ggml_type type>
+struct KHeadFragment {
+  static_assert(type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K);
+  // Raw words: the low codes, the high bits (Q5_K) and the scale words.
+  int ql[2];
+  int qh[2];
+  uint32_t words[3];
+  half2 dmh;
+  // Decoded: v0i, v1i for i = 0, then for i = 1; scales and minimums.
+  int v[4];
+  float sc[2];
+  float m[2];
+  float2 dm;
+
+  __device__ __forceinline__ void Load(const void* vx, int block, int iqs) {
+    const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+    const block_q4_K* scales;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+      const block_q4_K* b = (const block_q4_K*)vx + block;
+      const int* q4 = (const int*)(b->qs + 16 * offset + 4 * ((iqs / 2) % 4));
+      ql[0] = q4[0];
+      ql[1] = q4[4];
+      dmh = b->dm;
+      scales = b;
+    } else {
+      const block_q5_K* b = (const block_q5_K*)vx + block;
+      const int* q5 = (const int*)(b->qs + 16 * offset + 4 * ((iqs / 2) % 4));
+      const int* h = (const int*)(b->qh + 4 * ((iqs / 2) % 4));
+      ql[0] = q5[0];
+      ql[1] = q5[4];
+      qh[0] = h[0];
+      qh[1] = h[4];
+      dmh = b->dm;
+      // Q5_K packs its scales and minimums as Q4_K does, at the same offset.
+      scales = (const block_q4_K*)b;
+    }
+    const uint32_t* w = (const uint32_t*)scales->scales;
+#pragma unroll
+    for (int i = 0; i < 3; ++i)
+      words[i] = w[i];
+  }
+
+  __device__ __forceinline__ void Decode(int iqs) {
+    const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+    if constexpr (type == GGML_TYPE_Q4_K) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        v[2 * i + 0] = (ql[0] >> (4 * i)) & 0x0F0F0F0F;
+        v[2 * i + 1] = (ql[1] >> (4 * i)) & 0x0F0F0F0F;
+      }
+    } else {
+      const int vh0 = qh[0] >> offset;
+      const int vh1 = qh[1] >> offset;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        v[2 * i + 0] = ((ql[0] >> (4 * i)) & 0x0F0F0F0F) |
+                       (((vh0 >> i) << 4) & 0x10101010);
+        v[2 * i + 1] = ((ql[1] >> (4 * i)) & 0x0F0F0F0F) |
+                       (((vh1 >> i) << 4) & 0x10101010);
+      }
+    }
+    dm = __half22float2(dmh);
+    asm("" : "+v"(dm.x));
+    asm("" : "+v"(dm.y));
+    // q4_K_scale_pair on the loaded words.
+    const int j = offset / 2;
+    const int shift = 16 * (j & 1);
+    const uint32_t lo = (words[0] >> shift) & 0xffff;
+    const uint32_t mid = (words[1] >> shift) & 0xffff;
+    const uint32_t hi = (words[2] >> shift) & 0xffff;
+    const uint32_t low0 = lo & 0x3f3f;
+    const uint32_t low1 = mid & 0x3f3f;
+    const uint32_t high0 = ((hi >> 0) & 0x0f0f) | ((lo & 0xc0c0) >> 2);
+    const uint32_t high1 = ((hi >> 4) & 0x0f0f) | ((mid & 0xc0c0) >> 2);
+    const uint32_t aux0 = j < 2 ? low0 : high0;
+    const uint32_t aux1 = j < 2 ? low1 : high1;
+    sc[0] = aux0 & 0xFF;
+    sc[1] = aux0 >> 8;
+    m[0] = aux1 & 0xFF;
+    m[1] = aux1 >> 8;
+  }
+
+  __device__ __forceinline__ float Dot(const KHeadInput& x) const {
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int dot1 =
+          type == GGML_TYPE_Q4_K
+              ? ggml_hip_dp4a(v[2 * i + 1], x.u[2 * i + 1],
+                              ggml_hip_dp4a(v[2 * i], x.u[2 * i], 0))
+              : ggml_hip_dp4a(v[2 * i], x.u[2 * i],
+                              ggml_hip_dp4a(v[2 * i + 1], x.u[2 * i + 1], 0));
+      // Both products are integers below 2^24, so exact: the values
+      // float(dot1 * sc) and float(sum * m) the original converts. The
+      // fences keep fast-math from regrouping them with d8.
+      float d = float(dot1) * sc[i];
+      float mm = x.sum[i] * m[i];
+      asm("" : "+v"(d));
+      asm("" : "+v"(mm));
+      sumf_d += x.d8[i] * d;
+      sumf_m += x.d8[i] * mm;
+    }
+    return dm.x * sumf_d - dm.y * sumf_m;
+  }
+};
+
+/// warp_reduce_sum<32> over up to 32 sums at once (scatter_reduce_sum's
+/// pairs and operands, five levels deep): lane l finishes sum
+/// l >> (5 - levels), and every lane of that group holds the same bits.
+template<int n>
+static __device__ __forceinline__ float scatter_reduce_sum32(
+    const float (&v)[n], int lane) {
+  static_assert(n <= 32);
+  constexpr int levels = n <= 1   ? 0
+                         : n <= 2 ? 1
+                         : n <= 4 ? 2
+                         : n <= 8 ? 3
+                         : n <= 16 ? 4
+                                   : 5;
+  float s[1 << levels];
+#pragma unroll
+  for (int j = 0; j < (1 << levels); ++j)
+    s[j] = j < n ? v[j] : 0.0f;
+  if constexpr (levels >= 1) scatter_level<16, (1 << levels)>(s, lane);
+  else s[0] += xor_lane<16>(s[0]);
+  if constexpr (levels >= 2) scatter_level<8, (1 << levels) / 2>(s, lane);
+  else s[0] += xor_lane<8>(s[0]);
+  if constexpr (levels >= 3) scatter_level<4, (1 << levels) / 4>(s, lane);
+  else s[0] += xor_lane<4>(s[0]);
+  if constexpr (levels >= 4) scatter_level<2, (1 << levels) / 8>(s, lane);
+  else s[0] += xor_lane<2>(s[0]);
+  if constexpr (levels >= 5) scatter_level<1, 2>(s, lane);
+  else s[0] += xor_lane<1>(s[0]);
+  return s[0];
+}
+
+/// mul_mat_vec_dense_kq for Q4_K/Q5_K rows and 2-8 tokens (the output head's
+/// verification and batched draft rows). Each wave decodes `c_rows` rows'
+/// codes once and loads each token's activations once for all of them, so
+/// a token adds only its dot products; per row and token the lane order,
+/// block order, products and butterfly are mul_mat_vec_dense_kq's.
+template<ggml_type type, int c_rows, int tokens>
+__launch_bounds__(32, 1) static __global__
+    void mul_mat_vec_dense_kq_rows(const void* __restrict__ vx,
+                                   const void* __restrict__ vy,
+                                   float* __restrict__ dst,
+                                   const uint32_t ncols_x,
+                                   const uint32_t nrows_x,
+                                   const uint32_t stride_row_x,
+                                   const uint32_t stride_col_y,
+                                   const uint32_t stride_col_dst) {
+  static_assert(tokens * c_rows <= 32);
+  constexpr int qk = QK_K;
+  constexpr int qi = QI4_K;
+  constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+  static_assert(qi == QI5_K && vdr == VDR_Q5_K_Q8_1_MMVQ);
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  const int lane = threadIdx.x;
+  const int row0 = c_rows * blockIdx.x;
+  const int blocks_per_row_x = ncols_x / qk;
+  const block_q8_1* y = (const block_q8_1*)vy;
+  uint32_t row_offsets[c_rows];
+#pragma unroll
+  for (int i = 0; i < c_rows; ++i)
+    row_offsets[i] = min(uint32_t(row0 + i), nrows_x - 1) * stride_row_x;
+  const int kqs = vdr * (lane % (qi / vdr));
+  float tmp[tokens * c_rows] = {};
+  for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    KHeadFragment<type> w[c_rows];
+    KHeadInput x[tokens];
+#pragma unroll
+    for (int i = 0; i < c_rows; ++i)
+      w[i].Load(vx, row_offsets[i] + kbx, kqs);
+#pragma unroll
+    for (int j = 0; j < tokens; ++j)
+      x[j].Load(y + j * stride_col_y + kby, kqs);
+    // Every read of the iteration is in flight before the first product.
+    // Left to itself the scheduler interleaves loads and products from six
+    // tokens on, and the exposed latency made 8 rows 30% slower.
+    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for (int i = 0; i < c_rows; ++i)
+      w[i].Decode(kqs);
+#pragma unroll
+    for (int j = 0; j < tokens; ++j) {
+      x[j].Finish();
+#pragma unroll
+      for (int i = 0; i < c_rows; ++i)
+        tmp[j * c_rows + i] += w[i].Dot(x[j]);
+    }
+  }
+  constexpr int n = tokens * c_rows;
+  constexpr int shift = 5 - (n <= 1    ? 0
+                             : n <= 2  ? 1
+                             : n <= 4  ? 2
+                             : n <= 8  ? 3
+                             : n <= 16 ? 4
+                                       : 5);
+  const float value = scatter_reduce_sum32(tmp, lane);
+  const int index = lane >> shift;
+  const int j = index / c_rows;
+  const int i = index % c_rows;
+  if ((lane & ((1 << shift) - 1)) == 0 && index < n &&
+      uint32_t(row0 + i) < nrows_x)
+    dst[j * stride_col_dst + row0 + i] = isfinite(value) ? value : 0.0f;
+}
+
 template<ggml_type type, int tokens = 1>
 static void launch_dense_kq(const void* weights, const block_q8_1* input,
                             float* output, int k, int rows, int n_tokens,
                             int input_stride, hipStream_t stream) {
+  if constexpr (tokens > 1 &&
+                (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) {
+    if (n_tokens == tokens) {
+      constexpr int kRows = tokens <= 3 ? 2 : 4;
+      mul_mat_vec_dense_kq_rows<type, kRows, tokens>
+          <<<dim3((rows + kRows - 1) / kRows), dim3(32), 0, stream>>>(
+              weights, input, output, k, rows, k / ggml_blck_size(type),
+              input_stride, rows);
+      return;
+    }
+  }
   if (n_tokens == tokens) {
     constexpr int kRows = 2;
     mul_mat_vec_dense_kq<type, kRows, tokens>
