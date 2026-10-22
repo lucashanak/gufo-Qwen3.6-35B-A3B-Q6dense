@@ -6466,6 +6466,30 @@ void HcApplyDeferred(float* res, const float* block_out, const float* w,
                      stream, res, block_out, w, hidden);
 }
 
+__global__ void HcMeanRowsKernel(const float* res, float* out,
+                                 std::uint32_t hidden, std::uint32_t streams,
+                                 std::size_t out_stride, float scale) {
+  const std::uint32_t t = blockIdx.x;
+  const float* row = res + static_cast<std::size_t>(t) * streams * hidden;
+  float* dst = out + static_cast<std::size_t>(t) * out_stride;
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += kThreads) {
+    float sum = row[i];
+    for (std::uint32_t s = 1; s < streams; ++s)
+      sum = __fadd_rn(sum, row[static_cast<std::size_t>(s) * hidden + i]);
+    dst[i] = __fmul_rn(sum, scale);
+  }
+}
+
+void HcMeanRows(const float* res, float* out, std::uint32_t n_tokens,
+                std::uint32_t hidden, std::uint32_t streams,
+                std::size_t out_stride, hipStream_t stream) {
+  if (n_tokens == 0)
+    return;
+  hipLaunchKernelGGL(HcMeanRowsKernel, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, res, out, hidden, streams, out_stride,
+                     1.0F / static_cast<float>(streams));
+}
+
 bool HcCombineF16(float* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,

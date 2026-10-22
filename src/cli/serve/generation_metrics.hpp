@@ -188,6 +188,10 @@ inline std::string GenerationLogDetails(
   if (result.lookup_tokens > 0)
     out << " lookup_accepted=" << result.lookup_accepted_tokens
         << " lookup_proposed=" << result.lookup_tokens;
+  if (result.dflash_rounds > 0)
+    out << " dflash_rounds=" << result.dflash_rounds
+        << " dflash_accepted=" << result.dflash_accepted_tokens
+        << " dflash_proposed=" << result.dflash_tokens;
   if (result.ngram_rows > 0)
     out << " ngram_rows=" << result.ngram_rows
         << " ngram_dedup_rows=" << result.ngram_dedup_rows
@@ -237,6 +241,11 @@ inline json::Value GenerationTimings(
   if (result.lookup_tokens > 0) {
     timings["lookup_n"] = result.lookup_tokens;
     timings["lookup_n_accepted"] = result.lookup_accepted_tokens;
+  }
+  if (result.dflash_rounds > 0) {
+    timings["dflash_rounds"] = result.dflash_rounds;
+    timings["dflash_n"] = result.dflash_tokens;
+    timings["dflash_n_accepted"] = result.dflash_accepted_tokens;
   }
   return timings;
 }

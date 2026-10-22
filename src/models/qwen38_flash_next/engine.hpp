@@ -24,6 +24,10 @@
 namespace gufo::core {
 class GgufReader;
 }
+namespace gufo::hip {
+class QwenDFlashGpuModel;
+class QwenDFlashGpuExecutor;
+}  // namespace gufo::hip
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -115,6 +119,9 @@ private:
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
+  /// Optional DFlash2 draft (GUFO_FN_DFLASH) over the target's embedding and
+  /// head; single-session greedy cycles only, MTP stays loaded beside it.
+  std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
   MtpBatchController batch_policy_;
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
@@ -222,6 +229,10 @@ public:
     /// Of drafted/accepted: proposals copied by prompt lookup.
     std::uint64_t lookup{0};
     std::uint64_t lookup_accepted{0};
+    /// Of cycles/drafted/accepted: those drafted by DFlash2.
+    std::uint64_t dflash_cycles{0};
+    std::uint64_t dflash_drafted{0};
+    std::uint64_t dflash_accepted{0};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
@@ -337,6 +348,35 @@ private:
   std::vector<std::int32_t> draft_added_;
   /// After the token history is replaced: the table restarts from it.
   void ForgetDraftVocab() noexcept { draft_vocab_stale_ = true; }
+  /// DFlash2 draft state. Committed target features go to a device ring of
+  /// the last `ring_rows_` positions (the draft's attention window); the
+  /// draft context catches up from it only before a DFlash cycle.
+  std::unique_ptr<hip::QwenDFlashGpuExecutor> dflash_;
+  bool dflash_failed_{false};  ///< allocation failed; draft with MTP only
+  float* ring_{nullptr};
+  std::uint32_t ring_rows_{0};
+  std::uint32_t ring_begin_{0};  ///< first position held contiguously
+  std::uint32_t ring_end_{0};    ///< next position to be written
+  bool features_fresh_{false};   ///< the latest Forward's feature rows are ours
+  std::uint32_t feature_row_offset_{0};  ///< our first row in that Forward
+  /// Committed tokens and seconds of single-session cycles per draft source.
+  float dfl_tokens_{0.0F}, dfl_seconds_{0.0F};
+  float mtp_tokens_{0.0F}, mtp_seconds_{0.0F};
+  std::uint32_t dfl_cycles_{0}, mtp_cycles_{0}, draft_cycles_{0};
+  float catchup_seconds_{0.0F};
+  [[nodiscard]] bool PreferDFlash() const noexcept;
+  void ResetDraftRates() noexcept;
+  /// Allocates the draft executor and ring on first use; false without DFlash.
+  bool EnsureDFlashState();
+  /// Injects ring rows up to the committed position; false when the ring
+  /// does not cover the draft's attention window.
+  bool EnsureDFlashContext();
+  /// After the token history is replaced: the draft restarts at `position`.
+  void ForgetDFlashContext(std::uint32_t position) noexcept;
+  /// Copies the latest Forward's feature rows of positions
+  /// [position, position + rows) into the ring; `end` bounds the window.
+  void InjectFeatures(std::uint32_t position, std::uint32_t rows,
+                      std::uint32_t end);
   /// Brings the draft table up to the committed tokens.
   bool SyncDraftVocab(std::string* error_msg);
   [[nodiscard]] bool MtpEnabled() const noexcept;

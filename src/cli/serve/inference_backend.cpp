@@ -2805,6 +2805,11 @@ public:
     step.lookup_tokens = stats_after.lookup - stats_before.lookup;
     step.lookup_accepted_tokens =
         stats_after.lookup_accepted - stats_before.lookup_accepted;
+    step.dflash_rounds = stats_after.dflash_cycles - stats_before.dflash_cycles;
+    step.dflash_tokens =
+        stats_after.dflash_drafted - stats_before.dflash_drafted;
+    step.dflash_accepted_tokens =
+        stats_after.dflash_accepted - stats_before.dflash_accepted;
     return step;
   }
 
@@ -2897,6 +2902,10 @@ public:
       step.lookup_tokens = stats.lookup - before[i].lookup;
       step.lookup_accepted_tokens =
           stats.lookup_accepted - before[i].lookup_accepted;
+      step.dflash_rounds = stats.dflash_cycles - before[i].dflash_cycles;
+      step.dflash_tokens = stats.dflash_drafted - before[i].dflash_drafted;
+      step.dflash_accepted_tokens =
+          stats.dflash_accepted - before[i].dflash_accepted;
     }
     return steps;
   }

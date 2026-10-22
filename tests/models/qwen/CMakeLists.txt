@@ -55,6 +55,9 @@ add_qwen_cpu_test(qwen_attention_policy_test
 add_qwen_cpu_test(qwen_gemm_route_test
   tests/models/qwen/gemm_route_test.cpp
   "cpu;models;qwen;gemm;dispatch")
+add_qwen_cpu_test(qwen_dflash_weights_test
+  tests/models/qwen/dflash_weights_test.cpp
+  "cpu;models;qwen;dflash;dflash2")
 
 if (ENGINE_ENABLE_HIP)
   function(add_qwen_hip_test target source labels)

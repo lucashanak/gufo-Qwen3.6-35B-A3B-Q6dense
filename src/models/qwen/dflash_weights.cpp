@@ -151,9 +151,13 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
       RequiredUint32(reader, prefix + "attention.key_length", error_msg);
   auto rotary_dim = reader.GetMetadataUint32(prefix + "rope.dimension_count");
   if (!rotary_dim.has_value()) {
-    const auto sections =
-        GetNonnegativeIntegerArray(reader, prefix + "rope.dimension_sections");
-    if (sections.has_value()) {
+    const std::string sections_key = prefix + "rope.dimension_sections";
+    const auto sections = GetNonnegativeIntegerArray(reader, sections_key);
+    if (reader.FindMetadata(sections_key) == nullptr) {
+      // Exports without either key (incoai Flash-Next) rotate the whole
+      // head, as the default Hugging Face rope_parameters do.
+      rotary_dim = head_dim;
+    } else if (sections.has_value()) {
       const auto& values = *sections;
       if (values.size() == 4 && values[0] > 0 && values[1] == 0 &&
           values[2] == 0 && values[3] == 0 &&
