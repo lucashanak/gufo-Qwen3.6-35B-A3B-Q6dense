@@ -159,9 +159,7 @@ public:
   /// Copies rows [first, first + rows) of the latest Forward's features.
   bool DownloadFeatures(std::uint32_t first, std::uint32_t rows, float* host,
                         std::string* error_msg = nullptr) const;
-  [[nodiscard]] std::uint32_t FeatureWidth() const noexcept {
-    return feat_width_;
-  }
+  [[nodiscard]] std::uint32_t FeatureWidth() const noexcept { return feat_width_; }
   [[nodiscard]] const float* FeatureRows(std::uint32_t first) const noexcept {
     return feat_dev_ + std::size_t{first} * feat_width_;
   }
