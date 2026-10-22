@@ -2733,7 +2733,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
   const Config& c = config();
   return ExpertMatrixRows(n_tokens) &&
-         (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
+         (l.ffn_gate_exps.type == GgmlType::kQ3_K ||
+          l.ffn_gate_exps.type == GgmlType::kQ4_K ||
           l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
          l.ffn_up_exps.type == l.ffn_gate_exps.type &&
          (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
@@ -2776,6 +2777,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
     const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
                                      ? WeightType::kQ5_K
+                                 : l.ffn_gate_exps.type == GgmlType::kQ3_K
+                                     ? WeightType::kQ3_K
                                      : WeightType::kQ4_K;
     const bool gated_ok =
         routed_64_tiles_ != 0
