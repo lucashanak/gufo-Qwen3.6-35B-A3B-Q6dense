@@ -208,6 +208,10 @@ struct TextDecodeStep {
   /// Of draft_tokens: proposals copied from the context (prompt lookup).
   std::size_t lookup_tokens{0};
   std::size_t lookup_accepted_tokens{0};
+  /// Of draft_rounds/draft_tokens: rounds drafted by a DFlash2 model.
+  std::size_t dflash_rounds{0};
+  std::size_t dflash_tokens{0};
+  std::size_t dflash_accepted_tokens{0};
   bool stop{false};
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.

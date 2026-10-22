@@ -925,6 +925,7 @@ Executor::~Executor() {
   }
   (void)hipFree(batch_logits_);
   (void)hipFree(verification_penalties_);
+  (void)hipFree(feat_dev_);
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -3294,6 +3295,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     } else if (!finish(n)) {
       return false;
     }
+    // The end-of-layer combine settled every deferred residual update; the
+    // next layer's PLE injection belongs to that layer.
+    TapFeatures(il, s_.res, n);
     normed = next_norm != nullptr;
   }
   if (end_layer < c.num_layers) {
@@ -3355,6 +3359,63 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
   }
   return true;
+}
+
+bool Executor::ConfigureFeatureTaps(std::span<const std::uint32_t> layers,
+                                    std::string* error_msg) const {
+  const Config& c = config();
+  if (feat_dev_ != nullptr || layers.empty()) {
+    AssignError(error_msg, "feature taps are already configured or empty");
+    return false;
+  }
+  std::vector<std::int32_t> taps(c.num_layers, -1);
+  for (std::size_t t = 0; t < layers.size(); ++t) {
+    // Prefill may skip the final layer's FFN rows (ForwardBody).
+    if (layers[t] + 1 >= c.num_layers || taps[layers[t]] >= 0) {
+      AssignError(error_msg, "feature taps must name distinct inner layers");
+      return false;
+    }
+    taps[layers[t]] = static_cast<std::int32_t>(t);
+  }
+  const auto width = static_cast<std::uint32_t>(layers.size()) * c.hidden_size;
+  float* features = nullptr;
+  if (!Check(hipMalloc(reinterpret_cast<void**>(&features),
+                       std::size_t{options_.max_batch} * width * sizeof(float)),
+             "feature buffer", error_msg)) {
+    return false;
+  }
+  feat_tap_of_layer_ = std::move(taps);
+  feat_dev_ = features;
+  feat_width_ = width;
+  return true;
+}
+
+void Executor::TapFeatures(std::uint32_t il, const float* res,
+                           std::uint32_t rows) const {
+  if (feat_dev_ == nullptr || feat_tap_of_layer_[il] < 0)
+    return;
+  const Config& c = config();
+  HcMeanRows(res,
+             feat_dev_ + static_cast<std::size_t>(feat_tap_of_layer_[il]) *
+                             c.hidden_size,
+             rows, c.hidden_size, c.hc_count, feat_width_, stream_);
+}
+
+bool Executor::CopyFeatures(std::uint32_t first, std::uint32_t rows,
+                            float* dst, std::string* error_msg) const {
+  if (feat_dev_ == nullptr || first > options_.max_batch ||
+      rows > options_.max_batch - first) {
+    AssignError(error_msg, "feature rows are unavailable");
+    return false;
+  }
+  return Check(hipMemcpyAsync(dst, feat_dev_ + std::size_t{first} * feat_width_,
+                              std::size_t{rows} * feat_width_ * sizeof(float),
+                              hipMemcpyDeviceToDevice, stream_),
+               "feature copy", error_msg);
+}
+
+bool Executor::SyncStream(std::string* error_msg) const {
+  return Check(hipStreamSynchronize(stream_), "stream sync", error_msg);
 }
 
 bool Executor::Rollback(Session& session, std::uint32_t keep,

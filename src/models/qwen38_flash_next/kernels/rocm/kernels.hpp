@@ -128,6 +128,12 @@ bool HcCombineF16(float* res, const float* block_out, const float* inject,
 void HcApplyDeferred(float* res, const float* block_out, const float* w,
                      std::uint32_t n_tokens, std::uint32_t hidden,
                      hipStream_t stream);
+/// out[t * out_stride + i] = (res[t][0][i] + ... + res[t][streams-1][i]) *
+/// (1 / streams), summed in stream order with no contraction: the stream
+/// mean a DFlash draft reads as a target layer's feature.
+void HcMeanRows(const float* res, float* out, std::uint32_t n_tokens,
+                std::uint32_t hidden, std::uint32_t streams,
+                std::size_t out_stride, hipStream_t stream);
 /// HcCombineF16 with the MoE epilogue fused in: the block output is
 /// MoeEpilogueVec4F16's result over `expert_out` ([tokens][used][hidden]
 /// F16 rows), `weights`, the gated shared expert; it is formed in

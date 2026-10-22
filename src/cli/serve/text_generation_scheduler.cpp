@@ -1504,6 +1504,9 @@ struct TextGenerationScheduler::Impl {
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
       request->result.lookup_tokens += step.lookup_tokens;
       request->result.lookup_accepted_tokens += step.lookup_accepted_tokens;
+      request->result.dflash_rounds += step.dflash_rounds;
+      request->result.dflash_tokens += step.dflash_tokens;
+      request->result.dflash_accepted_tokens += step.dflash_accepted_tokens;
 
       CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
@@ -1811,6 +1814,10 @@ struct TextGenerationScheduler::Impl {
       item.request->result.lookup_tokens += step.lookup_tokens;
       item.request->result.lookup_accepted_tokens +=
           step.lookup_accepted_tokens;
+      item.request->result.dflash_rounds += step.dflash_rounds;
+      item.request->result.dflash_tokens += step.dflash_tokens;
+      item.request->result.dflash_accepted_tokens +=
+          step.dflash_accepted_tokens;
 
       bool published = true;
       try {
