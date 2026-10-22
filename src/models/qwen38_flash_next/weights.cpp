@@ -120,13 +120,15 @@ struct Binder {
     HcMixer m;
     const std::uint64_t hc_dim = c.HcDim();
     m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, {GgmlType::kF32});
-    // IQ4_NL mixers decode from their compact rows (see KQuantProjection).
+    // IQ4_NL, Q5_1 and Q6_K mixers decode from their compact rows (see
+    // KQuantProjection). The up projection's 320 columns rule out K-quants.
     m.down = Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
                  {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
-                  GgmlType::kF32, GgmlType::kIQ4_NL});
+                  GgmlType::kF32, GgmlType::kIQ4_NL, GgmlType::kQ5_1,
+                  GgmlType::kQ6_K});
     m.up = Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
                {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
-                GgmlType::kF32, GgmlType::kIQ4_NL});
+                GgmlType::kF32, GgmlType::kIQ4_NL, GgmlType::kQ5_1});
     if (with_inject) {
       m.inject = Get(prefix + "_inject.weight", hc_dim, c.hc_count, 1,
                      {GgmlType::kF32, GgmlType::kQ8_0, GgmlType::kBF16});
@@ -207,8 +209,9 @@ struct Binder {
                          {GgmlType::kF32});
     }
 
+    // A BF16 router is widened and narrowed to F16 like the F32 one.
     l.router = Get(p + "ffn_gate_inp.weight", hidden, c.num_experts, 1,
-                   {GgmlType::kF32});
+                   {GgmlType::kF32, GgmlType::kBF16});
     l.ffn_gate_exps = Get(p + "ffn_gate_exps.weight", hidden, c.expert_ff,
                           c.num_experts, experts);
     l.ffn_up_exps = Get(p + "ffn_up_exps.weight", hidden, c.expert_ff,

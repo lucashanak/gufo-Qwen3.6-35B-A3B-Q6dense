@@ -77,7 +77,8 @@ struct Uploader {
 
   static bool DecodeKQuant(core::GgmlType type) {
     return type == core::GgmlType::kQ3_K || type == core::GgmlType::kQ4_K ||
-           type == core::GgmlType::kQ5_K || type == core::GgmlType::kIQ4_NL;
+           type == core::GgmlType::kQ5_K || type == core::GgmlType::kQ6_K ||
+           type == core::GgmlType::kQ5_1 || type == core::GgmlType::kIQ4_NL;
   }
 
   /// Q8_0 blocks of `n` floats, as ggml's quantize_row_q8_0_ref.
@@ -100,7 +101,8 @@ struct Uploader {
   /// K-quant trunk projections stacked along rows: the file's rows go to
   /// `decode` unchanged and a Q8_0 re-encoding of them to `data`, so every
   /// Q8_0 path (prefill GEMMs, fused decode kernels) keeps its arithmetic
-  /// while decode GEMVs read the compact rows.
+  /// while decode GEMVs read the compact rows. The 32-wide formats (mixer
+  /// up projections, 320 columns) need only whole blocks.
   DeviceTensor KQuantProjection(std::initializer_list<const TensorRef*> parts) {
     DeviceTensor d;
     const TensorRef& first = **parts.begin();
@@ -108,7 +110,8 @@ struct Uploader {
     std::size_t raw = 0;
     for (const TensorRef* t : parts) {
       if (t->empty() || t->type != first.type || t->cols != first.cols ||
-          t->experts != 1 || t->cols % 256 != 0) {
+          t->experts != 1 ||
+          t->cols % gufo::quant::QuantizedBlockElements(t->type) != 0) {
         Fail("K-quant projection parts must share one type and shape");
         return d;
       }
@@ -152,6 +155,10 @@ struct Uploader {
             const auto* in = src + r * row_bytes;
             if (t->type == core::GgmlType::kIQ4_NL)
               gufo::quant::DequantizeIQ4_NL(in, row.data(), t->cols);
+            else if (t->type == core::GgmlType::kQ5_1)
+              gufo::quant::DequantizeQ5_1(in, row.data(), t->cols);
+            else if (t->type == core::GgmlType::kQ6_K)
+              gufo::quant::DequantizeQ6_K(in, row.data(), t->cols);
             else if (t->type == core::GgmlType::kQ3_K)
               gufo::quant::DequantizeQ3_K(in, row.data(), t->cols);
             else if (t->type == core::GgmlType::kQ4_K)
@@ -274,8 +281,9 @@ struct Uploader {
   /// Uploads matrices of one type stacked along rows; every input shares
   /// `cols`. An F32 stack (router logits, GDN alpha/beta: the only
   /// unquantized projections) is narrowed to F16, which the wide-batch GEMM
-  /// tier runs at speed. A Q8_0 stack merges projections of one input into
-  /// a single decode GEMV.
+  /// tier runs at speed; a BF16 router joins its F32 shared-expert gate row
+  /// there, widened exactly on the host. A Q8_0 stack merges projections of
+  /// one input into a single decode GEMV.
   DeviceTensor Stack(std::initializer_list<const TensorRef*> parts) {
     DeviceTensor d;
     if (!ok) {
@@ -287,14 +295,19 @@ struct Uploader {
     if (DecodeKQuant(type)) {
       return KQuantProjection(parts);
     }
+    const auto wide = [](core::GgmlType t) {
+      return t == core::GgmlType::kF32 || t == core::GgmlType::kBF16;
+    };
     for (const TensorRef* t : parts) {
-      if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
-        Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
+      if (t->empty() || t->cols != (*parts.begin())->cols ||
+          (type == core::GgmlType::kQ8_0 ? t->type != type
+                                         : !wide(type) || !wide(t->type))) {
+        Fail("stacked upload needs F32/BF16 or Q8_0 tensors of one shape");
         return d;
       }
       rows += t->rows;
-      size += t->SizeBytes();
+      size += type == core::GgmlType::kQ8_0 ? t->SizeBytes()
+                                            : t->ElementCount() * sizeof(float);
     }
     void* ptr = nullptr;
     if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
@@ -306,8 +319,26 @@ struct Uploader {
       bytes += size + kTailMargin;
       std::size_t offset = 0;
       for (const TensorRef* t : parts) {
+        auto* dst = static_cast<std::uint8_t*>(ptr) + offset;
+        if (t->type == core::GgmlType::kBF16) {
+          std::vector<float> wide_rows(t->ElementCount());
+          const auto* src = static_cast<const std::uint16_t*>(t->data);
+          for (std::size_t i = 0; i < wide_rows.size(); ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(src[i])
+                                       << 16;
+            std::memcpy(&wide_rows[i], &bits, sizeof(float));
+          }
+          if (hipMemcpy(dst, wide_rows.data(),
+                        wide_rows.size() * sizeof(float),
+                        hipMemcpyHostToDevice) != hipSuccess) {
+            Fail("upload failed for " + std::string(t->name));
+            return d;
+          }
+          offset += wide_rows.size() * sizeof(float);
+          continue;
+        }
         if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
-                         static_cast<std::uint8_t*>(ptr) + offset, error)) {
+                         dst, error)) {
           Fail("upload failed for " + std::string(t->name));
           return d;
         }

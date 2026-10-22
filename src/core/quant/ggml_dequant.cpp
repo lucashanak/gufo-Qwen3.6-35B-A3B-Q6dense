@@ -404,6 +404,31 @@ void DequantizeQ8_0(const void* src, float* dst, std::size_t k) {
   }
 }
 
+void DequantizeQ5_1(const void* src, float* dst, std::size_t k) {
+  // d, m (F16), 32 high bits, then 16 bytes of low nibbles per 32 elements.
+  constexpr std::size_t kBlockBytes = 24;
+  const auto* bytes = static_cast<const std::uint8_t*>(src);
+  for (std::size_t b = 0; b < k / 32; ++b) {
+    const std::uint8_t* blk = bytes + b * kBlockBytes;
+    std::uint16_t dh = 0;
+    std::uint16_t mh = 0;
+    std::uint32_t qh = 0;
+    std::memcpy(&dh, blk, 2);
+    std::memcpy(&mh, blk + 2, 2);
+    std::memcpy(&qh, blk + 4, 4);
+    const std::uint8_t* qs = blk + 8;
+    const float d = Fp16ToFloat(dh);
+    const float m = Fp16ToFloat(mh);
+    float* y = dst + b * 32;
+    for (int j = 0; j < 16; ++j) {
+      const int xh0 = ((qh >> j) & 1U) << 4;
+      const int xh1 = ((qh >> (j + 16)) & 1U) << 4;
+      y[j] = static_cast<float>((qs[j] & 0x0F) | xh0) * d + m;
+      y[j + 16] = static_cast<float>((qs[j] >> 4) | xh1) * d + m;
+    }
+  }
+}
+
 float DotProductQ8_0(const void* row_data, std::span<const float> vec,
                      std::size_t k) {
   const auto* blocks = static_cast<const block_q8_0*>(row_data);

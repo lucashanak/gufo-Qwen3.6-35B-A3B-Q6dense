@@ -7,35 +7,7 @@
 #include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::models::qwen38_flash_next::cpu {
-namespace {
-
 using core::GgmlType;
-
-struct BlockQ5_1 {
-  std::uint16_t d;
-  std::uint16_t m;
-  std::uint32_t qh;
-  std::uint8_t qs[16];
-};
-static_assert(sizeof(BlockQ5_1) == 24);
-
-void DequantizeQ5_1(const std::uint8_t* src, float* dst, std::size_t k) {
-  for (std::size_t b = 0; b < k / 32; ++b) {
-    BlockQ5_1 blk;
-    std::memcpy(&blk, src + b * sizeof(BlockQ5_1), sizeof(BlockQ5_1));
-    const float d = gufo::quant::Fp16ToFloat(blk.d);
-    const float m = gufo::quant::Fp16ToFloat(blk.m);
-    float* y = dst + b * 32;
-    for (int j = 0; j < 16; ++j) {
-      const int xh0 = ((blk.qh >> j) & 1U) << 4;
-      const int xh1 = ((blk.qh >> (j + 16)) & 1U) << 4;
-      y[j] = static_cast<float>((blk.qs[j] & 0x0F) | xh0) * d + m;
-      y[j + 16] = static_cast<float>((blk.qs[j] >> 4) | xh1) * d + m;
-    }
-  }
-}
-
-}  // namespace
 
 void DequantizeRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
                    float* out) {
@@ -64,7 +36,7 @@ void DequantizeRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
       gufo::quant::DequantizeQ8_0(src, out, k);
       break;
     case GgmlType::kQ5_1:
-      DequantizeQ5_1(src, out, k);
+      gufo::quant::DequantizeQ5_1(src, out, k);
       break;
     case GgmlType::kIQ4_NL:
       gufo::quant::DequantizeIQ4_NL(src, out, k);

@@ -36,8 +36,9 @@ int qfn_mmq_moe_vec(int weight_type, const void* W, const float* X_f32,
                     int n_experts, int n_expert_used, hipStream_t stream,
                     const void* W_b = nullptr, float* out_b = nullptr);
 
-// Dense Q4_K/Q5_K projection for 1–8 tokens, out [n_tokens][M]: each row is
-// read once for every token, and a token's sum matches qfn_mmq_moe_vec's.
+// Dense Q3_K/Q4_K/Q5_K/Q6_K/Q5_1/IQ4_NL projection for 1–8 tokens, out
+// [n_tokens][M]: each row is read once for every token, and a token's sum
+// matches qfn_mmq_moe_vec's.
 // qfn_mmq_dense_kq_vec over activations already quantized as
 // qfn_mmq_quantize_q8_1 writes them.
 int qfn_mmq_dense_kq_vec_preq(int weight_type, const void* W, const void* X_q8,
