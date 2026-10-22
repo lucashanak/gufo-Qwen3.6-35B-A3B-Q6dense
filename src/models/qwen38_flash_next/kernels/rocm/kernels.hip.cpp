@@ -5808,7 +5808,10 @@ __global__ void RoutedScatterKernel(const std::int32_t* __restrict__ ids,
 // launch neither needs co-resident blocks nor can deadlock behind other
 // work, and the last block to exit zeroes every counter for the next
 // launch or graph replay. Each item repeats its kernel's lane mapping,
-// rounded products, FMA operands and reduction order.
+// rounded products, FMA operands and reduction order. Projections decoded
+// from compact rows (Q6_K down / Q5_1 up, IQ4_NL) repeat
+// mul_mat_vec_dense_kq instead: its blocks per lane, mmq's vec_dot_*_q8_1,
+// the wave sum and the non-finite guard.
 constexpr std::uint32_t kFusedHidden = 2560;
 constexpr std::uint32_t kFusedStreams = 4;
 constexpr std::uint32_t kFusedRank = 320;
@@ -5921,7 +5924,255 @@ __device__ __forceinline__ void FusedCodes(const std::int8_t* qs, int i,
   __builtin_memcpy(v, qs + 4 * i, sizeof(v));
 }
 
-template<int kTokens>
+/// mmq's get_int_b2 (two 16-bit loads) and get_int_b4.
+__device__ __forceinline__ int FusedIntB2(const void* x, int i32) {
+  const auto* x16 = static_cast<const std::uint16_t*>(x);
+  int x32 = x16[2 * i32 + 0] << 0;
+  x32 |= x16[2 * i32 + 1] << 16;
+  return x32;
+}
+__device__ __forceinline__ int FusedIntB4(const void* x, int i32) {
+  return static_cast<const int*>(x)[i32];
+}
+
+/// mmq's __vsubss4: per-byte saturating a - b.
+__device__ __forceinline__ int FusedSubSat4(int a, int b) {
+  using Int8x4 = std::int8_t __attribute__((ext_vector_type(4)));
+  const Int8x4 c = __builtin_elementwise_sub_sat(__builtin_bit_cast(Int8x4, a),
+                                                 __builtin_bit_cast(Int8x4, b));
+  return __builtin_bit_cast(int, c);
+}
+
+/// A loop bound the compiler cannot see, so the decode-format loops keep
+/// mul_mat_vec_dense_kq's runtime trip count and first accumulation.
+__device__ __forceinline__ int FusedOpaque(int v) {
+  asm volatile("" : "+v"(v));
+  return v;
+}
+
+/// ggml's block_q6_K and block_iq4_nl (Q5_1Block is above).
+struct Q6KBlock {
+  std::uint8_t ql[128];
+  std::uint8_t qh[64];
+  std::int8_t scales[16];
+  __half d;
+};
+static_assert(sizeof(Q6KBlock) == 210, "block_q6_K must be 210 bytes");
+struct IQ4NLBlock {
+  __half d;
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(IQ4NLBlock) == 18, "block_iq4_nl must be 18 bytes");
+
+/// A decode format's lane share of one block (Load) and mmq's
+/// vec_dot_*_q8_1 of it against a token's Q8_1 blocks from the block's first
+/// one (Dot), spelled as vecdotq.hpp writes them: the same rounded products
+/// and FMA candidates, so both compile to the same arithmetic. qk, qi and
+/// vdr are mmq's; the Q8_0 entry only names the layout of the Q8_0 route.
+template<WeightType kType>
+struct FusedFormat;
+
+template<>
+struct FusedFormat<WeightType::kQ8_0> {
+  using Block = Q8_0Block;
+  struct Lane {};
+};
+
+template<>
+struct FusedFormat<WeightType::kQ6_K> {
+  using Block = Q6KBlock;
+  static constexpr int kQk = 256;
+  static constexpr int kQi = 32;  // QI6_K
+  static constexpr int kVdr = 1;
+  struct Lane {
+    int vl;
+    int vh;
+    int sc[2];
+    float d;
+  };
+  static __device__ __forceinline__ Lane Load(const Block* b, int iqs) {
+    const int scale_offset =
+        (kQi / 4) * (iqs / (kQi / 2)) + (iqs % (kQi / 2)) / (kQi / 8);
+    const int vh_shift = 2 * ((iqs % (kQi / 2)) / (kQi / 4));
+    Lane w;
+    w.vl = FusedIntB2(b->ql, iqs);
+    w.vh = FusedIntB2(b->qh, (kQi / 4) * (iqs / (kQi / 2)) + iqs % (kQi / 4)) >>
+           vh_shift;
+    const std::int8_t* scales = b->scales + scale_offset;
+    w.sc[0] = scales[0];
+    w.sc[1] = scales[4];
+    w.d = __half2float(b->d);
+    return w;
+  }
+  struct Input {
+    int u[2];
+    float d8[2];
+  };
+  static __device__ __forceinline__ Input Activations(const Q8_1Block* y,
+                                                      int iqs) {
+    const int bq8_offset =
+        2 * 2 * (iqs / (kQi / 2)) + (iqs % (kQi / 2)) / (kQi / 4);
+    Input x;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      x.u[i] = FusedIntB4(y[bq8_offset + 2 * i].qs, iqs % 8);
+      x.d8[i] = __low2float(y[bq8_offset + 2 * i].ds);
+    }
+    return x;
+  }
+  static __device__ __forceinline__ float Dot(const Lane& w, const Input& x) {
+    const int* u = x.u;
+    const float* d8 = x.d8;
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int sc = w.sc[i];
+      const int vil = (w.vl >> (4 * i)) & 0x0F0F0F0F;
+      const int vih = ((w.vh >> (4 * i)) << 4) & 0x30303030;
+      const int vi = FusedSubSat4((vil | vih), 0x20202020);
+      sumf += d8[i] *
+              (__builtin_amdgcn_sudot4(true, vi, true, u[i], 0, false) * sc);
+    }
+    return w.d * sumf;
+  }
+  static __device__ __forceinline__ float Add(float acc, const Lane& w,
+                                              const Input& x) {
+    return acc + Dot(w, x);
+  }
+};
+
+template<>
+struct FusedFormat<WeightType::kQ5_1> {
+  using Block = Q5_1Block;
+  static constexpr int kQk = 32;
+  static constexpr int kQi = 4;  // QI5_1
+  static constexpr int kVdr = 2;
+  struct Lane {
+    int vl[2];
+    int vh[2];
+    __half2 dm;
+  };
+  static __device__ __forceinline__ Lane Load(const Block* b, int iqs) {
+    Lane w;
+#pragma unroll
+    for (int i = 0; i < kVdr; ++i) {
+      w.vl[i] = FusedIntB4(b->qs, iqs + i);
+      w.vh[i] = FusedIntB4(&b->qh, 0) >> (4 * (iqs + i));
+    }
+    w.dm = __halves2half2(b->d, b->m);
+    return w;
+  }
+  struct Input {
+    int u[2 * kVdr];
+    __half2 ds;
+  };
+  static __device__ __forceinline__ Input Activations(const Q8_1Block* y,
+                                                      int iqs) {
+    Input x;
+#pragma unroll
+    for (int i = 0; i < kVdr; ++i) {
+      x.u[2 * i + 0] = FusedIntB4(y->qs, iqs + i);
+      x.u[2 * i + 1] = FusedIntB4(y->qs, iqs + i + kQi);
+    }
+    x.ds = y->ds;
+    return x;
+  }
+  static __device__ __forceinline__ float Dot(const Lane& w, const Input& x) {
+    const int* u = x.u;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < kVdr; ++i) {
+      const unsigned lo =
+          ((static_cast<unsigned>(w.vh[i]) & 15u) * 0x00204081u) & 0x01010101u;
+      const unsigned hi =
+          (((static_cast<unsigned>(w.vh[i]) >> 16) & 15u) * 0x00204081u) &
+          0x01010101u;
+      const int vi0 = (w.vl[i] & 0x0F0F0F0F) | (lo << 4);
+      sumi =
+          __builtin_amdgcn_sudot4(true, vi0, true, u[2 * i + 0], sumi, false);
+      const int vi1 = ((w.vl[i] >> 4) & 0x0F0F0F0F) | (hi << 4);
+      sumi =
+          __builtin_amdgcn_sudot4(true, vi1, true, u[2 * i + 1], sumi, false);
+    }
+    const float2 tmp = __half22float2(__hmul2(w.dm, x.ds));
+    const float d5d8 = tmp.x;
+    const float m5s8 = tmp.y;
+    return sumi * d5d8 + m5s8 / (kQi / kVdr);
+  }
+  static __device__ __forceinline__ float Add(float acc, const Lane& w,
+                                              const Input& x) {
+    return acc + Dot(w, x);
+  }
+};
+
+template<>
+struct FusedFormat<WeightType::kIQ4_NL> {
+  using Block = IQ4NLBlock;
+  static constexpr int kQk = 32;
+  static constexpr int kQi = 4;  // QI4_NL
+  static constexpr int kVdr = 2;
+  struct Lane {
+    int q4[2];
+    __half d;
+  };
+  static __device__ __forceinline__ Lane Load(const Block* b, int iqs) {
+    Lane w;
+#pragma unroll
+    for (int l = 0; l < 2; ++l) {
+      w.q4[l] = FusedIntB2(b->qs, iqs + l);
+    }
+    w.d = b->d;
+    return w;
+  }
+  struct Input {
+    int q8[8];
+    float d8;
+  };
+  static __device__ __forceinline__ Input Activations(const Q8_1Block* y,
+                                                      int iqs) {
+    Input x;
+    const int* q8 = reinterpret_cast<const int*>(y->qs) + iqs;
+#pragma unroll
+    for (int l = 0; l < 2; ++l) {
+      x.q8[l] = q8[l];
+      x.q8[l + 4] = q8[l + 4];
+    }
+    x.d8 = __low2float(y->ds);
+    return x;
+  }
+  static __device__ __forceinline__ float Add(float acc, const Lane& w,
+                                              const Input& x) {
+    const int* q8 = x.q8;
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 2; ++l) {
+      const int vx =
+          static_cast<int>(IQ4NLBytes(static_cast<std::uint32_t>(w.q4[l])));
+      const int vy = static_cast<int>(
+          IQ4NLBytes(static_cast<std::uint32_t>(w.q4[l] >> 4)));
+      sumi = __builtin_amdgcn_sudot4(true, vx, true, q8[l + 0], sumi, false);
+      sumi = __builtin_amdgcn_sudot4(true, vy, true, q8[l + 4], sumi, false);
+    }
+    // d = d4 * d8 and acc += d * sumi compile to sumi * d4, then one FMA
+    // with d8 into the sum. Spelled out and materialized: once d8 is hoisted
+    // out of the rows, fast-math regroups even __fmul_rn into d4 * d8.
+    const float p =
+        Materialize(__fmul_rn(static_cast<float>(sumi), __half2float(w.d)));
+    return __fmaf_rn(p, x.d8, acc);
+  }
+};
+
+/// A format's per-token activation operands (none for the Q8_0 route).
+template<WeightType kType>
+struct FusedInput {
+  using type = typename FusedFormat<kType>::Input;
+};
+template<>
+struct FusedInput<WeightType::kQ8_0> {
+  struct type {};
+};
+
+template<int kTokens, WeightType kDown, WeightType kUp>
 __launch_bounds__(kThreads) __global__
     void HcMixQ8FusedKernel(HcFusedMix a, HcFusedState* st) {
   __shared__ float shared[32];
@@ -5992,9 +6243,44 @@ __launch_bounds__(kThreads) __global__
   for (unsigned tile;
        (tile = FusedTake(&st->taken[1], &item)) < kFusedDownTiles;) {
     FusedWait(&st->done[0], kRows);
-    constexpr int kPrefetch = 2;
     const unsigned row = tile * kFusedWaves + wave;
     const auto* input = static_cast<const Q8_1Block*>(a.xn_q8);
+    if constexpr (kDown != WeightType::kQ8_0) {
+      // mul_mat_vec_dense_kq: the lane's blocks in order, the wave sum and
+      // its non-finite guard.
+      using F = FusedFormat<kDown>;
+      const auto* blocks = static_cast<const typename F::Block*>(a.down) +
+                           std::size_t{row} * (kFusedDim / F::kQk);
+      const int count = FusedOpaque(static_cast<int>(kFusedDim / F::kQk));
+      const int kqs = F::kVdr * (lane % (F::kQi / F::kVdr));
+      const float zero = Materialize(0.0f);
+      float sum[kTokens];
+#pragma unroll
+      for (int t = 0; t < kTokens; ++t) {
+        sum[t] = zero;
+      }
+      for (int kbx = lane / (F::kQi / F::kVdr); kbx < count;
+           kbx += F::kVdr * 32 / F::kQi) {
+        const auto w = F::Load(blocks + kbx, kqs);
+#pragma unroll
+        for (int t = 0; t < kTokens; ++t) {
+          sum[t] = F::Add(
+              sum[t], w,
+              F::Activations(input + t * kFusedDimBlocks + kbx * (F::kQk / 32),
+                             kqs));
+        }
+      }
+#pragma unroll
+      for (int t = 0; t < kTokens; ++t) {
+        const float value = WaveSum(sum[t]);
+        if (lane == 0) {
+          st->down[t * kFusedRank + row] = isfinite(value) ? value : 0.0f;
+        }
+      }
+      FusedDone(&st->done[1]);
+      continue;
+    }
+    constexpr int kPrefetch = 2;
     const int part = (lane & 3) * 2;
     float sum[kTokens] = {};
     for (int first = lane / 4; first < static_cast<int>(kFusedDimBlocks);
@@ -6066,14 +6352,36 @@ __launch_bounds__(kThreads) __global__
         (std::size_t{s} * kFusedHidden + unit * 32 + e0) * kFusedRankBlocks;
     int v0[kAhead][2], v1[kAhead][2];
     __half w0[kAhead], w1[kAhead];
+    // A decode format's lanes follow mul_mat_vec_dense_kq: one block each
+    // (lanes past the row's ten keep a zero sum).
+    using UF = FusedFormat<kUp>;
+    typename UF::Lane wl[kAhead];
+    const auto UpLanes = [] {
+      if constexpr (kUp == WeightType::kQ8_0) {
+        return 4;
+      } else {
+        return UF::kQi / UF::kVdr;
+      }
+    };
     const auto load = [&](int r0) {
 #pragma unroll
       for (int r = 0; r < kAhead; ++r) {
-        const Q8_0Block* wr = rows + (r0 + r) * kFusedRankBlocks;
-        FusedCodes(wr[kb0].qs, kqs, v0[r]);
-        FusedCodes(wr[kb1].qs, kqs, v1[r]);
-        w0[r] = wr[kb0].d;
-        w1[r] = wr[kb1].d;
+        if constexpr (kUp == WeightType::kQ8_0) {
+          const Q8_0Block* wr = rows + (r0 + r) * kFusedRankBlocks;
+          FusedCodes(wr[kb0].qs, kqs, v0[r]);
+          FusedCodes(wr[kb1].qs, kqs, v1[r]);
+          w0[r] = wr[kb0].d;
+          w1[r] = wr[kb1].d;
+        } else {
+          const auto* wr =
+              static_cast<const typename UF::Block*>(a.up) +
+              (std::size_t{s} * kFusedHidden + unit * 32 + e0 + r0 + r) *
+                  kFusedRankBlocks;
+          const int kb = lane / (UF::kQi / UF::kVdr);
+          wl[r] =
+              UF::Load(wr + (kb < static_cast<int>(kFusedRankBlocks) ? kb : 0),
+                       UF::kVdr * (lane % (UF::kQi / UF::kVdr)));
+        }
       }
     };
     FusedWait(&st->done[0], kRows);
@@ -6128,6 +6436,18 @@ __launch_bounds__(kThreads) __global__
       d11[t] = __low2float(x1.ds);
     }
     const float zero = Materialize(0.0f);
+    // A decode format's lane reads the same lo block for every row.
+    const int up_kb = lane / UpLanes();
+    const bool up_live = up_kb < static_cast<int>(kFusedRankBlocks);
+    typename FusedInput<kUp>::type up_x[kTokens];
+    if constexpr (kUp != WeightType::kQ8_0) {
+#pragma unroll
+      for (int t = 0; t < kTokens; ++t) {
+        up_x[t] = UF::Activations(lo_s + t * kFusedRankBlocks +
+                                      (up_live ? up_kb : 0) * (UF::kQk / 32),
+                                  UF::kVdr * (lane % (UF::kQi / UF::kVdr)));
+      }
+    }
 #pragma unroll
     for (int r0 = 0; r0 < 16; r0 += kAhead) {
       if (r0 != 0) {
@@ -6135,6 +6455,31 @@ __launch_bounds__(kThreads) __global__
       }
 #pragma unroll
       for (int r = 0; r < kAhead; ++r) {
+        if constexpr (kUp != WeightType::kQ8_0) {
+          // warp_reduce_sum per token, as the scatter pairs reproduce it.
+          float sum[kTokens];
+#pragma unroll
+          for (int t = 0; t < kTokens; ++t) {
+            sum[t] = zero;
+            if (up_live) {
+              sum[t] = UF::Add(sum[t], wl[r], up_x[t]);
+            }
+          }
+          if constexpr (kTokens == 1) {
+            const float value = WaveSum(sum[0]);
+            if (lane == 0) {
+              gate_s[0][s][e0 + r0 + r] = isfinite(value) ? value : 0.0f;
+            }
+          } else {
+            constexpr int kShift = 5 - FusedScatterLevels(kTokens);
+            const float value = FusedScatterSum(sum, lane);
+            const int t = lane >> kShift;
+            if ((lane & ((1 << kShift) - 1)) == 0 && t < kTokens) {
+              gate_s[t][s][e0 + r0 + r] = isfinite(value) ? value : 0.0f;
+            }
+          }
+          continue;
+        }
         float sum[kTokens];
 #pragma unroll
         for (int t = 0; t < kTokens; ++t) {
@@ -6383,17 +6728,34 @@ std::size_t HcMixQ8FusedStateBytes() {
   return sizeof(HcFusedState);
 }
 
-template<int kTokens>
+bool HcFusedFormats(WeightType down, WeightType up) {
+  return (down == WeightType::kQ8_0 && up == WeightType::kQ8_0) ||
+         (down == WeightType::kQ6_K && up == WeightType::kQ5_1) ||
+         (down == WeightType::kIQ4_NL && up == WeightType::kIQ4_NL);
+}
+
+std::uint32_t HcFusedMaxTokens(WeightType down, WeightType up) {
+  // Graph-replayed hc_mix_bench, five launches -> one: Q8_0 1.05-1.11x at
+  // 1-8 tokens; Q6_K/Q5_1 1.03-1.29x to 5 tokens, 0.92-0.95x at 6-8;
+  // IQ4_NL 1.08x at 1 token, 0.70-0.94x from 2.
+  if (!HcFusedFormats(down, up))
+    return 0;
+  return down == WeightType::kQ8_0   ? kFusedMaxTokens
+         : down == WeightType::kQ6_K ? 5
+                                     : 1;
+}
+
+template<WeightType kDown, WeightType kUp, int kTokens = 1>
 static void LaunchHcMixQ8Fused(const HcFusedMix& mix, HcFusedState* state,
                                std::uint32_t n_tokens, hipStream_t stream) {
   if (n_tokens == kTokens) {
     // A block per down tile and mix unit, so every unit can load its
     // weights early; the first blocks take the combine rows before units.
-    hipLaunchKernelGGL(HcMixQ8FusedKernel<kTokens>,
+    hipLaunchKernelGGL((HcMixQ8FusedKernel<kTokens, kDown, kUp>),
                        dim3(kFusedDownTiles + kFusedUnits), dim3(kThreads), 0,
                        stream, mix, state);
   } else if constexpr (kTokens < static_cast<int>(kFusedMaxTokens)) {
-    LaunchHcMixQ8Fused<kTokens + 1>(mix, state, n_tokens, stream);
+    LaunchHcMixQ8Fused<kDown, kUp, kTokens + 1>(mix, state, n_tokens, stream);
   }
 }
 
@@ -6403,11 +6765,21 @@ bool HcMixQ8Fused(void* state, const HcFusedMix& mix, std::uint32_t n_tokens,
       mix.hidden != kFusedHidden || mix.streams != kFusedStreams ||
       mix.rank != kFusedRank || mix.gamma == nullptr ||
       mix.lo_q8_cols < kFusedRank || mix.lo_q8_cols % 32 != 0 ||
-      (mix.inject_w != nullptr && mix.inject_out == nullptr)) {
+      (mix.inject_w != nullptr && mix.inject_out == nullptr) ||
+      !HcFusedFormats(mix.down_type, mix.up_type)) {
     return false;
   }
-  LaunchHcMixQ8Fused<1>(mix, static_cast<HcFusedState*>(state), n_tokens,
-                        stream);
+  auto* fused = static_cast<HcFusedState*>(state);
+  if (mix.down_type == WeightType::kQ6_K) {
+    LaunchHcMixQ8Fused<WeightType::kQ6_K, WeightType::kQ5_1>(mix, fused,
+                                                             n_tokens, stream);
+  } else if (mix.down_type == WeightType::kIQ4_NL) {
+    LaunchHcMixQ8Fused<WeightType::kIQ4_NL, WeightType::kIQ4_NL>(
+        mix, fused, n_tokens, stream);
+  } else {
+    LaunchHcMixQ8Fused<WeightType::kQ8_0, WeightType::kQ8_0>(mix, fused,
+                                                             n_tokens, stream);
+  }
   return true;
 }
 
