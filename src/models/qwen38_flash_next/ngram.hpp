@@ -71,10 +71,8 @@ struct NgramGatherOwner {
   NgramCounters* counters{nullptr};
 };
 
-/// Reads n-gram embedding rows from the GGUF shard. The table is mapped and,
-/// once Warm has faulted it in, rows decode from the page cache; reclaimed
-/// pages fault back in on the readers. Without a mapping the readers use
-/// direct I/O and a bounded cache of compressed rows.
+/// Reads n-gram embedding rows from the GGUF shard with direct I/O and a
+/// bounded cache of compressed rows. The table stays out of the page cache.
 /// Rows are dequantized to F32 and laid out [token][head][ple_head_dim].
 class NgramTable {
 public:
@@ -104,10 +102,6 @@ public:
                                std::span<float> out,
                                std::span<const NgramGatherOwner> owners = {});
   [[nodiscard]] bool WaitRead();
-
-  /// Faults the mapped table into the page cache over a few threads. Call
-  /// once the model weights are resident (it reads the whole table).
-  void Warm();
 
   [[nodiscard]] std::uint32_t RowDim() const noexcept { return row_dim_; }
   [[nodiscard]] std::uint64_t Rows() const noexcept { return rows_; }
@@ -145,12 +139,6 @@ private:
 
   int fd_{-1};
   bool direct_{false};
-  // The table's page-aligned mapping, its file offset, and whether Warm has
-  // faulted all of it in (small gathers then decode on the caller).
-  const std::uint8_t* map_{nullptr};
-  std::size_t map_len_{0};
-  std::uint64_t map_begin_{0};
-  std::atomic<bool> warm_done_{false};
   std::uint64_t base_offset_{0};
   std::uint64_t rows_{0};
   std::uint32_t row_dim_{0};

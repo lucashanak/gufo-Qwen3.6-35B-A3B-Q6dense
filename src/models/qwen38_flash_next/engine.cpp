@@ -172,9 +172,6 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->executor_) {
     return nullptr;
   }
-  if (m->ngram_) {
-    m->ngram_->Warm();
-  }
   return m;
 }
 

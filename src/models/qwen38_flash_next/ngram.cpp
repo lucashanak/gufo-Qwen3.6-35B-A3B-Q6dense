@@ -1,7 +1,6 @@
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -24,12 +23,6 @@ constexpr std::size_t kWorkers = 128;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
 constexpr std::size_t kCacheBytes = 128 * 1024 * 1024;
-// Warm faults the mapping in chunks over a few threads.
-constexpr std::size_t kWarmChunk = 64 * 1024 * 1024;
-constexpr unsigned kWarmThreads = 16;
-#ifndef MADV_POPULATE_READ
-#define MADV_POPULATE_READ 22
-#endif
 
 }  // namespace
 
@@ -81,9 +74,6 @@ NgramTable::~NgramTable() {
   if (fd_ >= 0) {
     ::close(fd_);
   }
-  if (map_ != nullptr) {
-    ::munmap(const_cast<std::uint8_t*>(map_), map_len_);
-  }
 }
 
 std::unique_ptr<NgramTable> NgramTable::Open(
@@ -107,26 +97,6 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   t->cache_rows_.resize(t->cache_count_ * t->row_bytes_);
   t->rows_ = rows;
   t->base_offset_ = file_offset;
-  // A buffered descriptor maps the table; the mapping is reclaimable cache,
-  // so memory pressure only sends rows back to the disk.
-  const auto map_path = "/proc/self/fd/" + std::to_string(file_descriptor);
-  if (const int map_fd = ::open(map_path.c_str(), O_RDONLY | O_CLOEXEC);
-      map_fd >= 0) {
-    const std::uint64_t begin = file_offset & ~std::uint64_t{kPage - 1};
-    const std::uint64_t end = file_offset + rows * t->row_bytes_;
-    void* p = ::mmap(nullptr, end - begin, PROT_READ, MAP_SHARED, map_fd,
-                     static_cast<off_t>(begin));
-    ::close(map_fd);
-    if (p != MAP_FAILED) {
-      (void)::madvise(p, end - begin, MADV_RANDOM);
-      t->map_ = static_cast<const std::uint8_t*>(p);
-      t->map_len_ = end - begin;
-      t->map_begin_ = begin;
-      t->cache_count_ = 0;
-      t->cache_entries_.reset();
-      t->cache_rows_ = {};
-    }
-  }
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
   // model must not be used here or every touched row would stay resident.
   const auto path = "/proc/self/fd/" + std::to_string(file_descriptor);
@@ -182,12 +152,6 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
                          std::vector<std::uint8_t>& buf, NgramCounters* owner) {
   if (row >= rows_) {
     return false;
-  }
-  if (map_ != nullptr) {
-    DecodeRow(map_ + (base_offset_ + row * row_bytes_ - map_begin_), dst);
-    if (owner != nullptr)
-      owner->cache_hits_.fetch_add(1, std::memory_order_relaxed);
-    return true;
   }
   if (ReadCached(row, dst)) {
     if (owner != nullptr)
@@ -354,16 +318,6 @@ bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
   if (jobs_.size() >= kBatchJobs) {
     std::sort(jobs_.begin(), jobs_.end(),
               [](const Job& a, const Job& b) { return a.row < b.row; });
-  } else if (warm_done_.load(std::memory_order_acquire)) {
-    // A resident table serves a decode gather on the caller: its few rows
-    // decode faster than a reader wakes.
-    for (const Job& job : jobs_) {
-      DecodeRow(map_ + (base_offset_ + job.row * row_bytes_ - map_begin_),
-                job.dst);
-      if (job.owner != nullptr)
-        job.owner->cache_hits_.fetch_add(1, std::memory_order_relaxed);
-    }
-    jobs_.clear();
   } else {
     // Small cached gathers avoid waking the I/O pool for every decode
     // token. Large prefills still parallelize their row conversions.
@@ -388,34 +342,6 @@ bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
       wake_.notify_one();
   }
   return true;
-}
-
-void NgramTable::Warm() {
-  if (map_ == nullptr || warm_done_.load(std::memory_order_acquire)) {
-    return;
-  }
-  std::atomic<std::size_t> next{0};
-  std::atomic<bool> ok{true};
-  std::vector<std::thread> threads;
-  for (unsigned i = 0; i < kWarmThreads; ++i) {
-    threads.emplace_back([&] {
-      for (;;) {
-        const std::size_t offset = next.fetch_add(kWarmChunk);
-        if (offset >= map_len_)
-          return;
-        const std::size_t length = std::min(kWarmChunk, map_len_ - offset);
-        if (::madvise(const_cast<std::uint8_t*>(map_) + offset, length,
-                      MADV_POPULATE_READ) != 0)
-          ok.store(false, std::memory_order_relaxed);
-      }
-    });
-  }
-  for (auto& thread : threads) {
-    thread.join();
-  }
-  // A failed fault-in (memory pressure) keeps every gather on the readers.
-  warm_done_.store(ok.load(std::memory_order_relaxed),
-                   std::memory_order_release);
 }
 
 bool NgramTable::WaitRead() {
