@@ -1142,12 +1142,12 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       sampler.config().uses_random_sampling() || batch_drafts.has_value()
           ? 0
           : occupancy;
-  // An unplanned cycle drafts to its budget and lets confidence end the
-  // chain; the controller still backs off to AR. Sampled proposals gate on
-  // host-side q in every path; greedy drafts need the head's confidence,
-  // which only an isolated cycle reads back.
-  const bool gated = MtpEnabled() && !batch_drafts &&
-                     (sampler.config().uses_random_sampling() || !defer_head);
+  // Every chain ends after its first proposal below the gate (greedy: the
+  // head's confidence, read back with each draft token in every path;
+  // sampled: host-side q). An unplanned cycle drafts to its budget; a jointly
+  // planned greedy batch keeps the planned width as its cap. The controller
+  // still backs off to AR.
+  const bool gated = MtpEnabled();
   std::uint32_t drafts = 0;
   if (MtpEnabled() && cap > 1) {
     drafts = batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
@@ -1155,7 +1155,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                                 static_cast<std::uint32_t>(cap - 1),
                                 static_cast<std::uint32_t>(tokens_.size()),
                                 pending->policy_concurrency);
-    if (gated && drafts != 0)
+    if (gated && !batch_drafts && drafts != 0)
       drafts = std::min<std::uint32_t>(
           static_cast<std::uint32_t>(cap - 1), model_->options_.max_draft_tokens);
   }
@@ -1704,6 +1704,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
           p.chain.size() < p.width) {
         heads.push_back({requests[i].session->session_.get(),
                          {.token = p.sampled ? nullptr : &p.draft,
+                          .confidence = p.sampled ? nullptr : &p.draft_confidence,
                           .candidates = p.sampled ? &p.candidates : nullptr,
                           .draft_subset = p.draft_subset}});
       }
