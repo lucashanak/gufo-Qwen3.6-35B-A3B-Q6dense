@@ -726,8 +726,15 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
     return false;
-  if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
-      l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
+  const auto gate_type = l.ffn_gate_exps.type;
+  if ((gate_type == core::GgmlType::kQ3_K ||
+       gate_type == core::GgmlType::kQ4_K ||
+       gate_type == core::GgmlType::kQ5_K ||
+       gate_type == core::GgmlType::kQ8_0) &&
+      l.ffn_up_exps.type == gate_type &&
+      l.ffn_up_exps.rows == l.ffn_gate_exps.rows &&
+      l.ffn_up_exps.cols == l.ffn_gate_exps.cols &&
+      l.ffn_up_exps.experts == l.ffn_gate_exps.experts) {
     // Share expert weights across request boundaries while retaining the
     // scalar Q8 activation quantization and dot-product reduction.
     if (qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),

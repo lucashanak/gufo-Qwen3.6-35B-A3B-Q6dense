@@ -6,6 +6,20 @@
 | --- | --- |
 | HcMixQ8Fused: a decode batch's combine, Q8_0 down/up projections, SiLU and epilogue in one launch | Component result; end-to-end qualification pending. Five launches per mixer become one: blocks take combine rows, down tiles and 32-element mix units from counters, wait on completion counts (no co-residency needed), and the last block to exit zeroes the counters for graph replay. Residual, norm, every Q8_1 row, lo, mixed and inject partials are byte-identical at 1–8 tokens, eager, in place and replayed. Graph-replayed microbenchmark (48 mixers over 16 rotating 7 MB weight sets), five launches → one: T1 47.8 → 44.5 µs, T2 48.2 → 44.3, T4 51.7 → 48.5, T8 59.2 → 57.2. Units load their up rows once the combine is done; down tiles do not prefetch. Rejected (all exact): touching down weights into the caches during the combine (its reads queue behind them; T8 0.92× of five launches), LDS-staged coalesced up rows (VGPRs 121–177, 0.75–0.93×), all 16 up rows ahead at T5–T8 (T8 1.00×). |
 
+## Shared routed experts in decode and verification (October 22, 2026)
+
+`qwen38_flash_next_routed_vec_bench` (new) replays the vector route over 48
+layers of 512 Q3_K/IQ4_NL experts as hipGraphs, with a fresh top-10 routing per
+layer (disjoint, random, overlap = each row keeps half of the previous row's
+experts, shared = all rows identical), alternating binaries, median of 9.
+
+| Experiment | Outcome |
+| --- | --- |
+| Profile of the old route | Gate/up and down stream disjoint experts at 180–200 GB/s, so a fresh expert costs its bytes. A shared expert did not: the Q3_K grouped kernel re-loaded and re-decoded the weights per row (shared 2 → 8 rows: gate 6.3 → 24.9 ms per 48 layers for the same 10 experts), and above eight rows each 8-row chunk re-read experts shared across requests. |
+| Decode-once gate/up groups, split single-row groups, all gated formats grouped up to 64 rows | Component result; end-to-end pending. Q3_K/Q5_K groups with two or more rows decode each weight block once per row pair (`MoeFragment`, original vec_dot float expression, exact `__mul24` scale product); groups with one row take a second launch with the original kernel and register footprint (VGPR 186 → 46–88). MoeBatch's grouped gate/up, single down launch and epilogue now cover Q3_K/Q5_K/Q8_0 as well as Q4_K. 48-layer ms before → after, overlap 2/4/8/16/64 rows: 10.6/18.7/36.7/71.8/292 → 9.6/16.4/30.5/59.8/217; random 8/16/64: 44.8/86.7/348 → 41.6/83.4/264; shared 8/64: 33.2/259 → 18.6/139; disjoint 1–6 rows within ±3%. Per extra row (2 → 8, overlap): 4.4 → 3.5 ms. Output hashes of every layer equal the old route for Q3_K, Q4_K, Q5_K, Q8_0 gate/up × IQ4_NL, Q5_1, Q8_0 down, 1–64 rows and all four routings; the routed operator test checks 1–64 rows of every gated format against the scalar kernel bit for bit, with shared and mostly single-row routing. |
+| Fused gate/up + SwiGLU + Q8_1 and down + epilogue (two launches per layer) | Rejected: exact on every configuration, but 32-row tiles of eight 8-row waves (130 VGPRs) and row tiles that walk every expert left too few loads in flight: 120–135 GB/s against 180–200, 1.4–1.6× slower on disjoint routing; only all-shared routing gained. |
+| Decode-once groups without the single-row split; scalar group fields | Rejected: the 8-column kernel's VGPRs (186–227) slowed single-row groups 10–25%; a scheduling barrier per row only partly helped. `readfirstlane` of the group fields halved VGPRs but serialized the group loads (random 8 rows +60%). Q8_0 gate/up keeps the original kernel (no gain). |
+
 ## Mid-size prefill passes (October 21, 2026)
 
 | Experiment | Outcome |
