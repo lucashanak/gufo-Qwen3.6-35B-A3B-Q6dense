@@ -76,7 +76,8 @@ struct Uploader {
   }
 
   static bool DecodeKQuant(core::GgmlType type) {
-    return type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K;
+    return type == core::GgmlType::kQ3_K || type == core::GgmlType::kQ4_K ||
+           type == core::GgmlType::kQ5_K;
   }
 
   /// Q8_0 blocks of `n` floats, as ggml's quantize_row_q8_0_ref.
@@ -149,7 +150,9 @@ struct Uploader {
           std::vector<float> row(t->cols);
           for (std::size_t r = w; r < t->rows; r += workers) {
             const auto* in = src + r * row_bytes;
-            if (t->type == core::GgmlType::kQ4_K)
+            if (t->type == core::GgmlType::kQ3_K)
+              gufo::quant::DequantizeQ3_K(in, row.data(), t->cols);
+            else if (t->type == core::GgmlType::kQ4_K)
               gufo::quant::DequantizeQ4_K(in, row.data(), t->cols);
             else
               gufo::quant::DequantizeQ5_K(in, row.data(), t->cols);
@@ -540,7 +543,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
-  m->output_bytes_ = w.output.SizeBytes();
+  // Row-addressed users (draft tables) read the head's Q8_0 rows when it
+  // also keeps K-quant decode rows.
+  m->output_bytes_ = m->output_.decode != nullptr
+                         ? std::size_t{m->output_.rows} *
+                               (m->output_.cols / 32 * 34)
+                         : w.output.SizeBytes();
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;

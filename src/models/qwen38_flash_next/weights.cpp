@@ -143,9 +143,10 @@ struct Binder {
     // The large trunk projections may also be K-quants: the device keeps a
     // Q8_0 copy for prefill and the compact rows for decode.
     const auto projection = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
-                             GgmlType::kF32,  GgmlType::kQ4_K, GgmlType::kQ5_K};
-    const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
-                          GgmlType::kQ5_1, GgmlType::kQ8_0};
+                             GgmlType::kF32,  GgmlType::kQ3_K, GgmlType::kQ4_K,
+                             GgmlType::kQ5_K};
+    const auto experts = {GgmlType::kQ3_K, GgmlType::kQ4_K, GgmlType::kQ5_K,
+                          GgmlType::kQ6_K, GgmlType::kQ5_1, GgmlType::kQ8_0};
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
@@ -266,8 +267,11 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   }
   w.token_embd =
       b.Get("token_embd.weight", c.hidden_size, c.vocab_size, 1, dense);
-  w.output =
-      b.Get("output.weight", c.hidden_size, c.vocab_size, 1, dense, false);
+  // The vocabulary head may be a K-quant (decode rows plus a Q8_0 copy).
+  w.output = b.Get("output.weight", c.hidden_size, c.vocab_size, 1,
+                   {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                    GgmlType::kF32, GgmlType::kQ4_K, GgmlType::kQ5_K},
+                   false);
   if (w.output.empty()) {
     w.output = w.token_embd;
   }
