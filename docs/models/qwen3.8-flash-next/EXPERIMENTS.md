@@ -1,5 +1,11 @@
 # Qwen3.8 Flash-Next experiments
 
+## One-launch decode HC mixer (October 22, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| HcMixQ8Fused: a decode batch's combine, Q8_0 down/up projections, SiLU and epilogue in one launch | Component result; end-to-end qualification pending. Five launches per mixer become one: blocks take combine rows, down tiles and 32-element mix units from counters, wait on completion counts (no co-residency needed), and the last block to exit zeroes the counters for graph replay. Residual, norm, every Q8_1 row, lo, mixed and inject partials are byte-identical at 1–8 tokens, eager, in place and replayed. Graph-replayed microbenchmark (48 mixers over 16 rotating 7 MB weight sets), five launches → one: T1 47.8 → 44.5 µs, T2 48.2 → 44.3, T4 51.7 → 48.5, T8 59.2 → 57.2. Units load their up rows once the combine is done; down tiles do not prefetch. Rejected (all exact): touching down weights into the caches during the combine (its reads queue behind them; T8 0.92× of five launches), LDS-staged coalesced up rows (VGPRs 121–177, 0.75–0.93×), all 16 up rows ahead at T5–T8 (T8 1.00×). |
+
 ## Mid-size prefill passes (October 21, 2026)
 
 | Experiment | Outcome |
