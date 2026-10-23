@@ -2629,6 +2629,10 @@ __launch_bounds__(256) __global__ void SelectScoreWmmaKernel(
     const std::uint32_t* start_pos, std::uint32_t first_token,
     std::uint32_t ratio, std::uint32_t budget, std::uint32_t max_blocks,
     std::uint32_t steps) {
+  // The pairwise step and head sums below are unrolled per query slot;
+  // under fast-math a slot (the query's offset from the pass start) must
+  // not be able to change their association or contraction.
+#pragma clang fp reassociate(off) contract(off)
   constexpr std::uint32_t kGroup = 16 / kSelectHeads;  // queries per tile
   constexpr std::uint32_t kKSteps = kSelectDim / 16;
   constexpr std::uint32_t kQueries = kGroup * kSelectGroups;
