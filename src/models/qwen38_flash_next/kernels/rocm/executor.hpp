@@ -306,6 +306,11 @@ public:
   void SetBatchGraphs(bool enabled) const noexcept {
     batch_graphs_.enabled = enabled;
   }
+  /// Decode mixers run as one HcMixQ8Fused launch where it wins (see
+  /// FusedMixer). Disabling it keeps the separate kernels, the byte-identical
+  /// qualification reference; set it before a session's first pass, as
+  /// captured graphs keep the route they recorded.
+  void SetFusedMixers(bool enabled) const noexcept { fused_mixers_ = enabled; }
   /// Batched graph launches so far (ForwardBatch pieces, MTP bodies, heads).
   [[nodiscard]] std::uint64_t BatchGraphReplays() const noexcept {
     return batch_graphs_.replays;
@@ -526,6 +531,12 @@ private:
                   float* mixed, float* inject, std::uint32_t rows,
                   std::string* error) const;
   void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
+  /// CombineBatch(res, gamma) then HcMixBatch(m, res, normed=true), as one
+  /// HcMixQ8Fused launch when FusedMixer takes the rows: every output the
+  /// two produce, byte for byte (the fused route also leaves Q8_1 rows).
+  bool CombineMixBatch(const DeviceMixer& m, float* res, const float* gamma,
+                       float* mixed, float* inject, std::uint32_t rows,
+                       std::string* error) const;
   /// Residual update by the block output plus the grouped norm for the next
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
   /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
@@ -537,6 +548,10 @@ private:
                const DeviceMixer* next = nullptr) const;
   /// Whether HcMix runs a decode batch of `m` as one HcMixQ8Fused launch.
   bool FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const;
+  struct PendingCombine;
+  /// The combine `p` and mixer `m` as that launch (HcMix and CombineMixBatch).
+  bool FusedHcMix(const DeviceMixer& m, const PendingCombine& p, float* mixed,
+                  float* inject, std::string* error_msg) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -881,6 +896,7 @@ private:
   };
   mutable PendingCombine pending_combine_;
   void* hc_fused_state_{nullptr};  ///< HcMixQ8Fused's counters (zeroed)
+  mutable bool fused_mixers_{true};
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

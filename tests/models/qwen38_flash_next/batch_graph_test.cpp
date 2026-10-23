@@ -1,8 +1,11 @@
-// Batched decode replayed from captured graphs must match eager execution
-// bit for bit. A small synthetic model keeps the production layer geometry
-// and weight formats (Q8_0 projections, Q4_K/Q5_1 experts, BF16 indexer,
-// F16 router, PLE and the Q8_0 MTP block) with four trunk layers and a
-// reduced vocabulary and expert count, so no model file is loaded.
+// Batched decode replayed from captured graphs, with the decode mixers fused
+// into one launch (HcMixQ8Fused), must match eager execution through the
+// separate mixer kernels bit for bit. A small synthetic model keeps the
+// production layer geometry and weight formats (Q8_0 projections, one layer
+// of the v3 recipe's Q6_K/Q5_1 mixers decoded from compact rows, Q4_K/Q5_1
+// experts, BF16 indexer, F16 router, PLE and the Q8_0 MTP block) with four
+// trunk layers and a reduced vocabulary and expert count, so no model file is
+// loaded.
 
 #include <hip/hip_runtime.h>
 #include <unistd.h>
@@ -155,11 +158,43 @@ struct DeviceModelTestAccess {
     return Make(GgmlType::kQ5_1, rows, cols, std::move(bytes), experts);
   }
 
-  DeviceMixer Mixer(const Config& c, bool inject, bool q8_inject) {
+  /// A decode projection as the loader leaves it: Q8_0 `data` for wide
+  /// batches plus compact rows in `decode` (independent random codes: only
+  /// the routes are compared).
+  void Decode(DeviceTensor& t, GgmlType type) {
+    const bool q6 = type == GgmlType::kQ6_K;
+    const std::size_t block = q6 ? 256 : 32;
+    const std::size_t block_bytes = q6 ? 210 : 24;
+    const float spread = 1.0F / std::sqrt(static_cast<float>(t.cols));
+    std::vector<std::uint8_t> bytes(std::size_t{t.rows} * t.cols / block *
+                                    block_bytes);
+    for (std::size_t b = 0; b < bytes.size() / block_bytes; ++b) {
+      auto* blk = bytes.data() + b * block_bytes;
+      for (std::size_t j = 0; j < block_bytes; j += 8) {
+        auto bits = Next();
+        for (std::size_t k = 0; k < 8 && j + k < block_bytes; ++k, bits >>= 8)
+          blk[j + k] = static_cast<std::uint8_t>(bits);
+      }
+      if (q6) {
+        PutHalf(blk + 208, spread / 1200.0F);  // |scale x code| ~ 1200
+      } else {
+        PutHalf(blk, spread / 9.2F);
+        PutHalf(blk + 2, -15.5F * spread / 9.2F);
+      }
+    }
+    t.decode = Upload(bytes);
+    t.decode_type = type;
+  }
+  DeviceMixer Mixer(const Config& c, bool inject, bool q8_inject,
+                    bool v3 = false) {
     DeviceMixer m;
     m.norm = F32(1, c.HcDim(), 1.0F, 0.1F);
     m.down = Q8(c.hc_low_rank, c.HcDim());
     m.up = Q8(c.HcDim(), c.hc_low_rank);
+    if (v3) {
+      Decode(m.down, GgmlType::kQ6_K);
+      Decode(m.up, GgmlType::kQ5_1);
+    }
     if (inject)
       m.inject = q8_inject ? Q8(c.hc_count, c.HcDim())
                            : F32(c.hc_count, c.HcDim(), 0.0F, 0.01F);
@@ -206,8 +241,10 @@ struct DeviceModelTestAccess {
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {
       DeviceLayer l;
       l.linear = c.IsLinearLayer(il);
-      l.hc_attn = b.Mixer(c, true, false);
-      l.hc_ffn = b.Mixer(c, true, false);
+      // Layer 2's mixers are the v3 recipe's (its attention mixer takes the
+      // previous layer's combine).
+      l.hc_attn = b.Mixer(c, true, false, il == 2);
+      l.hc_ffn = b.Mixer(c, true, false, il == 2);
       if (l.linear) {
         l.ssm_in = b.Q8(c.SsmConvChannels() + c.SsmValueDim(), c.hidden_size);
         l.ssm_alpha_beta =
@@ -466,9 +503,11 @@ bool Same(const char* what, const Record& eager, const Record& graph,
 int Run(const Executor& exec, const Plan& plan) {
   constexpr std::array<std::uint32_t, 6> kPrompts{5, 300, 2041, 2100, 64, 999};
   std::string error;
-  // Two identical cohorts: one eager reference, one replaying graphs.
+  // Two identical cohorts: an eager reference through the separate mixer
+  // kernels, and one replaying graphs with fused mixers.
   std::array<std::vector<Lane>, 2> cohorts;
   for (auto& cohort : cohorts) {
+    exec.SetFusedMixers(&cohort == &cohorts[1]);
     for (std::uint32_t i = 0; i < plan.lanes; ++i) {
       Lane lane;
       lane.session = exec.CreateSession(gufo::core::SessionMode::kSpeculative,
@@ -509,6 +548,7 @@ int Run(const Executor& exec, const Plan& plan) {
     std::array<Record, 2> records;
     for (std::size_t k = 0; k < 2; ++k) {
       exec.SetBatchGraphs(k == 1);
+      exec.SetFusedMixers(k == 1);
       Cycle(exec, cohorts[k], plan, cycle, records[k]);
     }
     if (!Same("batched outputs", records[0], records[1], cycle))
@@ -521,6 +561,7 @@ int Run(const Executor& exec, const Plan& plan) {
     }
   }
   exec.SetBatchGraphs(true);
+  exec.SetFusedMixers(true);
   for (std::uint32_t i = 0; i < plan.lanes; ++i) {
     if (cohorts[0][i].history != cohorts[1][i].history ||
         Snapshot(exec, *cohorts[0][i].session) !=
@@ -588,7 +629,8 @@ int main() {
       if (Run(*exec, plan) != 0)
         return 1;
     }
-    std::cout << "batched graph replay matches eager execution\n";
+    std::cout << "batched graph replay with fused mixers matches eager "
+                 "execution\n";
     return 0;
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

@@ -1,9 +1,10 @@
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstring>
-#include <array>
 #include <stdexcept>
 #include <tuple>
+#include <utility>
 
 #include "qfn_mmq.h"
 #include "src/core/hip/managed_alloc.hpp"
@@ -304,6 +305,25 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
   return true;
 }
 
+bool Executor::CombineMixBatch(const DeviceMixer& m, float* res,
+                               const float* gamma, float* mixed, float* inject,
+                               std::uint32_t rows, std::string* error) const {
+  if (gamma == nullptr || !FusedMixer(m, rows)) {
+    CombineBatch(res, gamma, rows);
+    return HcMixBatch(m, res, true, mixed, inject, rows, error);
+  }
+  // The batched route's kernels at these widths are the decode kernels on
+  // freshly quantized rows (Dense), which the fused launch reproduces.
+  xn_half_ = false;
+  DropReadyQ8();
+  const auto& c = config();
+  xn_q8_ready_ = {s_.xn, s_.xn_q8_1, rows, c.HcDim()};
+  return FusedHcMix(m,
+                    {&m, res, gamma, s_.block_out, s_.inject, inject_parts_,
+                     s_.xn, s_.xn_q8_1, rows},
+                    mixed, inject, error);
+}
+
 void Executor::CombineBatch(float* res, const float* gamma,
                             std::uint32_t rows) const {
   const auto& c = config();
@@ -517,9 +537,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     UseScratch(tail);
     if (!DenseBatch(l.attn_out, tail.ctx, tail.block_out, tail_rows, error))
       return false;
-    CombineBatch(tail.mtp_res, l.hc_ffn.norm.f32(), tail_rows);
-    if (!HcMixBatch(l.hc_ffn, tail.mtp_res, true, tail.mixed, tail.inject,
-                    tail_rows, error))
+    if (!CombineMixBatch(l.hc_ffn, tail.mtp_res, l.hc_ffn.norm.f32(),
+                         tail.mixed, tail.inject, tail_rows, error))
       return false;
     if (!AnyActive(items))
       return true;
@@ -1144,6 +1163,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     // Every piece starts at layer 0 or at the PLE layer, whose preceding
     // combine leaves no grouped norm.
     bool normed = false;
+    const float* pending_gamma = nullptr;  ///< a combine left to the mixer
     for (std::uint32_t il = first; il < end; ++il) {
       if (!AnyActive(items))
         return true;
@@ -1160,8 +1180,12 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         }
       }
       UseScratch(base);
-      if (!HcMixBatch(l.hc_attn, base.res, normed, base.mixed, base.inject,
-                      rows, error))
+      if (pending_gamma != nullptr
+              ? !CombineMixBatch(l.hc_attn, base.res,
+                                 std::exchange(pending_gamma, nullptr),
+                                 base.mixed, base.inject, rows, error)
+              : !HcMixBatch(l.hc_attn, base.res, normed, base.mixed,
+                            base.inject, rows, error))
         return false;
       if (l.linear) {
         if ((!l.ssm_in.empty()
@@ -1247,9 +1271,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                       error)) {
         return false;
       }
-      CombineBatch(base.res, l.hc_ffn.norm.f32(), rows);
-      if (!HcMixBatch(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
-                      error))
+      if (!CombineMixBatch(l.hc_ffn, base.res, l.hc_ffn.norm.f32(), base.mixed,
+                           base.inject, rows, error))
         return false;
       if (!MoeBatch(l, base.mixed, base.block_out, rows, error))
         return false;
@@ -1259,7 +1282,12 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                                       : layers[il + 1].hc_attn.norm.f32())
               : model_->hc_head().norm.f32();
       UseScratch(base);
-      CombineBatch(base.res, next_norm, rows);
+      // The next layer's attention mixer in this piece takes this combine
+      // (no PLE step between: next_norm is null before a PLE layer).
+      if (next_norm != nullptr && il + 1 < end)
+        pending_gamma = next_norm;
+      else
+        CombineBatch(base.res, next_norm, rows);
       normed = next_norm != nullptr;
     }
     if (end < c.num_layers)

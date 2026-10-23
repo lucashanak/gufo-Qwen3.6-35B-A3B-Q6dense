@@ -2005,7 +2005,7 @@ bool Executor::FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const {
   // Model geometry, and the formats and widths for which the fused kernel
   // wins; other mixers keep the separate kernels.
   const Config& c = config();
-  return hc_fused_state_ != nullptr && !MatrixRows(n_tokens) &&
+  return fused_mixers_ && hc_fused_state_ != nullptr && !MatrixRows(n_tokens) &&
          n_tokens <= kVecBatch && c.hc_count == 4 && c.hidden_size == 2560 &&
          c.hc_low_rank == 320 && m.down.rows == c.hc_low_rank &&
          m.down.cols == c.HcDim() && m.up.rows == c.HcDim() &&
@@ -2094,6 +2094,53 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
             c.hidden_size, c.hc_count, c.rms_eps, stream_);
 }
 
+bool Executor::FusedHcMix(const DeviceMixer& m, const PendingCombine& p,
+                          float* mixed, float* inject,
+                          std::string* error_msg) const {
+  // The combine, both projections, SiLU and the epilogue in one launch, with
+  // the outputs and producer-written Q8_1 rows of the separate kernels.
+  const Config& c = config();
+  const std::uint32_t n_tokens = p.n;
+  const bool fused_inject =
+      inject != nullptr && !m.inject.empty() && m.inject.type == GgmlType::kF32;
+  const HcFusedMix mix{
+      m.down.decode != nullptr ? m.down.decode : m.down.data,
+      m.up.decode != nullptr ? m.up.decode : m.up.data,
+      p.res,
+      p.block_out,
+      p.inject,
+      p.inject_parts,
+      p.gamma,
+      p.xn,
+      p.xn_q8,
+      s_.lo,
+      s_.lo_q8_1,
+      static_cast<std::uint32_t>(
+          qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32),
+      fused_inject ? m.inject.f32() : nullptr,
+      mixed,
+      s_.mixed_q8_1,
+      fused_inject ? inject : nullptr,
+      c.hidden_size,
+      c.hc_count,
+      c.hc_low_rank,
+      c.rms_eps,
+      1.0F / static_cast<float>(c.hc_count),
+      MixerFormat(m.down),
+      MixerFormat(m.up)};
+  if (!HcMixQ8Fused(hc_fused_state_, mix, n_tokens, stream_)) {
+    AssignError(error_msg, "fused HC mixer failed");
+    return false;
+  }
+  inject_fused_ = nullptr;
+  q8t_src_ = nullptr;
+  half_src_ = nullptr;
+  mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
+  inject_parts_ = fused_inject ? HcInjectParts(c.hidden_size) : 1;
+  return inject == nullptr || m.inject.empty() || fused_inject ||
+         Dense(m.inject, s_.xn, inject, n_tokens, error_msg);
+}
+
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      float* mixed, float* inject, std::uint32_t n_tokens,
                      std::string* error_msg, bool half_only,
@@ -2103,48 +2150,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   if (pending_combine_.mixer != nullptr) {
     const PendingCombine p = pending_combine_;
     pending_combine_ = {};
-    const bool fused_inject = inject != nullptr && !m.inject.empty() &&
-                              m.inject.type == GgmlType::kF32;
     if (normed && p.mixer == &m && p.res == res && p.n == n_tokens &&
         !half_only && !no_f32) {
-      // The combine, both projections, SiLU and the epilogue in one launch,
-      // with the outputs and producer-written Q8_1 rows of the kernels below.
-      const HcFusedMix mix{
-          m.down.decode != nullptr ? m.down.decode : m.down.data,
-          m.up.decode != nullptr ? m.up.decode : m.up.data,
-          p.res,
-          p.block_out,
-          p.inject,
-          p.inject_parts,
-          p.gamma,
-          p.xn,
-          p.xn_q8,
-          s_.lo,
-          s_.lo_q8_1,
-          static_cast<std::uint32_t>(
-              qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32),
-          fused_inject ? m.inject.f32() : nullptr,
-          mixed,
-          s_.mixed_q8_1,
-          fused_inject ? inject : nullptr,
-          c.hidden_size,
-          c.hc_count,
-          c.hc_low_rank,
-          c.rms_eps,
-          1.0F / static_cast<float>(c.hc_count),
-          MixerFormat(m.down),
-          MixerFormat(m.up)};
-      if (!HcMixQ8Fused(hc_fused_state_, mix, n_tokens, stream_)) {
-        AssignError(error_msg, "fused HC mixer failed");
-        return false;
-      }
-      inject_fused_ = nullptr;
-      q8t_src_ = nullptr;
-      half_src_ = nullptr;
-      mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
-      inject_parts_ = fused_inject ? HcInjectParts(c.hidden_size) : 1;
-      return inject == nullptr || m.inject.empty() || fused_inject ||
-             Dense(m.inject, s_.xn, inject, n_tokens, error_msg);
+      return FusedHcMix(m, p, mixed, inject, error_msg);
     }
     // Another mixer follows after all: run the combine Combine left.
     HcCombineQ8_1(p.res, p.block_out, p.inject, p.inject_parts, p.gamma, p.xn,
