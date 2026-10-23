@@ -635,7 +635,7 @@ int RouteChecks(const Executor& exec) {
                            static_cast<std::int32_t>(
                                exec.MtpPosition(s) -
                                (first - std::min<std::uint32_t>(first, 8))),
-                           {}, &error))
+                           {.kv_only = true}, &error))
         Throw("route catch-up", error);
     }
     if (!exec.Forward(s, all.subspan(first), 1, logits->data(),
@@ -725,6 +725,109 @@ int RouteChecks(const Executor& exec) {
   return failures == 0 ? 0 : 1;
 }
 
+/// The draft block's prompt state must not depend on how the prompt splits
+/// into passes either: a pass's own rows (K/V-only, in-pass) and the single
+/// row each later pass consumes first take one route. Compares the draft
+/// K/V and indexer rows bit for bit, then the full-head candidates of the
+/// first decode catch-up, which reads them.
+int MtpSplitChecks(const Executor& exec) {
+  constexpr std::uint32_t kPrompt = 1619;
+  const std::vector<std::vector<std::uint32_t>> plans{
+      {1618, kPrompt},
+      {1612, kPrompt},
+      {1610, kPrompt},
+      {1524, kPrompt},
+      {1523, kPrompt},
+      {1, kPrompt},
+      {2, 3, 100, 1100, kPrompt},
+      {1023, 1024, 1121, kPrompt}};
+  const auto& c = exec.config();
+  std::string error;
+  std::vector<std::int32_t> prompt(kPrompt);
+  for (std::uint32_t t = 0; t < kPrompt; ++t)
+    prompt[t] =
+        static_cast<std::int32_t>((t * 2246822519U + 17U) % (c.vocab_size - 2));
+  const auto all = std::span<const std::int32_t>(prompt);
+  const std::int32_t next = 4093;
+  struct State {
+    std::vector<std::uint8_t> draft;  ///< snapshot bytes of the draft block
+    std::size_t bytes{0};
+    std::uint32_t position{0};
+    std::vector<float> candidates;
+    std::vector<std::int32_t> ids;
+  };
+  const auto run = [&](std::span<const std::uint32_t> ends) {
+    auto s =
+        exec.CreateSession(gufo::core::SessionMode::kSpeculative, 4096, &error);
+    if (!s)
+      Throw("draft split session", error);
+    std::vector<float> logits(c.vocab_size);
+    std::uint32_t begin = 0;
+    std::uint32_t base = 0;
+    for (const auto end : ends) {
+      if (begin != 0 && !exec.MtpForward(*s, all.subspan(begin).first(1),
+                                         static_cast<std::int32_t>(
+                                             exec.MtpPosition(*s) - base),
+                                         {.kv_only = true}, &error))
+        Throw("draft split catch-up", error);
+      if (!exec.Forward(*s, all.subspan(begin, end - begin), 1, logits.data(),
+                        Executor::ForwardMode::kPrefill, &error))
+        Throw("draft split prefill", error);
+      base = end - std::min<std::uint32_t>(end - begin, 8);
+      begin = end;
+    }
+    State state;
+    state.position = exec.MtpPosition(*s);
+    const auto snapshot = Snapshot(exec, *s);
+    state.bytes = snapshot.size();
+    // The draft block's sections close the payload: unpooled indexer keys,
+    // then K and V rows (no pooled blocks below the sparse budget, no
+    // carried residual after K/V-only catch-up, no kept trunk rows).
+    const std::size_t draft =
+        std::size_t{state.position} *
+        (c.indexer_head_dim * sizeof(float) + 2 * c.AttentionKvDim() * 2);
+    if (draft > snapshot.size())
+      Throw("draft split snapshot", "payload too short");
+    state.draft.assign(snapshot.end() - static_cast<std::ptrdiff_t>(draft),
+                       snapshot.end());
+    // The first decode step's catch-up reads every draft row.
+    std::vector<std::int32_t> replay(all.begin() + state.position + 1,
+                                     all.end());
+    replay.push_back(next);
+    qfn::MtpCandidateLogits candidates;
+    if (!exec.MtpForward(*s, replay,
+                         static_cast<std::int32_t>(state.position - base),
+                         {.candidates = &candidates}, &error))
+      Throw("draft split decode catch-up", error);
+    state.ids.assign(candidates.ids.begin(),
+                     candidates.ids.begin() + candidates.size);
+    state.candidates.assign(candidates.logits.begin(),
+                            candidates.logits.begin() + candidates.size);
+    return state;
+  };
+  const std::array<std::uint32_t, 1> whole{kPrompt};
+  const auto reference = run(whole);
+  if (reference.position != kPrompt - 1 || reference.ids.empty()) {
+    std::cerr << "draft split reference is incomplete\n";
+    return 1;
+  }
+  int failures = 0;
+  for (const auto& plan : plans) {
+    const auto state = run(plan);
+    const bool same =
+        state.position == reference.position &&
+        state.bytes == reference.bytes && state.draft == reference.draft &&
+        state.ids == reference.ids && state.candidates == reference.candidates;
+    std::cout << "draft prefill passes";
+    for (const auto end : plan)
+      std::cout << ' ' << end;
+    std::cout << ": draft K/V, indexer rows and candidates "
+              << (same ? "exact" : "DIFFER") << '\n';
+    failures += !same;
+  }
+  return failures == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main() {
@@ -779,7 +882,7 @@ int main() {
         {.max_batch = 2048, .max_logit_rows = 8, .max_speculative = 8}, &error);
     if (!wide)
       Throw("wide executor", error);
-    if (RouteChecks(*wide) != 0)
+    if (RouteChecks(*wide) != 0 || MtpSplitChecks(*wide) != 0)
       return 1;
     std::cout << "prefill splits and batched decode match\n";
     return 0;

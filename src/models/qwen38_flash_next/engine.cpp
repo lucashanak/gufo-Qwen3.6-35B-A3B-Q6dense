@@ -780,7 +780,8 @@ bool Session::DraftReplay(std::int32_t next_token,
 
 bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
                            std::string* error_msg,
-                           MtpCandidateLogits* candidates, bool draft_subset) {
+                           MtpCandidateLogits* candidates, bool draft_subset,
+                           bool kv_only) {
   std::vector<std::int32_t> replay;
   std::int32_t hidden_row = 0;
   if (!DraftReplay(next_token, &replay, &hidden_row, error_msg))
@@ -788,6 +789,9 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
   if (replay.empty())
     return true;
   auto& exec = *model_->executor_;
+  if (kv_only)
+    return exec.MtpForward(*session_, replay, hidden_row, {.kv_only = true},
+                           error_msg);
   if (!exec.MtpForward(
           *session_, replay, hidden_row,
           {.token = propose && candidates == nullptr ? &draft_token_ : nullptr,
@@ -835,8 +839,11 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                               : model_->PrefillCapacity();
     const std::size_t n = std::min<std::size_t>(capacity, remaining);
     const auto chunk = tokens.subspan(off, n);
+    // A prompt pass first gives the draft block the previous row, whose
+    // successor is this chunk's first token: K/V only, with the prefill
+    // arithmetic the pass applies to its own rows.
     if (MtpEnabled() && !tokens_.empty() &&
-        !DraftCatchUp(chunk[0], false, error_msg)) {
+        !DraftCatchUp(chunk[0], false, error_msg, nullptr, false, prefill)) {
       return false;
     }
     const auto mode = prefill ? rocm::Executor::ForwardMode::kPrefill

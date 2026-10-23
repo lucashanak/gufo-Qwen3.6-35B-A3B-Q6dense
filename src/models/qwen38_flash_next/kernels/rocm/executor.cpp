@@ -4411,8 +4411,10 @@ bool Executor::MtpForward(Session& session,
   const auto complete = (pos + n) / c.compress_ratio;
   const auto pool = sparse ? complete - session.mtp_.blocks : 0;
   const auto graph_pool = n / c.compress_ratio + 1;
+  // Prompt rows (K/V-only catch-up) take the prefill projections, whose
+  // input caches a replayed graph would leave stale; they run eagerly.
   const bool graph = output.trace == nullptr && hidden_source == nullptr &&
-                     n <= kVecBatch && pool <= graph_pool &&
+                     !output.kv_only && n <= kVecBatch && pool <= graph_pool &&
                      pos + 1 >= session.VisionLayout().PrefixLength();
   // Captured graphs bake in the head; key on the one this draft reads.
   const bool subset = UseDraftSubset(session, output.draft_subset) &&
@@ -4457,6 +4459,32 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
   const std::size_t final_row = static_cast<std::size_t>(n - 1) * hc_dim;
+  // Prompt rows need only persistent K/V and indexer keys. They take the
+  // trunk's prefill GEMMs for every row count, so a row's draft state does
+  // not depend on how the prompt splits into passes: the in-pass catch-up
+  // and the single row consumed at the start of the next pass compute it
+  // alike. Decode and verification rows keep the batched decode route.
+  const bool cache_only = kv_only && !l.attn_qkv.empty();
+  PrefillPhase rows_phase(cache_only || prefill_phase);
+  // The wide projections reuse staged inputs by address; the embedding and
+  // hidden rows below overwrite trunk scratch those caches may still name.
+  const auto drop_staged = [&] {
+    q8t_src_ = nullptr;
+    half_src_ = nullptr;
+    xn_half_ = false;
+  };
+  if (cache_only)
+    drop_staged();
+  const auto project = [&](const DeviceTensor& w, const float* x, float* out,
+                           std::uint32_t rows) {
+    if (cache_only && w.type == GgmlType::kQ8_0)
+      return Dense(w, x, out, rows, error_msg);
+    // The BF16 indexer projection keeps its row-independent decode kernel
+    // for every row count: the wide BF16 GEMM's K order follows a row's
+    // position in the launch.
+    PrefillPhase decode_rows(false);
+    return DenseBatch(w, x, out, rows, error_msg);
+  };
   const auto copy_trace = [&](const float* source,
                               std::span<float> destination) {
     return destination.empty() ||
@@ -4499,13 +4527,10 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
               stream_);
   if (trace && !copy_trace(s_.mtp_h + final_row, trace->normalized_hidden))
     return false;
-  // These projections determine persistent draft KV. Use the same row-wise
-  // activation quantization and reduction for prompt chunks and decode;
-  // changing between F16 GEMM and Q8 GEMV changes sampled replay after reuse.
-  if (!DenseBatch(l.nextn_fc_embedding, s_.mtp_embd, s_.mtp_eproj, n,
-                  error_msg) ||
-      !DenseBatch(l.nextn_fc_hidden, s_.mtp_h, s_.mtp_res, n * c.hc_count,
-                  error_msg)) {
+  // These projections determine persistent draft KV. A prompt row takes the
+  // same route whichever pass consumes it (see cache_only above).
+  if (!project(l.nextn_fc_embedding, s_.mtp_embd, s_.mtp_eproj, n) ||
+      !project(l.nextn_fc_hidden, s_.mtp_h, s_.mtp_res, n * c.hc_count)) {
     return false;
   }
   MtpAddEmbedding(s_.mtp_eproj, s_.mtp_res, n, c.hidden_size, c.hc_count,
@@ -4534,9 +4559,10 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       control_host_->hidden_row >= 0 && n > 2 && n <= kVecBatch
           ? n - 2
           : (last_only && n >= 224 ? (n - 96) / 128 * 128 : 0U);
-  const bool cache_only = kv_only && !l.attn_qkv.empty();
-  if (!HcMixBatch(l.hc_attn, s_.mtp_res, false, s_.mixed,
-                  cache_only ? nullptr : s_.inject, n, error_msg)) {
+  if (!(cache_only ? HcMix(l.hc_attn, s_.mtp_res, false, s_.mixed, nullptr, n,
+                           error_msg)
+                   : HcMixBatch(l.hc_attn, s_.mtp_res, false, s_.mixed,
+                                s_.inject, n, error_msg))) {
     return false;
   }
   if (cache_only) {
@@ -4548,7 +4574,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     kv.data = static_cast<std::uint8_t*>(kv.data) +
               std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
     kv.rows = 2 * c.AttentionKvDim();
-    if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
+    if (!project(kv, s_.mixed, s_.qg, n) ||
         !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,
                           nullptr, attn.k_cache, attn.v_cache, n, 0,
                           c.num_kv_heads, c.head_dim, c.rotary_dim,
@@ -4559,7 +4585,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     }
     const auto capacity =
         IndexerCapacity(c, options_.max_batch, session.max_context_);
-    if (!DenseBatch(l.indexer_k, s_.mixed, s_.ik, n, error_msg))
+    if (!project(l.indexer_k, s_.mixed, s_.ik, n))
       return false;
     StoreRows(s_.ik, attn.index_k, n, c.indexer_head_dim,
               &session.control_->mtp_position, capacity, stream_);
@@ -4570,6 +4596,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                         c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
                         c.rope_theta, c.rms_eps, capacity, stream_, attn.rope);
     }
+    drop_staged();  // the trunk's next pass must not reuse draft scratch
     return true;
   }
   if (!l.attn_qkv.empty()) {
