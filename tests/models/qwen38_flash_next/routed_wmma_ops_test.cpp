@@ -1064,6 +1064,7 @@ void CheckGatedDecodeShape() {
                     static_cast<void*>(single), static_cast<void*>(batch)})
       (void)hipFree(p);
   }
+}
 
 /// Routing over `experts` with host-built tile maps for one token range.
 struct Routing {
