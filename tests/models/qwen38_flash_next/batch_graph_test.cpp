@@ -838,7 +838,11 @@ int SparseSplitChecks(const Executor& exec) {
   const std::vector<std::vector<std::uint32_t>> plans{
       {1024, 2048, kPrompt},
       {2048, 2400, kPrompt},
-      {1000, 2048, 2596, kPrompt}};
+      {1000, 2048, 2596, kPrompt},
+      // One pass straddles the budget: its first rows are dense, the rest
+      // select blocks.
+      {1500, kPrompt},
+      {2000, kPrompt}};
   const auto& c = exec.config();
   std::string error;
   std::vector<std::int32_t> prompt(kPrompt);
