@@ -90,6 +90,11 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_routed_vec_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
+  add_executable(qwen38_flash_next_route_exact_bench EXCLUDE_FROM_ALL
+    route_exact_bench.cpp)
+  target_link_libraries(qwen38_flash_next_route_exact_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
     mtp_audit.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE

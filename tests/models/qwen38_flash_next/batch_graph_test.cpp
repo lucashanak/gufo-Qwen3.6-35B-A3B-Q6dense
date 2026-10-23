@@ -581,85 +581,146 @@ int Run(const Executor& exec, const Plan& plan) {
   return 0;
 }
 
+/// Rows [0, rows) of the latest Forward's feature taps.
+std::vector<float> Features(const Executor& exec, std::uint32_t rows) {
+  std::string error;
+  const std::size_t count = std::size_t{rows} * exec.FeatureWidth();
+  float* device = nullptr;
+  if (hipMalloc(&device, count * sizeof(float)) != hipSuccess)
+    throw std::runtime_error("feature buffer");
+  std::vector<float> host(count);
+  const bool ok = exec.CopyFeatures(0, rows, device, &error) &&
+                  exec.SyncStream(&error) &&
+                  hipMemcpy(host.data(), device, count * sizeof(float),
+                            hipMemcpyDeviceToHost) == hipSuccess;
+  (void)hipFree(device);
+  if (!ok)
+    Throw("features", error);
+  return host;
+}
+
 /// A prompt's logits must not depend on how its prefill splits into
 /// passes: a checkpoint restore finishes the prompt with a short pass, and a
 /// wide pass takes other kernels than one of 95 rows or fewer. Nor may a
 /// decode step's logits depend on whether it runs alone or batched with
-/// another request. Bit for bit, with and without the draft block.
+/// another request. Bit for bit; the inner layers' feature taps name the
+/// first layer whose residual differs.
 int RouteChecks(const Executor& exec) {
   constexpr std::uint32_t kPrompt = 1619;
-  constexpr std::array<std::uint32_t, 6> kSplits{0,    1618, 1612,
-                                                 1610, 1524, 1523};
-  const auto vocab = exec.config().vocab_size;
+  constexpr std::array<std::uint32_t, 5> kSplits{1618, 1612, 1610, 1524, 1523};
+  const auto& c = exec.config();
+  const auto vocab = c.vocab_size;
   std::string error;
+  const std::array<std::uint32_t, 3> taps{0, 1, 2};
+  if (!exec.ConfigureFeatureTaps(taps, &error))
+    Throw("feature taps", error);
   std::vector<std::int32_t> prompt(kPrompt);
   for (std::uint32_t t = 0; t < kPrompt; ++t)
     prompt[t] =
         static_cast<std::int32_t>((t * 2246822519U + 17U) % (vocab - 2));
-  const std::vector<std::int32_t> other{3, 1, 4, 1, 5};
+  const auto all = std::span<const std::int32_t>(prompt);
   int failures = 0;
+  // Prefill `first` tokens, then the rest; logits of the last row.
+  const auto prefill = [&](Session& s, std::uint32_t first,
+                           std::vector<float>* logits) {
+    exec.EnableFeatureTaps(true);
+    if (first != 0) {
+      if (!exec.Forward(s, all.first(first), 1, logits->data(),
+                        Executor::ForwardMode::kPrefill, &error))
+        Throw("route prefill", error);
+      // The draft block consumes the next chunk's first token over the
+      // kept trunk rows, as the engine feeds a chunked prompt.
+      if (s.mtp_enabled() &&
+          !exec.MtpForward(s, all.subspan(first).first(1),
+                           static_cast<std::int32_t>(
+                               exec.MtpPosition(s) -
+                               (first - std::min<std::uint32_t>(first, 8))),
+                           {}, &error))
+        Throw("route catch-up", error);
+    }
+    if (!exec.Forward(s, all.subspan(first), 1, logits->data(),
+                      Executor::ForwardMode::kPrefill, &error))
+      Throw("route prefill", error);
+    exec.EnableFeatureTaps(false);
+  };
   for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
                           gufo::core::SessionMode::kSpeculative}) {
     const char* mode_name = mode == gufo::core::SessionMode::kSpeculative
                                 ? "speculative"
                                 : "autoregressive";
-    std::vector<float> reference;
-    std::vector<float> reference_decode;
+    auto reference = exec.CreateSession(mode, 4096, &error);
+    if (!reference)
+      Throw("route session", error);
+    std::vector<float> reference_logits(vocab);
+    prefill(*reference, 0, &reference_logits);
+    const auto reference_features = Features(exec, kPrompt);
     for (const std::uint32_t split : kSplits) {
       auto session = exec.CreateSession(mode, 4096, &error);
-      auto peer = exec.CreateSession(mode, 4096, &error);
-      if (!session || !peer)
+      if (!session)
         Throw("route session", error);
       std::vector<float> logits(vocab);
-      const auto all = std::span<const std::int32_t>(prompt);
-      if ((split != 0 &&
-           !exec.Forward(*session, all.first(split), 1, logits.data(),
-                         Executor::ForwardMode::kPrefill, &error)) ||
-          !exec.Forward(*session, all.subspan(split), 1, logits.data(),
-                        Executor::ForwardMode::kPrefill, &error) ||
-          !exec.Forward(*peer, other, 1, nullptr,
-                        Executor::ForwardMode::kPrefill, &error))
-        Throw("route prefill", error);
-      // The greedy successor, decoded alone after the single pass and in a
-      // batch with the peer after a split one.
-      const std::int32_t next = Argmax(logits);
-      std::vector<float> decoded(vocab);
-      if (split == 0) {
-        if (!exec.Forward(*session, std::span<const std::int32_t>(&next, 1), 1,
-                          decoded.data(), Executor::ForwardMode::kDecode,
-                          &error))
-          Throw("route decode", error);
-        reference = logits;
-        reference_decode = decoded;
-        continue;
+      prefill(*session, split, &logits);
+      const std::uint32_t tail = kPrompt - split;
+      const auto features = Features(exec, tail);
+      const bool same = std::memcmp(logits.data(), reference_logits.data(),
+                                    std::size_t{vocab} * sizeof(float)) == 0;
+      std::cout << mode_name << " prefill " << split << " + " << tail
+                << " rows: logits " << (same ? "exact" : "DIFFER");
+      for (std::size_t tap = 0; tap < taps.size(); ++tap) {
+        std::uint32_t differ = 0;
+        for (std::uint32_t r = 0; r < tail; ++r) {
+          const std::size_t width = exec.FeatureWidth();
+          differ +=
+              std::memcmp(features.data() + r * width + tap * c.hidden_size,
+                          reference_features.data() + (split + r) * width +
+                              tap * c.hidden_size,
+                          c.hidden_size * sizeof(float)) != 0;
+        }
+        std::cout << ", layer " << taps[tap] << " rows differing " << differ;
       }
-      // The peer's chain makes the batch two rows, or nine: past the
-      // eight-row launches the batched projections split their rows.
-      const std::array<std::int32_t, 8> peer_chain{7,  9,  11, 13,
-                                                   15, 17, 19, 21};
-      const std::uint32_t peer_rows = split % 2 == 0 ? 1 : 8;
-      const std::array<Executor::BatchItem, 2> batch{
-          Executor::BatchItem{
-              peer.get(),
-              std::span<const std::int32_t>(peer_chain).first(peer_rows),
-              false},
-          Executor::BatchItem{session.get(),
-                              std::span<const std::int32_t>(&next, 1), false}};
-      if (!exec.ForwardBatch(batch, &error) ||
-          !exec.SelectBatchLogits(peer_rows, 1, decoded.data(), &error))
-        Throw("route batched decode", error);
-      const bool prefill_same =
-          std::memcmp(logits.data(), reference.data(),
-                      std::size_t{vocab} * sizeof(float)) == 0;
-      const bool decode_same =
-          std::memcmp(decoded.data(), reference_decode.data(),
-                      std::size_t{vocab} * sizeof(float)) == 0;
-      std::cout << mode_name << " prefill " << split << " + " << kPrompt - split
-                << " rows: logits " << (prefill_same ? "exact" : "DIFFER")
-                << ", batched decode " << (decode_same ? "exact" : "DIFFERS")
-                << '\n';
-      failures += !prefill_same + !decode_same;
+      std::cout << '\n';
+      failures += !same;
     }
+  }
+  // Decode after the same single-pass prefill: alone, then batched with a
+  // peer's one or eight rows (past eight rows the batched projections split
+  // their launches).
+  const std::vector<std::int32_t> other{3, 1, 4, 1, 5};
+  const std::array<std::int32_t, 8> peer_chain{7, 9, 11, 13, 15, 17, 19, 21};
+  std::vector<float> alone;
+  for (const std::uint32_t peer_rows : {0U, 1U, 8U}) {
+    auto session =
+        exec.CreateSession(gufo::core::SessionMode::kAutoregressive, 4096);
+    auto peer =
+        exec.CreateSession(gufo::core::SessionMode::kAutoregressive, 4096);
+    std::vector<float> logits(vocab);
+    prefill(*session, 0, &logits);
+    if (!exec.Forward(*peer, other, 1, nullptr, Executor::ForwardMode::kPrefill,
+                      &error))
+      Throw("route peer prefill", error);
+    const std::int32_t next = Argmax(logits);
+    std::vector<float> decoded(vocab);
+    if (peer_rows == 0) {
+      if (!exec.Forward(*session, std::span<const std::int32_t>(&next, 1), 1,
+                        decoded.data(), Executor::ForwardMode::kDecode, &error))
+        Throw("route decode", error);
+      alone = decoded;
+      continue;
+    }
+    const std::array<Executor::BatchItem, 2> batch{
+        Executor::BatchItem{
+            peer.get(),
+            std::span<const std::int32_t>(peer_chain).first(peer_rows), false},
+        Executor::BatchItem{session.get(),
+                            std::span<const std::int32_t>(&next, 1), false}};
+    if (!exec.ForwardBatch(batch, &error) ||
+        !exec.SelectBatchLogits(peer_rows, 1, decoded.data(), &error))
+      Throw("route batched decode", error);
+    const bool same = std::memcmp(decoded.data(), alone.data(),
+                                  std::size_t{vocab} * sizeof(float)) == 0;
+    std::cout << "decode batched with " << peer_rows
+              << " peer rows: " << (same ? "exact" : "DIFFERS") << '\n';
+    failures += !same;
   }
   return failures == 0 ? 0 : 1;
 }
