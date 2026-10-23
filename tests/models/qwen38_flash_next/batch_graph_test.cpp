@@ -828,6 +828,81 @@ int MtpSplitChecks(const Executor& exec) {
   return failures == 0 ? 0 : 1;
 }
 
+/// Past the 2048-token sparse budget the indexer projections and block
+/// scores decide which keys a query attends to. With passes ending on
+/// four-token boundaries (the sparse attention tiles group four queries from
+/// the pass start), the final logits and the draft block's candidates must
+/// not depend on the split.
+int SparseSplitChecks(const Executor& exec) {
+  constexpr std::uint32_t kPrompt = 2600;
+  const std::vector<std::vector<std::uint32_t>> plans{
+      {1024, 2048, kPrompt},
+      {2048, 2400, kPrompt},
+      {1000, 2048, 2596, kPrompt}};
+  const auto& c = exec.config();
+  std::string error;
+  std::vector<std::int32_t> prompt(kPrompt);
+  for (std::uint32_t t = 0; t < kPrompt; ++t)
+    prompt[t] =
+        static_cast<std::int32_t>((t * 2654435761U + 7U) % (c.vocab_size - 2));
+  const auto all = std::span<const std::int32_t>(prompt);
+  const auto run = [&](gufo::core::SessionMode mode,
+                       std::span<const std::uint32_t> ends) {
+    auto s = exec.CreateSession(mode, 4096, &error);
+    if (!s)
+      Throw("sparse split session", error);
+    std::vector<float> logits(c.vocab_size);
+    std::uint32_t begin = 0;
+    std::uint32_t base = 0;
+    for (const auto end : ends) {
+      if (begin != 0 && s->mtp_enabled() &&
+          !exec.MtpForward(
+              *s, all.subspan(begin).first(1),
+              static_cast<std::int32_t>(exec.MtpPosition(*s) - base),
+              {.kv_only = true}, &error))
+        Throw("sparse split catch-up", error);
+      if (!exec.Forward(*s, all.subspan(begin, end - begin), 1, logits.data(),
+                        Executor::ForwardMode::kPrefill, &error))
+        Throw("sparse split prefill", error);
+      base = end - std::min<std::uint32_t>(end - begin, 8);
+      begin = end;
+    }
+    if (s->mtp_enabled()) {
+      const std::int32_t next = 4093;
+      qfn::MtpCandidateLogits candidates;
+      if (!exec.MtpForward(*s, std::span<const std::int32_t>(&next, 1),
+                           static_cast<std::int32_t>(kPrompt - 1 - base),
+                           {.candidates = &candidates}, &error))
+        Throw("sparse split decode catch-up", error);
+      logits.insert(logits.end(), candidates.logits.begin(),
+                    candidates.logits.begin() + candidates.size);
+    }
+    return logits;
+  };
+  int failures = 0;
+  for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
+                          gufo::core::SessionMode::kSpeculative}) {
+    const std::array<std::uint32_t, 2> reference_plan{2048, kPrompt};
+    const auto reference = run(mode, reference_plan);
+    for (const auto& plan : plans) {
+      const bool same = run(mode, plan) == reference;
+      std::cout << (mode == gufo::core::SessionMode::kSpeculative
+                        ? "speculative"
+                        : "autoregressive")
+                << " sparse prefill passes";
+      for (const auto end : plan)
+        std::cout << ' ' << end;
+      std::cout << ": logits"
+                << (mode == gufo::core::SessionMode::kSpeculative
+                        ? " and draft candidates "
+                        : " ")
+                << (same ? "exact" : "DIFFER") << '\n';
+      failures += !same;
+    }
+  }
+  return failures == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main() {
@@ -882,7 +957,8 @@ int main() {
         {.max_batch = 2048, .max_logit_rows = 8, .max_speculative = 8}, &error);
     if (!wide)
       Throw("wide executor", error);
-    if (RouteChecks(*wide) != 0 || MtpSplitChecks(*wide) != 0)
+    if (RouteChecks(*wide) != 0 || MtpSplitChecks(*wide) != 0 ||
+        SparseSplitChecks(*wide) != 0)
       return 1;
     std::cout << "prefill splits and batched decode match\n";
     return 0;
