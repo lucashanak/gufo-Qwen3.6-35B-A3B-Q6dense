@@ -1032,12 +1032,20 @@ struct Session::PendingDecode {
   bool dflash_eligible{false};
 };
 
+// Experiment only (gate sweep): GUFO_FN_GATE / GUFO_FN_GATE_SAMPLED.
+static float SweepGate(const char* name, float fallback) {
+  const char* v = std::getenv(name);
+  return v != nullptr ? std::strtof(v, nullptr) : fallback;
+}
+
 bool Session::GateStops(const PendingDecode& pending) {
+  static const float greedy = SweepGate("GUFO_FN_GATE", kMtpGateProbability);
+  static const float sampled =
+      SweepGate("GUFO_FN_GATE_SAMPLED", kMtpSampledGateProbability);
   if (!pending.gated)
     return false;
-  return pending.sampled
-             ? pending.proposals.back().probability < kMtpSampledGateProbability
-             : pending.draft_confidence < kMtpGateProbability;
+  return pending.sampled ? pending.proposals.back().probability < sampled
+                         : pending.draft_confidence < greedy;
 }
 
 void Session::AppendDraft(PendingDecode& pending) {
