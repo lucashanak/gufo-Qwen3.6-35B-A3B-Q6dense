@@ -32,6 +32,9 @@ public:
   [[nodiscard]] bool Gemm(const void* weights, const void* input, float* out,
                           hipDataType type, int m, int n, int k,
                           std::string* error_msg);
+  /// Whether Gemm runs its own kernel, whose rows do not depend on the
+  /// launch width; library plans are chosen per token count.
+  [[nodiscard]] static bool RowIndependent(hipDataType type, int k);
   /// Gemm through the library kernel even where Gemm runs its own (tests
   /// and benchmarks compare the two).
   [[nodiscard]] bool LibraryGemm(const void* weights, const void* input,

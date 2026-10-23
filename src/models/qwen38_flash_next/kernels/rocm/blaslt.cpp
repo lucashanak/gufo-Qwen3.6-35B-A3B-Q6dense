@@ -150,6 +150,10 @@ bool BlasLt::Gemm(const void* weights, const void* input, float* out,
   return p != nullptr && Run(*p, weights, input, out, error);
 }
 
+bool BlasLt::RowIndependent(hipDataType type, int k) {
+  return OwnF16(type, k) || OwnBf16(type, k);
+}
+
 bool BlasLt::Prepare(hipDataType type, int m, int n, int k,
                      std::string* error) {
   if (m <= 0 || n <= 0 || k <= 0) {
