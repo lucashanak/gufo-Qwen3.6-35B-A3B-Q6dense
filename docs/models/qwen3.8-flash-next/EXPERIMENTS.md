@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next experiments
 
+## Prefill draft block and pass plan (October 23, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| Prompt rows of the MTP block on the trunk's prefill GEMMs | Component result; end-to-end qualification pending. K/V-only catch-up (every in-pass row and the one row each later pass consumes first) now takes the wide Q8_0 routes (F16 WMMA for the 2560 × 2560 projections and the mixer up projection, W8A8 for the mixer down and K/V slice) and the trunk's mixer, for every row count; the BF16 indexer key projection keeps its row-independent decode kernel because the wide BF16 GEMM's K order follows a row's launch position. The boundary row no longer runs attention, MoE or the carried residual it never needed. Synthetic production-geometry block, gpu-test build, 4,095 rows: 53.8 → 27.5 ms (13.1 → 6.7 µs/token) at d0 and d8K. Draft K/V, indexer rows and the first decode catch-up's candidates are byte-identical across eight pass plans (`batch_graph`); both mutations tried (old boundary route, boundary without prefill arithmetic) fail it. Remaining time: the four-stream hidden projection 10.5 ms, embedding add 1.9, BF16 indexer 2.1, norms 2.2, epilogue 1.5. Snapshot payload version 19. |
+| Grid checkpoints inside 4,096-row passes | Retained: a grid point inside a pass longer than 2,176 rows takes that pass's start (or end, next to the reused prefix) instead of splitting it. A 26,541-token cold prompt had planned 6,144 and 12,288 and ran 4096/2048/4096/2048/4096/4096/4096/1966; it now plans 4,096 and 12,288 and runs six 4,096-row passes and the tail. 2,048-row adapters are unchanged. |
+| Larger lone-prompt passes | Not changed: 8,320-row capacity measured +1.34 GiB executor scratch and +0.46 GiB lazy first-pass scratch on the synthetic model (4,224 rows: 1.56 + 0.25 GiB; about 330 KiB per row), doubles each session's indexer rings, and lengthens the wait of a request arriving during a lone prefill to one 8K pass. 16,512 rows abort in the quantized tier's scratch arena (nested growth); the October 12 8,192-row trial was within drift. |
+
 ## Output and draft heads (October 22, 2026)
 
 | Experiment | Outcome |
