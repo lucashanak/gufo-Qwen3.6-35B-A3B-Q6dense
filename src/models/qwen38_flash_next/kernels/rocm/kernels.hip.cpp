@@ -2616,9 +2616,10 @@ __device__ __forceinline__ v16h LoadFrag(const __half* p) {
 /// four heads; each F32 query element is split into an F16 head and the F16
 /// rounding of its remainder, so the products keep about 22 significant bits
 /// against the stored F16 keys. Every (query, block) score is accumulated in
-/// one fixed order (per 16-dim step: head part, then remainder; steps in
-/// dimension order; heads summed 0..3 after ReLU), independent of the query's
-/// place in the launch, the launch width and the block's tile. A block
+/// one fixed order (per 16-dim step: remainder, then head part; the eight
+/// step partials summed pairwise; heads summed 0..3 after ReLU), independent
+/// of the query's place in the launch, the launch width and the block's
+/// tile. A block
 /// scores kSelectGroups tiles of queries (staged in LDS) against each key
 /// tile it loads; each wave takes 16 blocks per step, `steps` steps.
 constexpr std::uint32_t kSelectGroups = 4;
@@ -2703,12 +2704,20 @@ __launch_bounds__(256) __global__ void SelectScoreWmmaKernel(
       }
     }
     for (std::uint32_t g = 0; g < live_groups; ++g) {
-      v8f acc = {};
+      // One partial per 16-dim step (remainder, then head part), summed
+      // pairwise: a single chain through eight steps loses about 2 bits.
+      v8f part[kKSteps];
 #pragma unroll
       for (std::uint32_t ks = 0; ks < kKSteps; ++ks) {
-        acc = Wmma(q_lds[g][ks][0][sub], k[ks], acc);
-        acc = Wmma(q_lds[g][ks][1][sub], k[ks], acc);
+        part[ks] = Wmma(q_lds[g][ks][1][sub], k[ks], v8f{});
+        part[ks] = Wmma(q_lds[g][ks][0][sub], k[ks], part[ks]);
       }
+#pragma unroll
+      for (std::uint32_t d = kKSteps / 2; d; d /= 2)
+#pragma unroll
+        for (std::uint32_t ks = 0; ks < d; ++ks)
+          part[ks] += part[ks + d];
+      const v8f acc = part[0];
       // acc[i] is row 2i + half: query i / 2, head 2 * (i % 2) + half.
       float head[kGroup][kSelectHeads];
 #pragma unroll

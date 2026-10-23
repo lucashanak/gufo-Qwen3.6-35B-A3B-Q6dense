@@ -226,7 +226,9 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
   (void)hipFree(d_mask);
   (void)hipFree(d_scores);
   // F32 queries against the stored F16 keys, independently scored in F64.
-  return worst_score < 1e-5 && mismatches == 0;
+  // The bound matches the former per-lane F32 FMA scorer (1.2e-6 worst);
+  // one WMMA chain over all eight steps measured 1e-5.
+  return worst_score < 3e-6 && mismatches == 0;
 }
 
 void CheckQueryPrecisionBoundary() {
