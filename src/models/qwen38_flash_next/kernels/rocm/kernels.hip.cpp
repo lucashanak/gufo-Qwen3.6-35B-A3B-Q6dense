@@ -2596,6 +2596,425 @@ __device__ __forceinline__ v8f WmmaBf16(v16h a, v16h b, v8f c) {
       __builtin_bit_cast(v16bf, a), __builtin_bit_cast(v16bf, b), c);
 }
 
+/// x ~= hi + lo * 2^-11 in F16 parts: the residual is scaled into the
+/// normal range, since F16 subnormals are flushed. Three WMMAs of the parts
+/// give c + a * b to about 2^-22 relative.
+constexpr float kGdnLoScale = 2048.0F;
+__device__ __forceinline__ void GdnSplit(float x, _Float16& hi, _Float16& lo) {
+  hi = static_cast<_Float16>(x);
+  lo = static_cast<_Float16>((x - static_cast<float>(hi)) * kGdnLoScale);
+}
+__device__ __forceinline__ v8f GdnWmma3(v16h ah, v16h al, v16h bh, v16h bl,
+                                        v8f c) {
+  v8f lo = Wmma(al, bh, v8f{});
+  lo = Wmma(ah, bl, lo);
+  c = Wmma(ah, bh, c);
+#pragma unroll
+  for (int m = 0; m < 8; ++m)
+    c[m] = __builtin_fmaf(lo[m], 1.0F / kGdnLoScale, c[m]);
+  return c;
+}
+/// B fragment (column L % 16, k = 0..15) of the 16 x 16 tile a C fragment
+/// holds (element m: row 2m + L / 16), split into F16 parts.
+__device__ __forceinline__ void GdnCToB(v8f c, v16h& hi, v16h& lo) {
+  const bool upper = (threadIdx.x & 16) != 0;
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    const float other = XorLane(c[m], 16);
+    const float even = upper ? other : c[m];
+    const float odd = upper ? c[m] : other;
+    _Float16 h;
+    _Float16 l;
+    GdnSplit(even, h, l);
+    hi[2 * m] = h;
+    lo[2 * m] = l;
+    GdnSplit(odd, h, l);
+    hi[2 * m + 1] = h;
+    lo[2 * m + 1] = l;
+  }
+}
+
+/// Chunked prefill Gated DeltaNet: blocks of kGdnChunk tokens aligned to
+/// sequence position 0 (`start_pos` is the pass's first position), one value
+/// head per block of eight waves. Within a block the delta rule is solved in
+/// WY form: with cumulative log decays l, A_ij = b_i e^(l_i - l_j) k_i.k_j
+/// (j < i), (I + A) W = diag(b e^l) K and (I + A) U = diag(b) V by forward
+/// substitution in F32, D = U - W S0^T, O = diag(e^l) Q S0^T + (M o Q K^T) D
+/// and S^T = e^(l_C) S0^T + K'^T D with K'_j = e^(l_C - l_j) k_j. Matrix
+/// products run on F16 WMMA with both operands split into F16 parts, scaled
+/// by powers of two into the F16 normal range. Rows outside the pass are
+/// masked (zero k, q, v and beta, unit decay), so a block's arithmetic depends
+/// only on its aligned start, its rows and the state before it: passes split
+/// at multiples of kGdnChunk give the same bytes as one pass. Wave w owns the
+/// state's value columns 16w..16w+15 as eight F32 C fragments of 16 S^T.
+constexpr int kGdnChunk = 16;
+
+template<GdnOutput kOutput>
+__launch_bounds__(256) __global__
+    void GdnChunkKernel(const float* conv_out, const float* alpha_beta,
+                        const float* a, const float* dt, const float* z,
+                        std::uint32_t z_stride, const float* norm_w,
+                        float* state, float* out, void* out_q8,
+                        __half* out_half, void* out_q8_1,
+                        std::uint32_t out_half_stride, std::uint32_t n_tokens,
+                        std::uint32_t start_pos, std::uint32_t k_heads,
+                        std::uint32_t v_heads, float eps,
+                        GdnCheckpoint checkpoint) {
+  constexpr int d = kGdnDim;
+  constexpr int kC = kGdnChunk;
+  constexpr int kPerLane = d / 32;
+  // Power-of-two scales of the F16 operands: q, k (also K', W, M o QK) and
+  // the state, which the registers hold scaled.
+  constexpr float kQs = 128.0F;
+  constexpr float kKs = 16.0F;
+  constexpr float kSs = 16.0F;
+  static_assert(kKs == kSs, "the K'^T D product lands in the state's scale");
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wave = tid >> 5;
+  const int col = lane & 15;
+  const int upper = lane >> 4;
+  const int kh = h % k_heads;
+  const int channels = 2 * k_heads * d + v_heads * d;
+  const int n = static_cast<int>(n_tokens);
+  const int offset0 = static_cast<int>(start_pos % kC);
+  const int n_blocks = (offset0 + n + kC - 1) / kC;
+  const int vcol = wave * 16 + col;  // this lane's value / key column
+
+  // k rows (then the block's output rows), q rows, K'^T and -W rows (first
+  // the K K^T and Q K^T partial products).
+  __shared__ float4 s_k_out[512];
+  __shared__ _Float16 s_q[2][kC][d];
+  __shared__ _Float16 s_kt[2][d][kC];
+  __shared__ float4 s_w_part[512];
+  __shared__ float4 s_a[kC][kC / 4];
+  __shared__ _Float16 s_mqk[2][kC][kC];
+  __shared__ float s_lg[kC];
+  __shared__ float s_b[kC];
+  auto* s_k = reinterpret_cast<_Float16 (*)[kC][d]>(s_k_out);
+  auto* s_o = reinterpret_cast<float (*)[d]>(s_k_out);
+  auto* s_w = reinterpret_cast<_Float16 (*)[kC][d]>(s_w_part);
+  auto* s_part = reinterpret_cast<float (*)[kC * kC]>(s_w_part);
+  const auto* s_a_row = reinterpret_cast<const float (*)[kC]>(s_a);
+
+  const auto state_index = [&](int t, int m) {
+    return (static_cast<std::size_t>(h) * d + vcol) * d + 16 * t + 2 * m +
+           upper;
+  };
+  v8f st[8];
+#pragma unroll
+  for (int t = 0; t < 8; ++t)
+#pragma unroll
+    for (int m = 0; m < 8; ++m)
+      st[t][m] = state[state_index(t, m)] * kSs;
+
+  __shared__ float s_nw[d];
+  if (tid < d)
+    s_nw[tid] = norm_w[tid];
+  const float a_h = a[h];
+  const float dt_h = dt[h];
+
+  const auto row_token = [&](int block, int r) {
+    return block * kC + r - offset0;
+  };
+  const auto valid = [&](int block, int r) {
+    const int t = row_token(block, r);
+    return t >= 0 && t < n;
+  };
+  const auto clamp = [&](int t) {
+    return static_cast<std::size_t>(min(max(t, 0), n - 1));
+  };
+  // One register set per input, loaded after the state update: z of the
+  // current block, q/k and v of the next. Rows outside the pass are clamped
+  // and masked at use.
+  float4 qk[4];           // q and k of row 2 * wave + upper, keys 8col..8col+7
+  float gate;             // alpha (lanes 0-15) or beta of row col
+  float v[kC / 2];        // v of column vcol, rows 2m + upper
+  float zv[2][kPerLane];  // z of rows 2 * wave + e
+  const auto load_qk = [&](int block) {
+    const std::size_t t = clamp(row_token(block, 2 * wave + upper));
+    const float* row = conv_out + t * channels;
+    const auto* q4 = reinterpret_cast<const float4*>(row + kh * d + col * 8);
+    const auto* k4 =
+        reinterpret_cast<const float4*>(row + (k_heads + kh) * d + col * 8);
+    qk[0] = q4[0];
+    qk[1] = q4[1];
+    qk[2] = k4[0];
+    qk[3] = k4[1];
+    gate = alpha_beta[clamp(row_token(block, col)) * 2 * v_heads + h +
+                      (upper ? v_heads : 0)];
+  };
+  const auto load_v = [&](int block) {
+#pragma unroll
+    for (int m = 0; m < kC / 2; ++m)
+      v[m] = conv_out[clamp(row_token(block, 2 * m + upper)) * channels +
+                      (2 * k_heads + h) * d + vcol];
+  };
+  const auto load_z = [&](int block) {
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      const float* zrow =
+          z + clamp(row_token(block, 2 * wave + e)) * z_stride + h * d;
+#pragma unroll
+      for (int r = 0; r < kPerLane; ++r)
+        zv[e][r] = zrow[r * 32 + lane];
+    }
+  };
+  load_qk(0);
+  load_v(0);
+  for (int block = 0; block < n_blocks; ++block) {
+    const int next = min(block + 1, n_blocks - 1);
+    __syncthreads();  // the previous block's epilogue read s_o
+
+    // Gates: inclusive prefix sum of the log decays over rows (lanes 0-15),
+    // beta in lanes 16-31; identical in every wave.
+    const bool gate_valid = valid(block, col);
+    float lg = 0.0F;
+    float beta = 0.0F;
+    if (!upper)
+      lg = gate_valid ? a_h * SoftplusF(gate + dt_h) : 0.0F;
+    else
+      beta = gate_valid ? SigmoidF(gate) : 0.0F;
+    const auto shift_add = [&](auto shift) {
+      const int y = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, lg),
+                                                0x110 | decltype(shift)::value,
+                                                0xF, 0xF, false);
+      lg += __builtin_bit_cast(float, y);
+    };
+    shift_add(std::integral_constant<int, 1>{});
+    shift_add(std::integral_constant<int, 2>{});
+    shift_add(std::integral_constant<int, 4>{});
+    shift_add(std::integral_constant<int, 8>{});
+    const float lg_end = __shfl(lg, kC - 1, 32);
+    if (wave == 0) {
+      if (!upper)
+        s_lg[col] = lg;
+      else
+        s_b[col] = beta;
+    }
+
+    // q and k rows: norms over sixteen lanes, normalized parts to LDS.
+    {
+      const int r = 2 * wave + upper;
+      const bool ok = valid(block, r);
+      const float qv[8] = {qk[0].x, qk[0].y, qk[0].z, qk[0].w,
+                           qk[1].x, qk[1].y, qk[1].z, qk[1].w};
+      const float kv[8] = {qk[2].x, qk[2].y, qk[2].z, qk[2].w,
+                           qk[3].x, qk[3].y, qk[3].z, qk[3].w};
+      float qs = 0.0F;
+      float ks = 0.0F;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        qs = __builtin_fmaf(qv[i], qv[i], qs);
+        ks = __builtin_fmaf(kv[i], kv[i], ks);
+      }
+#pragma unroll
+      for (int off = 1; off < 16; off <<= 1) {
+        qs += XorLane(qs, off);
+        ks += XorLane(ks, off);
+      }
+      const float q_scale =
+          ok ? rsqrtf(qs + eps) * rsqrtf(static_cast<float>(d)) * kQs : 0.0F;
+      const float inv_k = ok ? rsqrtf(ks + eps) * kKs : 0.0F;
+      const float tail = __expf(lg_end - __shfl(lg, r, 32));
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int c = col * 8 + i;
+        _Float16 hi;
+        _Float16 lo;
+        const float kn = kv[i] * inv_k;
+        GdnSplit(qv[i] * q_scale, hi, lo);
+        s_q[0][r][c] = hi;
+        s_q[1][r][c] = lo;
+        GdnSplit(kn, hi, lo);
+        s_k[0][r][c] = hi;
+        s_k[1][r][c] = lo;
+        GdnSplit(kn * tail, hi, lo);
+        s_kt[0][c][r] = hi;
+        s_kt[1][c][r] = lo;
+      }
+    }
+    __syncthreads();
+
+    // K K^T (waves 0-3) and Q K^T (waves 4-7), two key tiles per wave.
+    {
+      const int pair = wave & 3;
+      const auto* arow = wave < 4 ? s_k : s_q;
+      v8f acc = {};
+#pragma unroll
+      for (int s = 0; s < 2; ++s) {
+        const int k0 = (2 * pair + s) * 16;
+        acc = GdnWmma3(*reinterpret_cast<const v16h*>(&arow[0][col][k0]),
+                       *reinterpret_cast<const v16h*>(&arow[1][col][k0]),
+                       *reinterpret_cast<const v16h*>(&s_k[0][col][k0]),
+                       *reinterpret_cast<const v16h*>(&s_k[1][col][k0]), acc);
+      }
+#pragma unroll
+      for (int m = 0; m < 8; ++m)
+        s_part[wave][(2 * m + upper) * kC + col] = acc[m];
+    }
+    __syncthreads();
+
+    // A and the decayed causal Q K^T (scaled by kKs).
+    {
+      const int i = tid / kC;
+      const int j = tid % kC;
+      const float kk =
+          ((s_part[0][tid] + s_part[1][tid]) + s_part[2][tid]) + s_part[3][tid];
+      const float qk_ij =
+          ((s_part[4][tid] + s_part[5][tid]) + s_part[6][tid]) + s_part[7][tid];
+      const float decay = __expf(s_lg[i] - s_lg[j]);
+      reinterpret_cast<float*>(s_a)[tid] =
+          j < i ? s_b[i] * decay * (kk * (1.0F / (kKs * kKs))) : 0.0F;
+      _Float16 hi;
+      _Float16 lo;
+      GdnSplit(j <= i ? decay * (qk_ij * (1.0F / kQs)) : 0.0F, hi, lo);
+      s_mqk[0][i][j] = hi;
+      s_mqk[1][i][j] = lo;
+    }
+    __syncthreads();
+
+    // (I + A) W = diag(b e^l) K and (I + A) U = diag(b) V, column vcol, in
+    // one sweep so each A element is read once. W goes to LDS as -kKs W
+    // (s_part, which it aliases, was read before the last barrier), and D
+    // starts as kKs kSs U.
+    v8f delta;
+    {
+      float w[kC];
+      float u[kC];
+#pragma unroll
+      for (int i = 0; i < kC; ++i) {
+        const float kn = __builtin_fmaf(static_cast<float>(s_k[1][i][vcol]),
+                                        1.0F / kGdnLoScale,
+                                        static_cast<float>(s_k[0][i][vcol])) *
+                         (1.0F / kKs);
+        // Row i's v sits in this lane or the other half of the wave.
+        const float own = v[i / 2];
+        const float other = XorLane(own, 16);
+        const float vi = (i % 2 == upper) ? own : other;
+        const float bi = s_b[i];
+        float wi = bi * __expf(s_lg[i]) * kn;
+        float ui = bi * vi;
+#pragma unroll
+        for (int j = 0; j < i; ++j) {
+          const float aij = s_a_row[i][j];
+          wi = __builtin_fmaf(-aij, w[j], wi);
+          ui = __builtin_fmaf(-aij, u[j], ui);
+        }
+        w[i] = wi;
+        u[i] = ui;
+      }
+      if (!upper) {
+#pragma unroll
+        for (int i = 0; i < kC; ++i) {
+          _Float16 hi;
+          _Float16 lo;
+          GdnSplit(-w[i] * kKs, hi, lo);
+          s_w[0][i][vcol] = hi;
+          s_w[1][i][vcol] = lo;
+        }
+      }
+#pragma unroll
+      for (int m = 0; m < 8; ++m)
+        delta[m] = u[2 * m + upper] * (kKs * kSs);
+    }
+    __syncthreads();
+
+    // D = U - W S0^T and Q S0^T against the old state, in two sweeps
+    // (fewer live fragments than one).
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+      v16h bh;
+      v16h bl;
+      GdnCToB(st[t], bh, bl);
+      const int k0 = 16 * t;
+      delta = GdnWmma3(*reinterpret_cast<const v16h*>(&s_w[0][col][k0]),
+                       *reinterpret_cast<const v16h*>(&s_w[1][col][k0]), bh, bl,
+                       delta);
+      // One tile's fragments at a time: hoisting all eight spills.
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    v8f o = {};
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+      v16h bh;
+      v16h bl;
+      GdnCToB(st[t], bh, bl);
+      const int k0 = 16 * t;
+      o = GdnWmma3(*reinterpret_cast<const v16h*>(&s_q[0][col][k0]),
+                   *reinterpret_cast<const v16h*>(&s_q[1][col][k0]), bh, bl, o);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+      delta[m] *= 1.0F / (kKs * kSs);
+      o[m] *= __expf(__shfl(lg, 2 * m + upper, 32)) * (kKs / (kQs * kSs));
+    }
+    v16h dh;
+    v16h dl;
+    GdnCToB(delta, dh, dl);
+    o = GdnWmma3(*reinterpret_cast<const v16h*>(&s_mqk[0][col][0]),
+                 *reinterpret_cast<const v16h*>(&s_mqk[1][col][0]), dh, dl, o);
+#pragma unroll
+    for (int m = 0; m < 8; ++m)
+      s_o[2 * m + upper][vcol] = o[m] * (1.0F / kKs);
+
+    // kSs S^T = e^(l_C) kSs S0^T + (kKs K')^T D.
+    const float carry = __expf(lg_end);
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+#pragma unroll
+      for (int m = 0; m < 8; ++m)
+        st[t][m] *= carry;
+      st[t] =
+          GdnWmma3(*reinterpret_cast<const v16h*>(&s_kt[0][16 * t + col][0]),
+                   *reinterpret_cast<const v16h*>(&s_kt[1][16 * t + col][0]),
+                   dh, dl, st[t]);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    load_z(block);
+    load_qk(next);
+    load_v(next);
+    const int block_end = min(row_token(block, kC), n);
+    if (checkpoint.state != nullptr &&
+        block_end == static_cast<int>(checkpoint.tokens)) {
+#pragma unroll
+      for (int t = 0; t < 8; ++t)
+#pragma unroll
+        for (int m = 0; m < 8; ++m)
+          checkpoint.state[state_index(t, m)] = st[t][m] * (1.0F / kSs);
+    }
+    __syncthreads();
+
+    // Epilogue: wave e normalizes rows 2e and 2e + 1.
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      const int r = 2 * wave + e;
+      const int t = row_token(block, r);
+      if (t < 0 || t >= n)
+        continue;
+      float ov[kPerLane];
+      float nw[kPerLane];
+#pragma unroll
+      for (int rr = 0; rr < kPerLane; ++rr) {
+        ov[rr] = s_o[r][rr * 32 + lane];
+        nw[rr] = s_nw[rr * 32 + lane];
+      }
+      GdnEpilogueRow(
+          ov, zv[e], nw, (static_cast<std::size_t>(t) * v_heads) + h, lane,
+          v_heads, eps, out, kOutput == GdnOutput::kQ8 ? out_q8 : nullptr,
+          kOutput == GdnOutput::kHalf ? out_half : nullptr,
+          kOutput == GdnOutput::kF32Q8_1 ? out_q8_1 : nullptr, out_half_stride);
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < 8; ++t)
+#pragma unroll
+    for (int m = 0; m < 8; ++m)
+      state[state_index(t, m)] = st[t][m] * (1.0F / kSs);
+}
+
 // Keep indexer queries in F32: narrowing them before ranking can swap blocks
 // at the selection boundary. A thread scores one key, reusing it across all
 // four heads. Preserve the original wave32 F32 accumulation and reduction
