@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next experiments
 
+## Indexer and sparse attention at depth (October 23, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| BF16 indexer projections on our own WMMA kernel | Retained; numerics change past the 2,048-token budget (lead requalifies). On ROCm 7.2.4 hipBLASLt never returned the algorithm `DenseBf16Gemm` reproduced, so every prefill pass used a library plan chosen per token count (5 TFLOPS, and a row's keys depended on the pass width). Every BF16 k=2560 projection now runs one K16 chain in K order, independent of the row's place and the launch width (`blaslt_ops` now requires BF16 chunk boundaries to be exact; `dense_gemm_bench` checks widths 1..4096). 4,096 rows: 512 × 2560 1.91 → 0.44 ms, 128 × 2560 0.52 → 0.18 ms. The draft block's K/V-only indexer keys take the same kernel. exQ3K-dnIQ4, MTP, `gufo bench` two alternating runs: pp8192 1687 → 1707, pp32768 1639 → 1656 tok/s. |
+| Indexer block scores on the matrix cores | Retained; numerics change past the budget. Each F32 query element splits into an F16 head and its F16 remainder; four queries × four heads fill a 16-row tile, 16 queries per block share each key tile through LDS, and each 16-dim step keeps its own partial, summed pairwise (one chain over eight steps measured 1e-5 FP64 error, the per-lane F32 FMA scorer 1.2e-6, this one 1.7e-6). Scores are bit-identical across launch widths and positions (`select_ops`, 31-row chunks). The old scorer was at about 88% of single-issue VALU peak: hoisting key widening, eight queries per thread or opaque F32 keys for dual-issue FMAs all moved query loads to VMEM and were 2–3× slower. Per layer and 4,096-token pass: 4.42 → 3.36 ms at d28K, 9.13 → 6.64 ms at d61K. Together with the row above: pp8192 1687 → 1719, pp32768 1648 → 1675 tok/s; greedy `fnexact` outputs identical (prompts below the budget). |
+| Sparse attention query packing (1/2/3 queries per tile instead of 4) | Rejected on masks dumped from a real 32K prefill (layer 6, every pass): the union of four queries' selections grows from 980 to 1,106 blocks between d8K and d28K (two queries 708 → 736, eight 1,392 → 1,747), and sparse attention from 19.7 to 23.7 ms per layer and pass. Two queries per tile measured 21–23 ms at d12K–d28K against 21–24 ms for four, inside run-to-run spread; one and three were slower. Remaining depth cost is the union itself; the per-tile softmax/barrier sequence is the next candidate. |
+
 ## Prefill draft block and pass plan (October 23, 2026)
 
 | Experiment | Outcome |
