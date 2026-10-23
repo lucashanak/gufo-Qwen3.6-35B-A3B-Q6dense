@@ -1142,7 +1142,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
-  s.dense_ids = Alloc<std::int32_t>(a, kVecBatch, error_msg);
+  // Zero expert ids for the dense gated K-quant GEMV: an isolated decode's
+  // rows, or a whole batched decode step's (ForwardBatch, up to 64 rows).
+  s.dense_ids = Alloc<std::int32_t>(a, 64, error_msg);
   s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
   {
     const std::size_t compact = RoutedCompactRows(slots, c.num_experts);

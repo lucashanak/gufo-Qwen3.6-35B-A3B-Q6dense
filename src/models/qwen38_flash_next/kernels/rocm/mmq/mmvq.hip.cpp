@@ -523,6 +523,9 @@ struct KHeadInput {
   half2 ds[2];
   float d8[2];
   float sum[2];
+  // sum * d8 exactly: a code sum below 2^10 times an F16 scale fits the
+  // F32 significand, so m * t rounds as (sum * m) * d8 does.
+  float t[2];
 
   __device__ __forceinline__ void Load(const block_q8_1* y, int iqs) {
     const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
@@ -545,6 +548,7 @@ struct KHeadInput {
       asm("" : "+v"(d8[i]));
       sum[i] = ggml_hip_dp4a(0x01010101, u[2 * i + 1],
                              ggml_hip_dp4a(0x01010101, u[2 * i + 0], 0));
+      t[i] = __fmul_rn(sum[i], d8[i]);
     }
   }
 };
@@ -657,6 +661,30 @@ struct KHeadFragment {
     }
     return dm.x * sumf_d - dm.y * sumf_m;
   }
+
+  /// acc + Dot(x) as the single-token kernel compiles it, each step pinned:
+  /// sd = c1 d8_1 + c0 d8_0 (c = dot1 * sc, exact), the same for the
+  /// minimum terms (m * t, see KHeadInput::t), then acc + sd dm.x and
+  /// acc - sm dm.y as two FMAs. Explicit roundings instead of Dot's fences
+  /// leave the scheduler free to interleave independent rows and tokens.
+  __device__ __forceinline__ float DotAcc(const KHeadInput& x,
+                                          float acc) const {
+    float c[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int dot1 =
+          type == GGML_TYPE_Q4_K
+              ? ggml_hip_dp4a(v[2 * i + 1], x.u[2 * i + 1],
+                              ggml_hip_dp4a(v[2 * i], x.u[2 * i], 0))
+              : ggml_hip_dp4a(v[2 * i], x.u[2 * i],
+                              ggml_hip_dp4a(v[2 * i + 1], x.u[2 * i + 1], 0));
+      c[i] = __fmul_rn(float(dot1), sc[i]);
+    }
+    const float sd = __fmaf_rn(c[1], x.d8[1], __fmul_rn(c[0], x.d8[0]));
+    const float sm = __fmaf_rn(m[1], x.t[1], __fmul_rn(m[0], x.t[0]));
+    acc = __fmaf_rn(sd, dm.x, acc);
+    return __fmaf_rn(-sm, dm.y, acc);
+  }
 };
 
 /// warp_reduce_sum<32> over up to 32 sums at once (scatter_reduce_sum's
@@ -743,7 +771,7 @@ __launch_bounds__(32, 1) static __global__
       x[j].Finish();
 #pragma unroll
       for (int i = 0; i < c_rows; ++i)
-        tmp[j * c_rows + i] += w[i].Dot(x[j]);
+        tmp[j * c_rows + i] = w[i].DotAcc(x[j], tmp[j * c_rows + i]);
     }
   }
   constexpr int n = tokens * c_rows;
@@ -760,6 +788,200 @@ __launch_bounds__(32, 1) static __global__
   if ((lane & ((1 << shift) - 1)) == 0 && index < n &&
       uint32_t(row0 + i) < nrows_x)
     dst[j * stride_col_dst + row0 + i] = isfinite(value) ? value : 0.0f;
+}
+
+/// Dense K-quant rows for many tokens (a batched decode step's 9-64 rows):
+/// block b takes token pass b % passes of `waves` row groups, one per wave,
+/// so the waves of a block read the same activations (from the CU's cache
+/// after the first) and the passes over a row group run next to each other
+/// and share its compact rows through L2. A wave computes `c_rows` rows for
+/// the `tokens` tokens of its pass; tokens past `n_tokens` repeat the last
+/// one and are not stored. For every row and
+/// token the lane, block order, products and butterfly are
+/// mul_mat_vec_dense_kq's, so a row's result is the single-token launch's.
+///
+/// Q4_K/Q5_K decode each row's codes once per block quarter for all tokens
+/// of the pass (KHeadFragment) and finish each token's activations once for
+/// all rows (KHeadInput), `kGroup` tokens at a time.
+template<ggml_type type, int c_rows, int tokens, int waves>
+__launch_bounds__(32 * waves, 1) static __global__
+    void mul_mat_vec_dense_kq_many(const void* __restrict__ vx,
+                                   const void* __restrict__ vy,
+                                   float* __restrict__ dst,
+                                   const uint32_t ncols_x,
+                                   const uint32_t nrows_x,
+                                   const uint32_t stride_row_x,
+                                   const uint32_t stride_col_y,
+                                   const uint32_t stride_col_dst,
+                                   const uint32_t n_tokens) {
+  static_assert(type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K);
+  constexpr int n = tokens * c_rows;
+  static_assert(n % 32 == 0, "whole 32-sum butterflies");
+  constexpr int kGroup = 4;
+  static_assert(tokens % kGroup == 0);
+  constexpr int qk = QK_K;
+  constexpr int qi = QI4_K;
+  constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+  static_assert(qi == QI5_K && vdr == VDR_Q5_K_Q8_1_MMVQ);
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  const int lane = threadIdx.x & 31;
+  const uint32_t passes = (n_tokens + tokens - 1) / tokens;
+  const int t0 = tokens * int(blockIdx.x % passes);
+  const int row0 =
+      c_rows * (int(blockIdx.x / passes) * waves + int(threadIdx.x >> 5));
+  const int last = int(n_tokens) - 1;
+  const int blocks_per_row_x = ncols_x / qk;
+  const block_q8_1* y = (const block_q8_1*)vy;
+  uint32_t row_offsets[c_rows];
+#pragma unroll
+  for (int i = 0; i < c_rows; ++i)
+    row_offsets[i] = min(uint32_t(row0 + i), nrows_x - 1) * stride_row_x;
+  uint32_t token_offsets[tokens];
+#pragma unroll
+  for (int j = 0; j < tokens; ++j)
+    token_offsets[j] = uint32_t(min(t0 + j, last)) * stride_col_y;
+  const int kqs = vdr * (lane % (qi / vdr));
+  float tmp[n] = {};
+  for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    KHeadFragment<type> w[c_rows];
+#pragma unroll
+    for (int i = 0; i < c_rows; ++i)
+      w[i].Load(vx, row_offsets[i] + kbx, kqs);
+#pragma unroll
+    for (int i = 0; i < c_rows; ++i)
+      w[i].Decode(kqs);
+#pragma unroll
+    for (int g = 0; g < tokens; g += kGroup) {
+      KHeadInput x[kGroup];
+#pragma unroll
+      for (int j = 0; j < kGroup; ++j)
+        x[j].Load(y + token_offsets[g + j] + kby, kqs);
+#pragma unroll
+      for (int j = 0; j < kGroup; ++j) {
+        x[j].Finish();
+#pragma unroll
+        for (int i = 0; i < c_rows; ++i)
+          tmp[(g + j) * c_rows + i] =
+              w[i].DotAcc(x[j], tmp[(g + j) * c_rows + i]);
+      }
+    }
+  }
+#pragma unroll
+  for (int c = 0; c < n; c += 32) {
+    float part[32];
+#pragma unroll
+    for (int s = 0; s < 32; ++s)
+      part[s] = tmp[c + s];
+    const float value = scatter_reduce_sum32(part, lane);
+    // 32 sums: lane l finishes sum l.
+    const int j = (c + lane) / c_rows;
+    const int i = (c + lane) % c_rows;
+    if (t0 + j <= last && uint32_t(row0 + i) < nrows_x)
+      dst[(t0 + j) * stride_col_dst + row0 + i] =
+          isfinite(value) ? value : 0.0f;
+  }
+}
+
+/// mul_mat_vec_dense_kq over passes of `tokens` tokens, blocks ordered as
+/// mul_mat_vec_dense_kq_many's: the formats
+/// without a decoded fragment reread their codes from cache per token, as
+/// the single-token launch does.
+template<ggml_type type, int c_rows_per_block, int tokens, int waves>
+__launch_bounds__(32 * waves, 1) static __global__
+    void mul_mat_vec_dense_kq_pass(const void* __restrict__ vx,
+                                   const void* __restrict__ vy,
+                                   float* __restrict__ dst,
+                                   const uint32_t ncols_x,
+                                   const uint32_t nrows_x,
+                                   const uint32_t stride_row_x,
+                                   const uint32_t stride_col_y,
+                                   const uint32_t stride_col_dst,
+                                   const uint32_t n_tokens) {
+  constexpr int qk = ggml_hip_type_traits<type>::qk;
+  constexpr int qi = ggml_hip_type_traits<type>::qi;
+  constexpr int vdr = get_vdr_mmvq(type);
+  constexpr int warp_size = 32;
+  constexpr vec_dot_q_hip_t vec_dot_q_hip = get_vec_dot_q_hip(type);
+  const uint32_t passes = (n_tokens + tokens - 1) / tokens;
+  const int t0 = tokens * int(blockIdx.x % passes);
+  const int row0 = c_rows_per_block *
+                   (int(blockIdx.x / passes) * waves + int(threadIdx.x >> 5));
+  const int lane = threadIdx.x & 31;
+  const int last = int(n_tokens) - 1;
+  const int blocks_per_row_x = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * warp_size / qi;
+  const block_q8_1* y = (const block_q8_1*)vy;
+  uint32_t row_offsets[c_rows_per_block];
+#pragma unroll
+  for (int i = 0; i < c_rows_per_block; ++i)
+    row_offsets[i] = min(uint32_t(row0 + i), nrows_x - 1) * stride_row_x;
+  uint32_t token_offsets[tokens];
+#pragma unroll
+  for (int j = 0; j < tokens; ++j)
+    token_offsets[j] = uint32_t(min(t0 + j, last)) * stride_col_y;
+  float tmp[tokens][c_rows_per_block] = {};
+  for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    const int kqs = vdr * (lane % (qi / vdr));
+#pragma unroll
+    for (int j = 0; j < tokens; ++j) {
+#pragma unroll
+      for (int i = 0; i < c_rows_per_block; ++i) {
+        tmp[j][i] += vec_dot_q_hip(vx, &y[token_offsets[j] + kby],
+                                   row_offsets[i] + kbx, kqs);
+      }
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < tokens; ++j) {
+#pragma unroll
+    for (int i = 0; i < c_rows_per_block; ++i) {
+      const float value = warp_reduce_sum<warp_size>(tmp[j][i]);
+      if (lane == 0 && t0 + j <= last && uint32_t(row0 + i) < nrows_x)
+        dst[(t0 + j) * stride_col_dst + row0 + i] =
+            isfinite(value) ? value : 0.0f;
+    }
+  }
+}
+
+template<ggml_type type, int c_rows, int tokens, int waves, typename Kernel>
+static void launch_dense_kq_passes(Kernel kernel, const void* weights,
+                                   const block_q8_1* input, float* output,
+                                   int k, int rows, int n_tokens,
+                                   int input_stride, hipStream_t stream) {
+  const unsigned groups = (rows + c_rows * waves - 1) / (c_rows * waves);
+  const unsigned passes = (n_tokens + tokens - 1) / tokens;
+  kernel<<<dim3(passes * groups), dim3(32 * waves), 0, stream>>>(
+      weights, input, output, k, rows, k / ggml_blck_size(type), input_stride,
+      rows, n_tokens);
+}
+
+/// Tokens per pass of launch_dense_kq_many: the dispatch hands it whole
+/// passes and the remainder to the decode kernels, so no token is padded.
+constexpr int dense_kq_pass_tokens(ggml_type type) {
+  return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 16 : 8;
+}
+
+/// Whole passes of dense_kq_pass_tokens tokens. Q4_K/Q5_K: four rows per
+/// wave (route_exact_bench: other shapes of rows, tokens, token groups and
+/// waves were no faster).
+template<ggml_type type>
+static void launch_dense_kq_many(const void* weights, const block_q8_1* input,
+                                 float* output, int k, int rows, int n_tokens,
+                                 int input_stride, hipStream_t stream) {
+  constexpr int kWaves = 8;
+  constexpr int kTokens = dense_kq_pass_tokens(type);
+  if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)
+    launch_dense_kq_passes<type, 4, kTokens, kWaves>(
+        mul_mat_vec_dense_kq_many<type, 4, kTokens, kWaves>, weights, input,
+        output, k, rows, n_tokens, input_stride, stream);
+  else
+    launch_dense_kq_passes<type, 2, kTokens, kWaves>(
+        mul_mat_vec_dense_kq_pass<type, 2, kTokens, kWaves>, weights, input,
+        output, k, rows, n_tokens, input_stride, stream);
 }
 
 template<ggml_type type, int tokens = 1>
@@ -784,7 +1006,7 @@ static void launch_dense_kq(const void* weights, const block_q8_1* input,
         <<<dim3((rows + kRows - 1) / kRows), dim3(32), 0, stream>>>(
             weights, input, output, k, rows, k / ggml_blck_size(type),
             input_stride, rows);
-  } else if constexpr (tokens < MMVQ_DENSE_KQ_MAX_BATCH) {
+  } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
     launch_dense_kq<type, tokens + 1>(weights, input, output, k, rows,
                                       n_tokens, input_stride, stream);
   } else {
@@ -798,6 +1020,35 @@ void mul_mat_vec_dense_kq_dispatch(const void* weights, ggml_type type,
                                    int input_stride, hipStream_t stream) {
   GGML_ASSERT(tokens > 0 && tokens <= MMVQ_DENSE_KQ_MAX_BATCH &&
               k % ggml_blck_size(type) == 0 && rows > 0);
+  if (tokens > MMVQ_MAX_BATCH_SIZE) {
+    // Whole passes in one launch, then the remainder (and a batch narrower
+    // than one pass) in launches of at most eight tokens.
+    const int bulk = tokens / dense_kq_pass_tokens(type) *
+                     dense_kq_pass_tokens(type);
+    for (int r = bulk; r < tokens; r += MMVQ_MAX_BATCH_SIZE)
+      mul_mat_vec_dense_kq_dispatch(
+          weights, type, input + std::size_t(r) * input_stride,
+          output + std::size_t(r) * rows, k, rows,
+          std::min(MMVQ_MAX_BATCH_SIZE, tokens - r), input_stride, stream);
+    if (bulk == 0)
+      return;
+    switch (type) {
+#define QFN_DENSE_KQ_MANY(t)                                              \
+  case t:                                                                 \
+    launch_dense_kq_many<t>(weights, input, output, k, rows, bulk,        \
+                            input_stride, stream);                        \
+    return;
+      QFN_DENSE_KQ_MANY(GGML_TYPE_Q3_K)
+      QFN_DENSE_KQ_MANY(GGML_TYPE_Q4_K)
+      QFN_DENSE_KQ_MANY(GGML_TYPE_Q5_K)
+      QFN_DENSE_KQ_MANY(GGML_TYPE_Q6_K)
+      QFN_DENSE_KQ_MANY(GGML_TYPE_Q5_1)
+      QFN_DENSE_KQ_MANY(GGML_TYPE_IQ4_NL)
+#undef QFN_DENSE_KQ_MANY
+      default:
+        GGML_ABORT("unsupported dense vector weight format");
+    }
+  }
   switch (type) {
     case GGML_TYPE_Q3_K:
       launch_dense_kq<GGML_TYPE_Q3_K>(weights, input, output, k, rows, tokens,

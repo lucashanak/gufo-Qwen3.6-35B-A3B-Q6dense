@@ -986,12 +986,12 @@ void CheckDenseKQuant(GgmlType type, int rows, int cols, std::uint32_t seed) {
     CheckHip(hipFree(ptr), "K-quant test free");
 }
 
-// A batched decode step projects up to 16 rows of K-quant weights in one
+// A batched decode step projects up to 64 rows of K-quant weights in one
 // launch; each row must equal the same token projected alone, as an
 // isolated request's decode step projects it.
 void CheckDenseKQuantWidths(GgmlType type, int rows, int cols,
                             std::uint32_t seed) {
-  constexpr int kTokens = 16;
+  constexpr int kTokens = 64;
   struct Layout {
     std::size_t block, bytes, d_offset;
     bool min;  ///< a second F16 (dmin / m) follows d
@@ -1059,7 +1059,7 @@ void CheckDenseKQuantWidths(GgmlType type, int rows, int cols,
       throw std::runtime_error("K-quant GEMV rows depend on the width: " +
                                shape + " N=" + std::to_string(n));
   }
-  std::cout << "dense K-quant " << shape << " N=1..16: rows exact\n";
+  std::cout << "dense K-quant " << shape << " N=1..64: rows exact\n";
   for (void* ptr : {dw, static_cast<void*>(dx), static_cast<void*>(out)})
     CheckHip(hipFree(ptr), "K-quant width test free");
 }
@@ -1249,6 +1249,8 @@ int main() {
          {GgmlType::kQ3_K, GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K})
       CheckDenseKQuantWidths(type, 640, 2560, 0x16A640U);
     CheckDenseKQuantWidths(GgmlType::kQ4_K, 2560, 6144, 0x16A256U);
+    CheckDenseKQuantWidths(GgmlType::kQ4_K, 16384, 2560, 0x16A163U);
+    CheckDenseKQuantWidths(GgmlType::kQ6_K, 320, 10240, 0x16A610U);
     CheckDenseKQuantWidths(GgmlType::kQ5_1, 10240, 320, 0x16A320U);
     CheckDenseKQuantWidths(GgmlType::kIQ4_NL, 10240, 320, 0x16B320U);
     CheckW8A8Tail(320, 10240, 0x7A1320U);

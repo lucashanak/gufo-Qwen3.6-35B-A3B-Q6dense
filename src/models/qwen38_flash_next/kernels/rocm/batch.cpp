@@ -814,11 +814,9 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   if (w.decode != nullptr) {
     // A K-quant projection's isolated decode reads its compact rows; the
     // Q8_0 copy in w.data holds other weights (the prefill route's). Each
-    // row's sum does not depend on how many rows a launch covers. Narrow
-    // projections read their compact rows once per sixteen rows; from 8,192
-    // rows the products dominate and eight-row launches are as fast
-    // (route_exact_bench).
-    const std::uint32_t chunk = w.rows >= 8192 ? 8 : 16;
+    // row's sum does not depend on how many rows a launch covers, and one
+    // launch reads the compact rows for up to 64 rows.
+    constexpr std::uint32_t chunk = 64;
     for (std::uint32_t r = 0; r < rows; r += chunk) {
       if (qfn_mmq_dense_kq_vec(
               static_cast<int>(w.decode_type), w.decode,
@@ -879,6 +877,18 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
                   up.cols == gate.cols;
   if (q8 && !QuantizeBatch(x, rows, up.cols, error))
     return false;
+  if (up.decode != nullptr && gate.decode != nullptr &&
+      up.decode_type == gate.decode_type && up.rows == gate.rows &&
+      up.cols == gate.cols && rows <= 64) {
+    // GatedDense's decode GEMV over every row at once: each row's sum is
+    // the per-request launch's, and the compact rows are read once.
+    return qfn_mmq_moe_gated_vec(static_cast<int>(up.decode_type), gate.decode,
+                                 up.decode, x, s_.dense_ids, out,
+                                 static_cast<int>(up.rows),
+                                 static_cast<int>(up.cols),
+                                 static_cast<int>(rows), 1, 1, stream_) == 0 ||
+           Fail(error, "batched gated K-quant projection failed");
+  }
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
     const auto n = std::min(kDecodeRows, rows - r);
     if (q8) {
