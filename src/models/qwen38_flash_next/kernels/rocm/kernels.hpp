@@ -513,10 +513,12 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
 /// complete block below its own tail, keeps the `budget` highest, and
 /// writes a visibility bitmap (`mask_words` uint32 per query, bit b = block
 /// b visible). Every block is visible when the count fits the budget.
-/// Queries retain F32 precision; pooled cache keys are F16. Scores
-/// still accumulate in FP32. `scores` holds n_tokens * max_blocks floats.
-/// `live_blocks`, when nonzero, bounds the complete blocks of the last
-/// query (eager launches only: a captured graph must cover max_blocks).
+/// Queries retain F32 precision (an F16 head plus its F16 remainder on the
+/// matrix cores); pooled cache keys are F16. Scores accumulate in FP32 in
+/// one order per (query, block), whatever the launch width or position.
+/// `scores` holds n_tokens * max_blocks floats. `live_blocks`, when nonzero,
+/// bounds the complete blocks of the last query (eager launches only: a
+/// captured graph must cover max_blocks).
 void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                   float* scores, std::uint32_t n_tokens,
                   const std::uint32_t* start_pos, std::uint32_t first_token,

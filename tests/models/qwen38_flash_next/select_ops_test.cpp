@@ -124,6 +124,8 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
   }
   // Reusing bounded score scratch must retain absolute query positions and
   // causal masks, including a ragged chunk and a different padded stride.
+  // A 31-row chunk also moves every query within its four-query score tile:
+  // each score must keep its bits.
   constexpr std::uint32_t chunk = 31;
   const auto compact_stride = ((start_pos + n_tokens) / kRatio + 31) / 32 * 32;
   float* d_chunk_scores = nullptr;
@@ -137,6 +139,17 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
                     count, d_pos, first, kHeads, kDim, kRatio, kBudget,
                     mask_words, compact_stride, nullptr,
                     (start_pos + first + count) / kRatio);
+    const auto part =
+        Download(d_chunk_scores, std::size_t{count} * compact_stride);
+    for (std::uint32_t r = 0; r < count; ++r) {
+      const std::uint32_t complete = (start_pos + first + r + 1) / kRatio;
+      if (complete <= kBudget)
+        continue;
+      if (std::memcmp(part.data() + std::size_t{r} * compact_stride,
+                      scores.data() + std::size_t{first + r} * max_blocks,
+                      complete * sizeof(float)) != 0)
+        throw std::runtime_error("a score depends on its place in the launch");
+    }
   }
   if (Download(d_mask, mask.size()) != mask) {
     throw std::runtime_error("chunked selection changed the mask");
@@ -164,30 +177,18 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
       if (sample_scores && b % 1024 != 0 && b + 1 != complete)
         continue;
       double total = 0.0;
-      float rounded_total = 0.0F;
       for (std::uint32_t h = 0; h < kHeads; ++h) {
         double dot = 0.0;
-        std::array<float, 32> partial{};
         for (std::uint32_t i = 0; i < kDim; ++i) {
           const auto query =
               qv[(static_cast<std::size_t>(t) * kHeads + h) * kDim + i];
           const auto key =
               __half2float(blocks_half[static_cast<std::size_t>(b) * kDim + i]);
           dot += static_cast<double>(query) * key;
-          partial[i % 32] = std::fma(query, key, partial[i % 32]);
         }
         total += std::max(dot, 0.0);
-        for (unsigned delta = 16; delta; delta >>= 1)
-          for (unsigned lane = 0; lane < delta; ++lane)
-            partial[lane] += partial[lane + delta];
-        rounded_total += std::max(partial[0], 0.0F);
       }
       const float got = scores[static_cast<std::size_t>(t) * max_blocks + b];
-      // A loose numerical tolerance cannot detect exchanges at the top-k
-      // boundary. Keep the established F32 reduction as well as the FP64
-      // formula check below when changing kernel layout.
-      if (got != rounded_total)
-        throw std::runtime_error("selector changed the F32 reduction");
       const double err = std::abs(total - got) / std::max(1.0, total);
       worst_score = std::max(worst_score, err);
     }
