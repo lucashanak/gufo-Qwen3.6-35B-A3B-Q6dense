@@ -1003,10 +1003,72 @@ void CheckPairedMmq() {
     throw std::runtime_error("paired MMQ differs from separate projections");
 }
 
+/// Decode-shaped gated experts (640 x 2560, top-10 of 32): a multi-token
+/// launch must equal one launch per token bit for bit, with and without
+/// caller-quantized rows, because a batched decode cycle and an isolated
+/// one must produce the same tokens.
+void CheckGatedDecodeShape() {
+  constexpr int experts = 32, rows = 640, cols = 2560, used = 10, tokens = 8;
+  for (const auto type : {q::WeightType::kQ3_K, q::WeightType::kQ4_K,
+                          q::WeightType::kQ5_K, q::WeightType::kQ8_0}) {
+    const auto make = [&](std::uint32_t seed) {
+      return type == q::WeightType::kQ3_K   ? MakeQ3K(experts, rows, cols, seed)
+             : type == q::WeightType::kQ4_K ? MakeQ4K(experts, rows, cols, seed)
+             : type == q::WeightType::kQ5_K ? MakeQ5K(experts, rows, cols, seed)
+                                            : MakeQ8_0(experts, rows, cols, seed);
+    };
+    const auto a = make(101), b = make(202);
+    std::vector<float> x(tokens * cols);
+    std::uint32_t seed = 99;
+    for (auto& v : x)
+      v = Uniform(&seed, 0.05F);
+    std::vector<std::int32_t> ids(tokens * used);
+    for (int t = 0; t < tokens; ++t)
+      for (int j = 0; j < used; ++j)
+        ids[t * used + j] = (t * 3 + j * 7) % experts;
+    auto* wa = Upload(a.packed);
+    auto* wb = Upload(b.packed);
+    auto* dx = Upload(x);
+    auto* di = Upload(ids);
+    const std::size_t count = std::size_t{tokens} * used * rows;
+    auto* single = Upload(std::vector<float>(count, 0.0F));
+    auto* batch = Upload(std::vector<float>(count, 0.0F));
+    for (int t = 0; t < tokens; ++t)
+      if (qfn_mmq_moe_gated_vec(static_cast<int>(type), wa, wb, dx + t * cols,
+                                di + t * used, single + std::size_t{t} * used * rows,
+                                rows, cols, 1, experts, used, nullptr))
+        throw std::runtime_error("single-token gated launch failed");
+    const auto reference = Download(single, count);
+    for (int n = 2; n <= tokens; ++n) {
+      if (qfn_mmq_moe_gated_vec(static_cast<int>(type), wa, wb, dx, di, batch,
+                                rows, cols, n, experts, used, nullptr))
+        throw std::runtime_error("multi-token gated launch failed");
+      const auto out = Download(batch, count);
+      if (std::memcmp(reference.data(), out.data(),
+                      std::size_t{n} * used * rows * sizeof(float)) != 0) {
+        std::size_t i = 0;
+        while (std::memcmp(&reference[i], &out[i], sizeof(float)) == 0)
+          ++i;
+        throw std::runtime_error(
+            std::string("gated decode shape differs from single-token launches: ") +
+            TypeName(type) + " n=" + std::to_string(n) + " first index " +
+            std::to_string(i));
+      }
+    }
+    std::cout << TypeName(type) << " gated 640x2560 top-10: 2..8 tokens equal "
+              << "per-token launches\n";
+    for (void* p : {static_cast<void*>(wa), static_cast<void*>(wb),
+                    static_cast<void*>(dx), static_cast<void*>(di),
+                    static_cast<void*>(single), static_cast<void*>(batch)})
+      (void)hipFree(p);
+  }
+}
+
 }  // namespace
 
 int main() {
   try {
+    CheckGatedDecodeShape();
     ReportVectorAccuracy();
     CheckVectorGrouping();
     CheckVectorGrouping(false, 64);
