@@ -4472,13 +4472,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     drop_staged();
   const auto project = [&](const DeviceTensor& w, const float* x, float* out,
                            std::uint32_t rows) {
-    if (cache_only && w.type == GgmlType::kQ8_0)
-      return Dense(w, x, out, rows, error_msg);
-    // The BF16 indexer projection keeps its row-independent decode kernel
-    // for every row count: the wide BF16 GEMM's K order follows a row's
-    // position in the launch.
-    PrefillPhase decode_rows(false);
-    return DenseBatch(w, x, out, rows, error_msg);
+    return cache_only ? Dense(w, x, out, rows, error_msg)
+                      : DenseBatch(w, x, out, rows, error_msg);
   };
   const auto copy_trace = [&](const float* source,
                               std::span<float> destination) {

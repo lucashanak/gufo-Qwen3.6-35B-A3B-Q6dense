@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -306,8 +307,9 @@ int main(int argc, char** argv) try {
 
   // BF16 indexer projections (query 512 x 2560, key 128 x 2560, and a TP2
   // rank's halves): the library kernel against BlasLt::Gemm, which runs
-  // DenseBf16Gemm where that reproduces the library. Timed at the requested
-  // tokens; every token count up to it must match bitwise.
+  // DenseBf16Gemm. Timed at the requested tokens; prints the largest
+  // difference from the library, and every token count up to the requested
+  // one must reproduce the full launch's rows bitwise.
   {
     std::string error;
     auto blas = q::BlasLt::Create(nullptr, &error);
@@ -357,31 +359,28 @@ int main(int argc, char** argv) try {
       std::printf("%s-own", name);
       report("", MedianMs([&] { own(t); }, reps), 2.0 * tokens * m * k,
              Hash(y_own, bytes));
-      int routed = 0;
+      const auto full_lib = host(y_lib, std::size_t{tokens} * m);
+      const auto full_own = host(y_own, std::size_t{tokens} * m);
+      double worst = 0.0;
+      for (std::size_t i = 0; i < full_own.size(); ++i)
+        worst = std::max(
+            worst,
+            std::abs(static_cast<double>(full_own[i]) - full_lib[i]) /
+                std::max(1.0, std::abs(static_cast<double>(full_lib[i]))));
       int differ = 0;
-      std::string library_only;
-      for (int n = 1; n <= t; ++n) {
-        const bool uses_own = blas->UsesOwnKernel(HIP_R_16BF, m, n, k, &error);
-        routed += uses_own;
-        if (!uses_own) {
-          if (library_only.size() < 200)
-            library_only += " " + std::to_string(n);
-          continue;
-        }
-        lib(n);
+      for (int n = 1; n <= t; n += n < 160 ? 1 : 97) {
         own(n);
         CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
-        const auto a = host(y_lib, std::size_t{static_cast<unsigned>(n)} * m);
         const auto b = host(y_own, std::size_t{static_cast<unsigned>(n)} * m);
-        if (std::memcmp(a.data(), b.data(), a.size() * 4) != 0) {
+        if (std::memcmp(b.data(), full_own.data(), b.size() * 4) != 0) {
           if (++differ <= 10)
             std::printf("%s n %d DIFF\n", name, n);
         }
       }
       std::printf(
-          "%s n 1..%d: own kernel at %d, bitwise differ at %d; "
-          "library only at:%s\n",
-          name, t, routed, differ, library_only.c_str());
+          "%s: worst relative difference from the library %.3g; widths "
+          "1..%d differing from the full launch: %d\n",
+          name, worst, t, differ);
       for (void* p : {static_cast<void*>(w), static_cast<void*>(x),
                       static_cast<void*>(y_lib), static_cast<void*>(y_own)})
         CheckHip(hipFree(p), "hipFree");

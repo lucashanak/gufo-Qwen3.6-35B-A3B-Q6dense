@@ -21,6 +21,12 @@ bool OwnF16(hipDataType type, int k) {
   return type == HIP_R_16F && k == 2560;
 }
 
+bool OwnBf16(hipDataType type, int k) {
+  // The BF16 indexer projections, for the same reason: their keys and
+  // queries decide the sparse selection past the token budget.
+  return type == HIP_R_16BF && k == 2560;
+}
+
 }  // namespace
 
 struct BlasLt::Plan {
@@ -29,8 +35,6 @@ struct BlasLt::Plan {
   hipblasLtMatrixLayout_t input{nullptr};
   hipblasLtMatrixLayout_t output{nullptr};
   hipblasLtMatmulAlgo_t algorithm{};
-  // DenseBf16Gemm reproduces the library kernel's summation order bitwise.
-  bool own_bf16{false};
 
   ~Plan() {
     if (output != nullptr)
@@ -119,17 +123,6 @@ std::unique_ptr<BlasLt::Plan> BlasLt::MakePlan(hipDataType type, int m, int n,
       if (candidates[i].state == HIPBLAS_STATUS_SUCCESS &&
           candidates[i].workspaceSize == 0 && usable(candidates[i].algo)) {
         p->algorithm = candidates[i].algo;
-        // The indexer projections' MT32x32x64 kernel runs at ~5 TFLOPS;
-        // DenseBf16Gemm reproduces its K order (including the StaggerU
-        // rotation) at about 4x the speed. Only the shapes, token counts (up
-        // to one 4096-token prefill chunk) and library kernel checked bitwise
-        // by dense_gemm_bench take it.
-        p->own_bf16 =
-            type == HIP_R_16BF && k == 2560 &&
-            (m == 512 || m == 256 || m == 128 || m == 64) && n <= 4096 &&
-            hipblaslt_ext::getIndexFromAlgo(p->algorithm) == 4438 &&
-            hipblaslt_ext::getKernelNameFromAlgo(handle_, p->algorithm)
-                    .find("_MT32x32x64_MI16x16x1_") != std::string::npos;
         return p;
       }
     }
@@ -151,12 +144,10 @@ bool BlasLt::Gemm(const void* weights, const void* input, float* out,
     return UnquantizedF16Gemm(weights, static_cast<const __half*>(input), out,
                               n, m, k, stream_);
   }
-  Plan* p = FindPlan(type, m, n, k, error);
-  if (p == nullptr)
-    return false;
-  if (p->own_bf16)
+  if (OwnBf16(type, k))
     return DenseBf16Gemm(weights, input, out, n, m, k, stream_);
-  return Run(*p, weights, input, out, error);
+  Plan* p = FindPlan(type, m, n, k, error);
+  return p != nullptr && Run(*p, weights, input, out, error);
 }
 
 bool BlasLt::Prepare(hipDataType type, int m, int n, int k,
@@ -165,7 +156,8 @@ bool BlasLt::Prepare(hipDataType type, int m, int n, int k,
     AssignError(error, "hipBLASLt dimensions must be positive");
     return false;
   }
-  return OwnF16(type, k) || FindPlan(type, m, n, k, error) != nullptr;
+  return OwnF16(type, k) || OwnBf16(type, k) ||
+         FindPlan(type, m, n, k, error) != nullptr;
 }
 
 BlasLt::Plan* BlasLt::FindPlan(hipDataType type, int m, int n, int k,
@@ -177,12 +169,6 @@ BlasLt::Plan* BlasLt::FindPlan(hipDataType type, int m, int n, int k,
   if (!p)
     p = MakePlan(type, m, n, k, error);
   return p.get();
-}
-
-bool BlasLt::UsesOwnKernel(hipDataType type, int m, int n, int k,
-                           std::string* error) {
-  const Plan* p = FindPlan(type, m, n, k, error);
-  return p != nullptr && p->own_bf16;
 }
 
 bool BlasLt::LibraryGemm(const void* weights, const void* input, float* out,

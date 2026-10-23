@@ -105,15 +105,10 @@ int main() {
           }
           Check(hipMemcpy(split.data(), c.data, split.size() * sizeof(float),
                           hipMemcpyDeviceToHost));
-          // BF16 follows hipBLASLt's order, which rotates K by the token's
-          // place in the batch (DenseBf16Gemm) or comes from a library plan
-          // chosen per token count; only reported until that is fixed.
           if (bulk != split)
-            std::cout << (type == HIP_R_16BF ? "KNOWN: " : "") << "type "
-                      << type << " m=" << m << " split " << total << " at "
-                      << boundary << " changes the rows\n";
-          Require(bulk == split || type == HIP_R_16BF,
-                  "projection changed across prefill chunks");
+            std::cout << "type " << type << " m=" << m << " split " << total
+                      << " at " << boundary << " changes the rows\n";
+          Require(bulk == split, "projection changed across prefill chunks");
         }
       }
       // Vary shape order and use ragged sizes between the calibrated widths.
@@ -153,7 +148,7 @@ int main() {
         }
       }
     }
-    std::cout << "PASS: F16/BF16 prepared/lazy projection replay, F16 chunk "
+    std::cout << "PASS: F16/BF16 prepared/lazy projection replay, chunk "
                  "boundaries, ragged shapes and F64\n";
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';
