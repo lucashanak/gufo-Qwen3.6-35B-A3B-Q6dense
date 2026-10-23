@@ -1,5 +1,44 @@
 # Qwen3.8 Flash-Next experiments
 
+## Long prefill passes against halogen (October 23, 2026)
+
+Kernel-trace µs per prompt token over one 26.5K-token cold prefill, exQ3K-dnIQ4
+and MTP (`gufo bench` pp32768 in 4,096-row passes, its first 26.5K rows)
+against halogen 0.18.13 (one HTTP request,
+one 26,540-row pass; rocprofv3 7.14 inside the image with the host's
+libatomic and an LD_PRELOAD that calls `exit` so the trace is written).
+Both are power-limited at about 120 W. Unprofiled, ours ran 1,679 tok/s for
+that request alone and 1,550 in the three-repetition HTTP probe; halogen 1,828.
+
+| Stage | Ours | halogen | Ours − halogen |
+| --- | ---: | ---: | ---: |
+| GDN: projections, convolution, recurrence, output | 176.1 | 166.0 | +10.1 |
+| (of which recurrence and convolution) | (45.1) | (25.1) | (+20.0) |
+| Routed experts | 174.4 | 160.0 | +14.4 |
+| HC mixers and combines | 123.6 | 124.3 | −0.7 |
+| Sparse and dense-window attention | 53.6 | 48.6 | +5.0 |
+| Attention projections, q/k norms, RoPE, KV store | 41.3 | 45.6 | −4.3 |
+| Shared expert and router | 31.4 | 35.7 | −4.3 |
+| Indexer projections, scores, selection | 9.5 | 10.5 | −1.0 |
+| MTP block (draft K/V of prompt rows) | 6.7 | 0 | +6.7 |
+| PLE, embedding, head, other | 5.2 | 5.5 | −0.3 |
+| Total (profiled) | 621.8 | 596.3 | +25.5 |
+
+Per 4,096-row pass from d0 to d28K only sparse attention (20.5 → 63.5) and
+the indexer (5.1 → 15.4) grow; every other stage stays within ±3%. halogen's
+aggregate attention and indexer cost is no lower, so the gap that grows
+with the prompt is its single pass: its routed experts take 3.27 µs per
+token and layer at 26.5K rows, ours 3.64 at 4,096 and 3.30 at 16,384. Its
+recurrence (`k_dn_fused16`) is about twice as fast as `GdnPrefillKernel`,
+presumably a 16-token chunked form, which the pass-split contract rules out
+(see Prefill DeltaNet).
+
+| Experiment | Outcome |
+| --- | --- |
+| 16,384-row lone-prompt passes, dense prefill GEMMs launched in 4,096-row token-tile groups | Retained. `GroupedRasterTile` maps blocks so each group of 4,096 rows sweeps every row tile before the next group starts (`DenseF16GEMMKernel`, `W8A8BlockedWmmaGEMMKernel`); grids up to one group keep their order, and only the block-to-tile mapping changes. Routed experts per token at 16K rows: pair 106.9 → 101.4, down 65.3 → 57.4 µs; the HC down GEMM 23.8 → 21.3. Long greedy replies (21,022 and 25,580-token prompts through `gufo serve`, 4,096 against 16,384-row plans) byte-identical; `fnexact` identical; retrieval 48/48 (16.5K and 38.3K prompts). `projection_ops` now checks W8A8 and F16 rows of 9,001-row passes against 1,031/4,096-row passes, including rows that straddle a group. `gufo bench` MTP, alternating twice: pp32768 1,666/1,666 → 1,711/1,696; pp8192 1,758/1,734 → 1,749/1,754. HTTP probe (`fnab`), alternating twice: 26.5K 1,551/1,549 → 1,597/1,605, 7.3K 1,598/1,585 → 1,626/1,624; decode, code, C1/C4/C8 within run-to-run spread. Peak GTT in `gufo bench` 68.5 → 72.6 GiB. A request that arrives during a lone long prefill now waits for up to one 16K pass (about 10 s) before the scheduler bounds it. |
+| 16,384-row passes in the original tile order | Rejected: experts −13.9 µs/token, but the dense GEMMs re-read activations for every row tile once a pass outgrew the caches (+17 µs/token; HC down +5.4, fused SSM projection +4.5), so pp32768 stayed 1,661 → 1,663. Synthetic `routed_gemm_bench` (Q3_K/IQ4_NL, skewed top-10) per 4,096 tokens: 15.5 ms at 4,096 rows, 14.6 at 8,192, 12.7 at 16,384. |
+| Per-pass fixed cost | Not a lever: head GEMV, MTP boundary row and idle gaps total about 3 ms per 4,096-row pass (0.7 µs/token); the GPU is 99.8% busy across a bench prefill. |
+
 ## Indexer and sparse attention at depth (October 23, 2026)
 
 | Experiment | Outcome |
