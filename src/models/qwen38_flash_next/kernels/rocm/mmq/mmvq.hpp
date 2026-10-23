@@ -3,6 +3,9 @@
 
 constexpr int MMVQ_MAX_BATCH_SIZE = 8;
 constexpr int MMVQ_MAX_ROUTED_BATCH = 64;
+// Dense K-quant projections: a row's sum does not depend on the width, and
+// the batched decode reads the compact rows once for up to 16 tokens.
+constexpr int MMVQ_DENSE_KQ_MAX_BATCH = 16;
 
 // Resolve the first dense decode function before serving; launches no work.
 int prepare_q8_decode();

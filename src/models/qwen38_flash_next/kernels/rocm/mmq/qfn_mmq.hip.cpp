@@ -518,7 +518,7 @@ extern "C" int qfn_mmq_dense_kq_vec(int weight_type, const void* W,
        type != GGML_TYPE_Q5_1 && type != GGML_TYPE_IQ4_NL) ||
       !W || !X_f32 ||
       !out_f32 || M <= 0 || K <= 0 || K % ggml_blck_size(type) != 0 ||
-      n_tokens <= 0 || n_tokens > MMVQ_MAX_BATCH_SIZE) {
+      n_tokens <= 0 || n_tokens > MMVQ_DENSE_KQ_MAX_BATCH) {
     fprintf(stderr, "%s: unsupported type %d or shape M=%d K=%d ntok=%d\n",
             tag, weight_type, M, K, n_tokens);
     return -1;
@@ -556,7 +556,7 @@ extern "C" int qfn_mmq_dense_kq_vec_preq(int weight_type, const void* W,
        type != GGML_TYPE_Q5_1 && type != GGML_TYPE_IQ4_NL) ||
       !W || !X_q8 || !out_f32 || M <= 0 || K <= 0 ||
       K % ggml_blck_size(type) != 0 || n_tokens <= 0 ||
-      n_tokens > MMVQ_MAX_BATCH_SIZE) {
+      n_tokens > MMVQ_DENSE_KQ_MAX_BATCH) {
     fprintf(stderr,
             "qfn_mmq_dense_kq_vec_preq: unsupported type %d or shape M=%d "
             "K=%d ntok=%d\n",

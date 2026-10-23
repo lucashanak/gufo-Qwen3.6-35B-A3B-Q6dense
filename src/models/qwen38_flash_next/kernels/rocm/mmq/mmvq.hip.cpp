@@ -463,7 +463,7 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
     }
 }
 
-/// A dense K-quant projection for 1-8 tokens: every wave computes its rows for
+/// A dense K-quant projection for 1-16 tokens: every wave computes its rows for
 /// all tokens, so the weights are read from memory once and from cache for
 /// the later tokens. Each token's sum follows mul_mat_vec_q_moe's lane and
 /// block order, so a row's result does not depend on the batch width.
@@ -689,8 +689,8 @@ static __device__ __forceinline__ float scatter_reduce_sum32(
   return s[0];
 }
 
-/// mul_mat_vec_dense_kq for Q4_K/Q5_K rows and 2-8 tokens (the output head's
-/// verification and batched draft rows). Each wave decodes `c_rows` rows'
+/// mul_mat_vec_dense_kq for Q4_K/Q5_K rows and 2-16 tokens (the output
+/// head's verification and batched draft rows, batched decode). Each wave decodes `c_rows` rows'
 /// codes once and loads each token's activations once for all of them, so
 /// a token adds only its dot products; per row and token the lane order,
 /// block order, products and butterfly are mul_mat_vec_dense_kq's.
@@ -769,7 +769,8 @@ static void launch_dense_kq(const void* weights, const block_q8_1* input,
   if constexpr (tokens > 1 &&
                 (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) {
     if (n_tokens == tokens) {
-      constexpr int kRows = tokens <= 3 ? 2 : 4;
+      // tokens * kRows sums fit the 32-lane butterfly.
+      constexpr int kRows = tokens <= 3 || tokens > 8 ? 2 : 4;
       mul_mat_vec_dense_kq_rows<type, kRows, tokens>
           <<<dim3((rows + kRows - 1) / kRows), dim3(32), 0, stream>>>(
               weights, input, output, k, rows, k / ggml_blck_size(type),
@@ -783,7 +784,7 @@ static void launch_dense_kq(const void* weights, const block_q8_1* input,
         <<<dim3((rows + kRows - 1) / kRows), dim3(32), 0, stream>>>(
             weights, input, output, k, rows, k / ggml_blck_size(type),
             input_stride, rows);
-  } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
+  } else if constexpr (tokens < MMVQ_DENSE_KQ_MAX_BATCH) {
     launch_dense_kq<type, tokens + 1>(weights, input, output, k, rows,
                                       n_tokens, input_stride, stream);
   } else {
@@ -795,7 +796,7 @@ void mul_mat_vec_dense_kq_dispatch(const void* weights, ggml_type type,
                                    const block_q8_1* input, float* output,
                                    int k, int rows, int tokens,
                                    int input_stride, hipStream_t stream) {
-  GGML_ASSERT(tokens > 0 && tokens <= MMVQ_MAX_BATCH_SIZE &&
+  GGML_ASSERT(tokens > 0 && tokens <= MMVQ_DENSE_KQ_MAX_BATCH &&
               k % ggml_blck_size(type) == 0 && rows > 0);
   switch (type) {
     case GGML_TYPE_Q3_K:
