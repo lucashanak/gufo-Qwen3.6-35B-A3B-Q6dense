@@ -456,6 +456,13 @@ public:
     return options_.max_speculative;
   }
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
+  /// PLE rows a prefill of `tokens` after the session's n-gram history would
+  /// read from disk: distinct rows outside the table's cache. Zero without a
+  /// table, or when the next pass would claim a prefetch for them.
+  [[nodiscard]] std::size_t PleDiskRows(
+      const Session& session, std::span<const std::int32_t> tokens) const;
+  /// The table's measured disk rate, in rows per second.
+  [[nodiscard]] double PleDiskRowsPerSecond() const;
 
 private:
   friend class Session;

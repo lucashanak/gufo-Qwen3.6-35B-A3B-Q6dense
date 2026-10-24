@@ -414,6 +414,45 @@ void CheckPrefetchHints(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+// Rows of a cold, non-repetitive prompt miss the table cache, so its first
+// passes ramp up from a short one; the same prompt with cached rows runs in
+// one pass. Pass splits must not change the results.
+void CheckColdPrefillRamp(const std::shared_ptr<qfn::Model>& model) {
+  const auto& c = model->config();
+  if (c.ple_layer < 0)
+    return;
+  std::string error;
+  std::vector<std::int32_t> tokens(4096);
+  std::uint64_t state = 0x9e3779b97f4a7c15ULL;
+  for (auto& token : tokens) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    token = static_cast<std::int32_t>(1000 + (state >> 33) % 100000);
+  }
+  const auto mode = model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                                    : gufo::core::SessionMode::kAutoregressive;
+  auto cold = model->CreateSession(mode, 6145, &error);
+  auto warm = model->CreateSession(mode, 6145, &error);
+  Require(cold && warm && cold->Sync(tokens, &error), error);
+  const auto cold_rows = cold->NgramRowTotals();
+  Require(warm->Sync(tokens, &error), error);
+  const auto warm_rows = warm->NgramRowTotals();
+  Require(cold_rows.disk_reads > warm_rows.disk_reads * 8,
+          "cold prompt rows did not come from disk");
+  for (unsigned step = 0; step < 4; ++step) {
+    const auto logits = cold->Logits();
+    RequireExact(
+        logits, warm->Logits(),
+        "cold prefill ramp changed logits: step=" + std::to_string(step));
+    const auto token = static_cast<std::int32_t>(
+        std::max_element(logits.begin(), logits.end()) - logits.begin());
+    Require(cold->Evaluate(token, &error) && warm->Evaluate(token, &error),
+            error);
+  }
+  std::cout << "cold prefill ramp: " << cold_rows.disk_reads << " vs "
+            << warm_rows.disk_reads << " disk rows, four logit rows exact\n"
+            << std::flush;
+}
+
 void CheckMtpCacheReplay(const std::shared_ptr<qfn::Model>& model) {
   namespace qt = gufo::tokenization;
   std::string error;
@@ -1950,6 +1989,7 @@ int main(int argc, char** argv) {
       CheckExecutionModes(model, 2048, true);
       CheckPrefillChunks(model);
       CheckPrefetchHints(model);
+      CheckColdPrefillRamp(model);
     }
     if (prefill_only)
       return 0;

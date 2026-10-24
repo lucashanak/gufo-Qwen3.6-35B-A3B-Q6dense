@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -103,6 +104,13 @@ public:
                                std::span<const NgramGatherOwner> owners = {});
   [[nodiscard]] bool WaitRead();
 
+  /// Distinct rows of `rows` outside the row cache: the disk reads a gather
+  /// of them would make. Safe beside an outstanding gather.
+  [[nodiscard]] std::size_t CountUncached(std::span<const std::uint32_t> rows);
+  /// Rows per second the disk delivered to the last gather that read many
+  /// of them; before any such gather, a conservative estimate.
+  [[nodiscard]] double DiskRowsPerSecond();
+
   [[nodiscard]] std::uint32_t RowDim() const noexcept { return row_dim_; }
   [[nodiscard]] std::uint64_t Rows() const noexcept { return rows_; }
   [[nodiscard]] std::size_t RowBytes() const noexcept { return row_bytes_; }
@@ -123,6 +131,7 @@ private:
   // occurrence in the current input, so no row-cache state is retained here.
   std::vector<std::size_t> first_rows_;
   void DecodeRow(const std::uint8_t* src, float* dst) const;
+  /// A null `dst` only probes the cache.
   bool ReadCached(std::uint32_t row, float* dst);
   bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf,
                NgramCounters* owner);
@@ -158,6 +167,9 @@ private:
   bool active_{false};
   bool failed_{false};
   bool stop_{false};
+  std::chrono::steady_clock::time_point started_;
+  std::atomic<std::size_t> gather_reads_{0};
+  double disk_rows_per_second_;
 };
 
 }  // namespace gufo::models::qwen38_flash_next

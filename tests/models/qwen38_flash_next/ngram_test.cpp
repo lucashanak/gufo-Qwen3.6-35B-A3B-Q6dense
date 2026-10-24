@@ -512,6 +512,13 @@ void TestCounters() {
               balanced(p),
           "pooled gather balances");
 
+    Check(table->CountUncached(ids) == 0, "gathered rows are cached");
+    const std::vector<std::uint32_t> fresh{3500, 3501, 3500, 9, 3502};
+    Check(table->CountUncached(fresh) == 3,
+          "distinct uncached rows are counted once");
+    Check(table->CountUncached(fresh) == 3, "probing does not fill the cache");
+    Check(table->DiskRowsPerSecond() > 0, "disk rate has an estimate");
+
     const std::array short_owner{q::NgramGatherOwner{ids.size() - 1, &first}};
     Check(!table->StartRead(ids, out, short_owner),
           "owners must cover the gather");

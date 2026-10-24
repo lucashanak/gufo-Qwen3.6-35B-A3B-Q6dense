@@ -38,6 +38,21 @@ constexpr std::uint32_t kPrefillChunkTokens = 16384;
 // A prompt ending this close past a chunk finishes in that chunk: a separate
 // tail pass costs about as much as this many more chunk rows.
 constexpr std::uint32_t kPrefillTailTokens = 128;
+// A pass reads its own PLE rows from disk before layer 1 unless the previous
+// pass prefetched them, so a cold prompt's first pass waits for all of its
+// reads (7K-token prose: 89K reads, 1.16 s of a 5.05 s pass). Such a prompt
+// starts with a pass whose reads take about one pass's fixed cost, and each
+// later pass grows to the rows the disk can read during the one before it.
+// Pass splits do not change the results. The bound on a pass's time is
+// measured on gfx1151 (MTP, 512-16,384 rows, d0-d16K), with margin.
+constexpr double kRampFirstReadSeconds = 0.1;
+// A first pass that would wait less than this keeps its full size.
+constexpr double kRampMinReadSeconds = 0.3;
+constexpr double kRampPassSeconds = 0.1;
+constexpr double kRampTokensPerSecond = 1800;
+// The disk-row rate per token comes from the start of the prompt.
+constexpr std::size_t kRampSampleTokens = 2048;
+constexpr std::size_t kRampAlign = 128;
 
 void AssignError(std::string* error_msg, std::string_view message) {
   if (error_msg != nullptr) {
@@ -836,12 +851,61 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    double* capture_ms, std::span<const std::int32_t> after,
                    const PrefillCapture& consume) {
   rocm::Executor& exec = *model_->executor_;
+  // Prompt tokens whose new PLE rows the disk reads per second, and the
+  // size limit of the next pass while a cold prompt ramps up (zero: none).
+  double read_tokens_per_second = 0;
+  std::size_t ramp = 0;
+  if (prefill) {
+    // The first pass's disk rows, from the start of the prompt and the rate
+    // its second half adds new ones: repetitive text front-loads them.
+    const auto sample =
+        tokens.first(std::min<std::size_t>(tokens.size(), kRampSampleTokens));
+    const auto half = sample.first(sample.size() / 2);
+    if (const auto rows = exec.PleDiskRows(*session_, sample); rows != 0) {
+      const double later =
+          static_cast<double>(
+              rows - std::min(rows, exec.PleDiskRows(*session_, half))) /
+          static_cast<double>(sample.size() - half.size());
+      const auto first =
+          std::min<std::size_t>(tokens.size(), model_->PrefillCapacity());
+      const double first_rows =
+          static_cast<double>(rows) +
+          later * static_cast<double>(first - sample.size());
+      const double disk_rate = exec.PleDiskRowsPerSecond();
+      ramp = static_cast<std::size_t>(kRampFirstReadSeconds * disk_rate *
+                                      static_cast<double>(sample.size()) /
+                                      static_cast<double>(rows));
+      ramp = std::max(ramp / kRampAlign * kRampAlign, kRampAlign);
+      if (first_rows <= kRampMinReadSeconds * disk_rate || 2 * ramp >= first)
+        ramp = 0;
+      read_tokens_per_second = later > 0
+                                   ? disk_rate / later
+                                   : std::numeric_limits<double>::infinity();
+    }
+  }
+  const auto pass_tokens = [&](std::size_t remaining, std::size_t limit) {
+    std::size_t n =
+        remaining <= exec.max_batch() ? remaining : model_->PrefillCapacity();
+    // An even split avoids a short last pass, whose time would not hide the
+    // next reads.
+    if (limit != 0 && limit + kPrefillTailTokens < remaining)
+      n = std::min(
+          {n, limit,
+           (remaining / 2 + kRampAlign - 1) / kRampAlign * kRampAlign});
+    return n;
+  };
   for (std::size_t off = 0; off < tokens.size();) {
-    const auto remaining = tokens.size() - off;
-    const auto capacity = remaining <= exec.max_batch()
-                              ? exec.max_batch()
-                              : model_->PrefillCapacity();
-    const std::size_t n = std::min<std::size_t>(capacity, remaining);
+    const std::size_t n = pass_tokens(tokens.size() - off, ramp);
+    if (ramp != 0) {
+      const double grown =
+          (kRampPassSeconds + static_cast<double>(n) / kRampTokensPerSecond) *
+          read_tokens_per_second;
+      ramp = grown < model_->PrefillCapacity()
+                 ? std::max(static_cast<std::size_t>(grown) / kRampAlign *
+                                kRampAlign,
+                            kRampAlign)
+                 : 0;
+    }
     const auto chunk = tokens.subspan(off, n);
     // A prompt pass first gives the draft block the previous row, whose
     // successor is this chunk's first token: K/V only, with the prefill
@@ -863,10 +927,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     }
     // The chunk this loop, or the following Sync, takes next.
     const auto rest = off + n < tokens.size() ? tokens.subspan(off + n) : after;
-    const auto next = rest.first(std::min<std::size_t>(
-        rest.size() <= exec.max_batch() ? exec.max_batch()
-                                        : model_->PrefillCapacity(),
-        rest.size()));
+    const auto next = rest.first(
+        pass_tokens(rest.size(), off + n < tokens.size() ? ramp : 0));
     // Only rows inside the draft's attention window at the end of this
     // feed are ever read; earlier chunks skip the taps.
     // A decode-mode feed also needs to run alone, as DecodeStep does.

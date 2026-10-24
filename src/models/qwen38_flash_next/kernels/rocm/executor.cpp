@@ -2408,6 +2408,29 @@ void Executor::PrefetchPle(const Session& session,
                         std::span(&owner, 1));
 }
 
+std::size_t Executor::PleDiskRows(const Session& session,
+                                  std::span<const std::int32_t> tokens) const {
+  if (ngram_ == nullptr || tokens.empty())
+    return 0;
+  // PleFetch claims such a prefetch for these tokens.
+  if ((prefetch_.pending || prefetch_.ready) &&
+      session.ngram_ == prefetch_.before) {
+    const auto shared = static_cast<std::size_t>(
+        std::ranges::mismatch(tokens, prefetch_.tokens).in1 - tokens.begin());
+    if (shared == tokens.size() || shared == prefetch_.tokens.size())
+      return 0;
+  }
+  const Config& c = config();
+  NgramHistory history = session.ngram_;
+  std::vector<std::uint32_t> rows(tokens.size() * c.ple_heads);
+  HashNgramRows(c, history, tokens, rows);
+  return ngram_->CountUncached(rows);
+}
+
+double Executor::PleDiskRowsPerSecond() const {
+  return ngram_ != nullptr ? ngram_->DiskRowsPerSecond() : 0;
+}
+
 void Executor::FinishPrefetch() const {
   if (prefetch_.pending) {
     prefetch_.ready = ngram_->WaitRead();

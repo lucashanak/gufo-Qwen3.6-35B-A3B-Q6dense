@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next experiments
 
+## PLE rows of cold prompts (October 24, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| Ramp a cold prompt's first passes | Retained. The PLE layer (layer 1) waits for its pass's table rows, and only the next pass's rows are prefetched, so a new document's first pass read all of its own: 7,016-token prose (Pride and Prejudice) 89K disk rows, 1,158 ms of a 5,048 ms pass; a 28.7K prompt's first 16K pass 2,188 of 11,625 ms; later passes waited under 7 ms. The table's random 4 KiB direct reads saturate at about 61K/s from 16 to 256 threads (ZFS's default 10 synchronous reads per device), about 72K/s in sorted gathers, so more workers or queue depth cannot help. `Session::Feed` now probes the row cache for the prompt's first 2,048 tokens (`NgramTable::CountUncached`); when the full first pass would wait over 0.3 s it starts with a pass whose reads take about 0.1 s and grows each pass to what the disk (`DiskRowsPerSecond`, measured per gather) can read during the one before, splitting a short remainder evenly. Prefetched, cached and repetitive prompts keep full passes. 7K prose runs 384/1,280/2,688/2,536 rows (first request, default rate) or 640/3,072/3,037, with 1–5 ms waits after the first pass (87–120 ms). Greedy MTP replies to 6.5K/28.8K/29.5K prose and a 21K code prompt byte-identical, `fnexact` identical; `session_test --prefill-only` (new cold-ramp check against the same prompt with cached rows) and `ngram_test` pass. HTTP, alternating base/candidate twice (base's first run had cold ZFS metadata and is excluded): prose 7.0K/6.7K/6.7K 1,354/1,338/1,351 → 1,487–1,494/1,448–1,457/1,444–1,454 tok/s, 28.7K/28.0K/27.9K 1,500/1,440/1,445 → 1,599–1,601/1,538–1,541/1,530–1,533; IQ `longctx_06`/`_16` (templated, few disk rows) 1,531/1,596–1,703 → 1,537–1,540/1,590–1,595. `fnab` synthetic pp8192 1,627/1,619 → 1,637/1,636, pp32768 1,603/1,602 → 1,608/1,607; decode, code and C1/C4/C8 within run-to-run spread. |
+| Fixed first-pass sizes | Rejected: 512/1,792/5,888 for every prompt gained the same on prose but added passes to prefetched server steps and to cached prompts. |
+| Ramp without the even tail split | Rejected: a 28K prompt's 16K step ended in a 384-row pass that could not hide the next step's 11.6K-row prefetch (1,099 ms wait, 1,237–1,510 tok/s). |
+
 ## Long prefill passes against halogen (October 23, 2026)
 
 Kernel-trace µs per prompt token over one 26.5K-token cold prefill, exQ3K-dnIQ4
