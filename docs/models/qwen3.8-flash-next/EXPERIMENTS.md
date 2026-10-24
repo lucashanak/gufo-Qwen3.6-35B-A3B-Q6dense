@@ -1,5 +1,24 @@
 # Qwen3.8 Flash-Next experiments
 
+## Prefill recurrence balance and sparse attention tiles (October 24, 2026)
+
+Nothing here was retained; every variant below was byte-identical to the
+base (`qfn_gdn_prefill_bench` F32/F16/Q8 output and state hashes, `attn_bench`
+hashes on the layer-6 masks dumped from a 32K prefill). GDN times are µs per
+row per layer, alternating base and candidate on a quiet GPU. The base ran
+1.04–1.13 across the session.
+
+| Experiment | Outcome |
+| --- | --- |
+| Two blocks per value head (96 blocks of four waves, 64 state rows each) | Rejected. Blocks take head and half from a launch-zeroed ticket, so a head's lower half is running before its upper half starts. The lower half publishes finished rows through the unused raw scratch, and the upper half runs the whole head's epilogue, so only the upper half waits, and only on a block that never waits. A HW_ID probe confirmed the balance: the busiest SIMD drops from 6 waves to 5 (64 SIMDs at 5, 16 at 4, where the base has 32 at 6 and 48 at 4). Without any epilogue (an incorrect ablation) the recurrence ran 1.05 against 1.13. With the epilogue it was 1.22–1.30 (rows read in the next window), 1.25–1.31 (three windows later, vector poll) and 1.18–1.28 (four windows later, scalar poll). The upper half pays a full epilogue every window; the base pays it every other window per wave. The vector poll compiled to `readfirstlane` plus `vmcnt(0)`, which drained the prefetched windows. On gfx1151, a scalar load needs `glc dlc` to see another CU's store: with `glc` alone a probe never observed the update. |
+| Paired epilogue: all eight waves finish two windows after every odd window | Rejected: 1.15–1.17 against 1.08–1.10. Two call sites (46 KB of code against 27 KB) gave 1.24–1.26. |
+| Two windows of loads ahead instead of three | Rejected: 1.22–1.26 against 1.04–1.06. |
+| Epilogue indices from (token, head) instead of 64-bit `row / v_heads` | Rejected: 1.20–1.23 against 1.10–1.11. The original instruction schedule is a sharp local optimum; every perturbation tried lost 7–20%. |
+| Sparse attention: what the per-tile time is | Measured, ms per layer and 4,096-row pass at d8K / d28K: base 19.7–20.5 / 22.5–23.8. Loading K/V from one cache-resident row saved 8–12% (K alone 2%, V alone 4%). Dropping the exponentials saved 1–2%. The tiles run about 96 WMMAs each (S and PV over 48 rows), roughly 38 TFLOPS at d28K, close to the 39–48 measured ceiling. So barriers and softmax are not the limit; the masked half of each union tile is, and changing the union changes which blocks a tile attends to. |
+| Sparse attention: K and V loads two steps ahead (two alternating register sets) | Rejected: 253 VGPRs with 24 spilled, 1.4× slower. With V alone two steps ahead it still spilled (242 VGPRs, occupancy 5). |
+| Sparse attention: stage K/V before the softmax so the next loads overlap it | Rejected: 19.7 / 22.6–22.8 against 19.7–20.4 / 23.1–23.8, within run-to-run spread. |
+| MTP draft K/V of prompt rows (6.7 µs/token; 0 in halogen's table) | Not changed. In halogen 0.18.13's long-pass trace, `k_dn_fused16` runs 36 times and `k_attn_qs_bt4x` 12 times per pass. No other kernel family launches once per pass at prompt-row width except PLE and a few wide `k_ht_lin<…, true, true>` GEMMs (5–8 launches per two passes, 44 ms). That suggests halogen skips or defers the draft block over prompt rows; the trace cannot confirm it. Our draft attends to every prompt row's draft K/V, so skipping or approximating them would change the draft's inputs. A lazy form would have to keep each row's four-stream hidden state (about 40 KB per row) until the draft first reads it. |
+
 ## Long prefill passes against halogen (October 23, 2026)
 
 Kernel-trace µs per prompt token over one 26.5K-token cold prefill, exQ3K-dnIQ4
