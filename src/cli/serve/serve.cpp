@@ -588,6 +588,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
     std::int64_t reasoning_budget = -1;
+    float reasoning_budget_fraction = 0.0F;
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -658,6 +659,11 @@ void PrintServeHelp(std::string_view program_name,
         "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
         "(default: -1)",
         "Reasoning Defaults", &reasoning_budget);
+    parser.AddOption(
+        "", "--reasoning-budget-fraction", "F",
+        "Without a reasoning budget, share of max_tokens before the model is "
+        "told to answer and </think> is forced: 0 disables (default: 0)",
+        "Reasoning Defaults", &reasoning_budget_fraction);
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
@@ -1141,6 +1147,7 @@ int RunServe(std::span<const char* const> args) {
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
     std::int64_t reasoning_budget = -1;
+    float reasoning_budget_fraction = 0.0F;
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -1207,6 +1214,11 @@ int RunServe(std::span<const char* const> args) {
         "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
         "(default: -1)",
         "Reasoning Defaults", &reasoning_budget);
+    llm_parser.AddOption(
+        "", "--reasoning-budget-fraction", "F",
+        "Without a reasoning budget, share of max_tokens before the model is "
+        "told to answer and </think> is forced: 0 disables (default: 0)",
+        "Reasoning Defaults", &reasoning_budget_fraction);
     llm_parser.AddOption("", "--speculative", "MODE",
                          "HTTP draft backend: dspark, dflash2, mtp, or off",
                          "Speculative", &speculative_backend);
@@ -1368,6 +1380,12 @@ int RunServe(std::span<const char* const> args) {
     if (reasoning_budget >= 0)
       reasoning_defaults->budget_tokens =
           static_cast<std::size_t>(reasoning_budget);
+    if (!(reasoning_budget_fraction >= 0.0F &&
+          reasoning_budget_fraction < 1.0F)) {
+      std::cerr << "Error: --reasoning-budget-fraction must be in [0, 1)\n";
+      return 2;
+    }
+    reasoning_defaults->budget_fraction = reasoning_budget_fraction;
 
     server::TextSpeculativeConfig speculative_config;
     if (speculative_backend.empty() && !dspark_model_path.empty()) {
