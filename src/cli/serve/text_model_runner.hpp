@@ -336,7 +336,7 @@ public:
     std::string_view wrap_up;
   };
   [[nodiscard]] virtual ReasoningTags ReasoningBudgetTags() const {
-    return {"<think>", "</think>", {"</think>"}};
+    return {"<think>", "</think>", {"</think>"}, {}};
   }
   /// Zero when the vocabulary cannot be enumerated.
   [[nodiscard]] virtual std::uint32_t VocabularySize() const { return 0; }
