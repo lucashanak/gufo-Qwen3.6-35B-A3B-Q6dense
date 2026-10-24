@@ -4,7 +4,14 @@
 
 Where upstream and this branch built the same thing, the merge keeps the side
 that satisfies the route-invariance contract more widely and measured faster.
-End-to-end exactness and speed of the merged build are still to be measured.
+Merged build on Strix Halo (ROCm 7.2.4, v3 recipe + MTP) against fn-prefillchunk:
+all 25 `qwen38_flash_next` ctests pass; greedy MTP outputs of both fnexact prompts
+are byte-identical; serving alternated twice (fn-up23 / fn-prefillchunk) gives
+pp8K 1639/1618 vs 1643/1708, pp32K 1612/1601 vs 1607/1602, prose decode 60.0/61.3
+vs 58.6/59.6, code greedy 78.4/77.6 vs 77.8/78.4, code at 0.7 79.0/82.8 vs
+78.3/83.2 tok/s. A focused C2/C4 greedy alternation (up23, pc, pc, up23; three
+C4 and two C2 runs per arm) puts C4 wall throughput at 84.1–89.7 vs 78.8–92.6
+tok/s: no regression.
 
 | Overlap | Kept | Why |
 | --- | --- | --- |
