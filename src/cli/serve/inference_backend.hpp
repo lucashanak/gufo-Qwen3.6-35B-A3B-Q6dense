@@ -78,6 +78,8 @@ public:
   InferenceBackend& operator=(InferenceBackend&&) = delete;
 
   /// Loads weights from a GGUF file. Returns false and sets *error on failure.
+  /// `enable_yarn` opts Flash-Next into static YaRN, required for (and only
+  /// accepted with) a `max_context` above its native context.
   bool load(const std::string& model_path, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
@@ -85,7 +87,8 @@ public:
             const TextSpeculativeConfig& speculative_config = {},
             const TextDiskCacheConfig& disk_cache_config = {},
             const std::string& vision_model_path = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerRamCacheOptions ram_cache_config = {},
+            bool enable_yarn = false);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -134,6 +137,7 @@ public:
 
   /// Stable model identifier used in API responses.
   [[nodiscard]] std::string model_id() const override;
+  [[nodiscard]] std::vector<std::string> model_ids() const override;
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] bool device_lost() const override;
   [[nodiscard]] bool supports_images() const override;
@@ -145,7 +149,8 @@ public:
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
-  void set_model_id(const std::string& model_id);
+  /// The first name is primary; the rest are additional served names.
+  void set_model_ids(std::vector<std::string> model_ids);
   void set_served_artifact(const std::string& model_path,
                            const std::string& build_info);
   void set_sampling_defaults(std::size_t max_tokens,

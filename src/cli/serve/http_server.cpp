@@ -38,6 +38,8 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/embedding_service.hpp"
+#include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -50,6 +52,8 @@
 #include "src/cli/serve/websocket.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
+#include "src/core/platform/net.hpp"
+#include "src/core/platform/shutdown_signal.hpp"
 #include "src/core/utf8.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
@@ -68,30 +72,14 @@ void RequestShutdown(int signal) noexcept {
 class ShutdownSignals {
 public:
   ShutdownSignals() {
+    // Reset before installation: a signal landing between the previous
+    // guard's uninstall and this store must not be erased afterwards.
     shutdown_signal.store(0, std::memory_order_relaxed);
-    struct sigaction action{};
-    action.sa_handler = RequestShutdown;
-    ::sigemptyset(&action.sa_mask);
-    if (::sigaction(SIGINT, &action, &previous_interrupt_) != 0)
-      throw std::system_error(errno, std::generic_category(),
-                              "install SIGINT handler");
-    if (::sigaction(SIGTERM, &action, &previous_terminate_) != 0) {
-      const int error = errno;
-      (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
-      throw std::system_error(error, std::generic_category(),
-                              "install SIGTERM handler");
-    }
+    guard_ = platform::ShutdownSignalGuard(&RequestShutdown);
   }
-  ~ShutdownSignals() {
-    (void)::sigaction(SIGTERM, &previous_terminate_, nullptr);
-    (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
-  }
-  ShutdownSignals(const ShutdownSignals&) = delete;
-  ShutdownSignals& operator=(const ShutdownSignals&) = delete;
 
 private:
-  struct sigaction previous_interrupt_{};
-  struct sigaction previous_terminate_{};
+  platform::ShutdownSignalGuard guard_;
 };
 
 // ---------------------------------------------------------------------------
@@ -129,12 +117,8 @@ bool ReadN(std::string& out, int fd, std::size_t n) {
 bool SendAll(int fd, std::string_view data) {
   std::size_t sent = 0;
   while (sent < data.size()) {
-#ifdef MSG_NOSIGNAL
-    const int flags = MSG_NOSIGNAL;
-#else
-    const int flags = 0;
-#endif
-    const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, flags);
+    const ssize_t n = static_cast<ssize_t>(
+        net::SendNoSignal(fd, data.data() + sent, data.size() - sent));
     if (n <= 0)
       return false;
     sent += static_cast<std::size_t>(n);
@@ -174,7 +158,7 @@ bool IsPeerDisconnected(int fd) noexcept {
 #ifdef POLLRDHUP
   descriptor.events |= POLLRDHUP;
 #endif
-  const int ready = ::poll(&descriptor, 1, 0);
+  const int ready = net::PollSocket(&descriptor, 1, 0);
   if (ready <= 0)
     return false;
   if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
@@ -683,6 +667,15 @@ struct CompatibilityAllowances {
   bool tools{false};
 };
 
+// The served name a validated request selected; responses echo it. A request
+// without one is answered under the primary name.
+std::string RequestedModel(const json::Value& body,
+                           const TextGenerationBackend& backend) {
+  const auto* model = body.find("model");
+  return model != nullptr && model->is_string() ? model->str()
+                                                : backend.model_id();
+}
+
 // Validate the text subset before dispatch so a client never gets an answer
 // to a different request. Responses also supports streamed output.
 std::optional<HttpResponse> ReadCompatibilityOptions(
@@ -695,7 +688,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
   if (const auto* model = body.find("model"); model != nullptr) {
     if (!model->is_string())
       return InvalidCompatibilityRequest("'model' must be a string");
-    if (model->str() != backend.model_id())
+    if (!backend.serves_model(model->str()))
       return Err(404, "Not Found", "requested model is not loaded",
                  "invalid_request_error", "model_not_found");
   }
@@ -789,13 +782,15 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
 HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts, const AsrService* asr,
-                        const ImageService* images) {
+                        const ImageService* images,
+                        const EmbeddingService* embeddings) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
-  if (backend != nullptr) {
+  for (const auto& id :
+       backend != nullptr ? backend->model_ids() : std::vector<std::string>{}) {
     json::Value model = json::Value::object();
-    model["id"] = backend->model_id();
+    model["id"] = id;
     model["object"] = "model";
     model["created"] = Now();
     model["owned_by"] = "gufo";
@@ -857,6 +852,15 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["created"] = Now();
     model["owned_by"] = "operator-supplied-qwen";
     model["capability"] = "image";
+    data.push_back(std::move(model));
+  }
+  if (embeddings != nullptr && embeddings->ready()) {
+    json::Value model = json::Value::object();
+    model["id"] = embeddings->model_id();
+    model["object"] = "model";
+    model["created"] = Now();
+    model["owned_by"] = "operator-supplied-gemma";
+    model["capability"] = "embedding";
     data.push_back(std::move(model));
   }
   resp["data"] = std::move(data);
@@ -940,7 +944,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
       req.client_id, stop_sequences, return_progress, cache_prompt);
   const std::string id = "cmpl-" + RandomId();
   const long long created = Now();
-  const std::string model = b.model_id();
+  const std::string model = RequestedModel(body, b);
   if (stream) {
     auto stream_log = std::make_shared<HttpResponse::StreamLog>();
     return {
@@ -1145,7 +1149,8 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   chat.client_id = req.client_id;
   return CreateOpenAiResponse(
       req, b, chat, max_tokens, sampling_config,
-      body.find("stream") != nullptr && body.find("stream")->as_bool());
+      body.find("stream") != nullptr && body.find("stream")->as_bool(),
+      RequestedModel(body, b));
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1290,7 +1295,8 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   chat.client_id = req.client_id;
   return CreateAnthropicMessage(
       req, b, chat, max_tokens, sampling_config,
-      body.find("stream") != nullptr && body.find("stream")->as_bool());
+      body.find("stream") != nullptr && body.find("stream")->as_bool(),
+      RequestedModel(body, b));
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1667,6 +1673,7 @@ LoadingResponder::LoadingResponder(const std::string& host, int port) {
   if (port <= 0 || port > 65535 ||
       !ParseListenAddress(host, port, &addr, &addr_length))
     return;
+  net::EnsureSocketRuntimeStarted();
   const int fd = ::socket(addr.ss_family, SOCK_STREAM, 0);
   if (fd < 0)
     return;
@@ -1682,7 +1689,7 @@ LoadingResponder::LoadingResponder(const std::string& host, int port) {
     Logger::Debug("server", "event=loading_listener_unavailable host=" + host +
                                 " port=" + std::to_string(port) +
                                 " errno=" + std::to_string(error));
-    ::close(fd);
+    net::CloseSocket(fd);
     return;
   }
   listen_fd_ = fd;
@@ -1698,7 +1705,7 @@ void LoadingResponder::stop() {
   if (thread_.joinable())
     thread_.join();
   if (listen_fd_ >= 0) {
-    ::close(listen_fd_);
+    net::CloseSocket(listen_fd_);
     listen_fd_ = -1;
   }
 }
@@ -1714,7 +1721,7 @@ void LoadingResponder::serve() {
   constexpr auto kRequestWait = std::chrono::milliseconds(500);
   while (!stopped_.load(std::memory_order_acquire)) {
     pollfd listener{.fd = listen_fd_, .events = POLLIN, .revents = 0};
-    if (::poll(&listener, 1, 100) <= 0)
+    if (net::PollSocket(&listener, 1, 100) <= 0)
       continue;
     const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
     if (client_fd < 0)
@@ -1729,7 +1736,7 @@ void LoadingResponder::serve() {
               .count();
       pollfd client{.fd = client_fd, .events = POLLIN, .revents = 0};
       if (remaining <= 0 ||
-          ::poll(&client, 1, static_cast<int>(remaining)) <= 0)
+          net::PollSocket(&client, 1, static_cast<int>(remaining)) <= 0)
         break;
       char buffer[2048];
       const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
@@ -1739,7 +1746,7 @@ void LoadingResponder::serve() {
     }
     (void)SendAll(client_fd, reply);
     ::shutdown(client_fd, SHUT_WR);
-    ::close(client_fd);
+    net::CloseSocket(client_fd);
   }
 }
 
@@ -1778,6 +1785,10 @@ std::string HttpRequest::query_param(const std::string& key) const {
 
 struct HttpServer::ConnectionWorker {
   int fd{-1};  // Protected by workers_mutex_, including shutdown and close.
+  // Set after the final response is written. The server reads nothing more,
+  // so the connection only logs and closes and no longer counts toward the
+  // limit.
+  std::atomic<bool> response_sent{false};
   std::atomic<bool> done{false};
   std::jthread thread;
 };
@@ -1788,7 +1799,8 @@ HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<TtsService> tts,
                        std::shared_ptr<AsrService> asr,
                        HttpServerOptions options,
-                       std::shared_ptr<ImageService> images)
+                       std::shared_ptr<ImageService> images,
+                       std::shared_ptr<EmbeddingService> embeddings)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
@@ -1796,6 +1808,7 @@ HttpServer::HttpServer(std::string host, int port,
       tts_(std::move(tts)),
       asr_(std::move(asr)),
       images_(std::move(images)),
+      embeddings_(std::move(embeddings)),
       options_(std::move(options)) {
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
@@ -1809,7 +1822,7 @@ HttpServer::HttpServer(std::string host, int port,
 HttpServer::~HttpServer() {
   stop();
   if (listen_fd_ >= 0) {
-    ::close(listen_fd_);
+    net::CloseSocket(listen_fd_);
   }
 }
 
@@ -1851,6 +1864,7 @@ void HttpServer::register_routes() {
 }
 
 bool HttpServer::start(std::string* error) {
+  net::EnsureSocketRuntimeStarted();
   if (listen_fd_ >= 0 || stopped_.load(std::memory_order_acquire)) {
     if (error != nullptr) {
       *error = "HTTP server has already been started or stopped";
@@ -1868,7 +1882,7 @@ bool HttpServer::start(std::string* error) {
     }
     return false;
   }
-  (void)::signal(SIGPIPE, SIG_IGN);
+  platform::IgnoreSocketPipeSignal();
   listen_fd_ = ::socket(addr.ss_family, SOCK_STREAM, 0);
   if (listen_fd_ < 0) {
     if (error != nullptr)
@@ -1885,7 +1899,7 @@ bool HttpServer::start(std::string* error) {
           0) {
     if (error != nullptr)
       *error = "setsockopt(IPV6_V6ONLY) failed";
-    ::close(listen_fd_);
+    net::CloseSocket(listen_fd_);
     listen_fd_ = -1;
     return false;
   }
@@ -1894,14 +1908,14 @@ bool HttpServer::start(std::string* error) {
     if (error != nullptr) {
       *error = "bind() failed on " + host_ + ":" + std::to_string(port_);
     }
-    ::close(listen_fd_);
+    net::CloseSocket(listen_fd_);
     listen_fd_ = -1;
     return false;
   }
   if (::listen(listen_fd_, 16) < 0) {
     if (error != nullptr)
       *error = "listen() failed";
-    ::close(listen_fd_);
+    net::CloseSocket(listen_fd_);
     listen_fd_ = -1;
     return false;
   }
@@ -1913,7 +1927,7 @@ bool HttpServer::start(std::string* error) {
       if (error != nullptr) {
         *error = "getsockname() failed";
       }
-      ::close(listen_fd_);
+      net::CloseSocket(listen_fd_);
       listen_fd_ = -1;
       return false;
     }
@@ -1932,8 +1946,7 @@ void HttpServer::run(bool handle_signals) {
   // Poll even without signal handling so device loss is observed while a
   // request worker is blocked writing to a slow client. Nonblocking accept
   // also keeps a vanished connection from wedging this observation loop.
-  const int flags = ::fcntl(listen_fd_, F_GETFL, 0);
-  if (flags < 0 || ::fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK) != 0)
+  if (!net::SetNonBlocking(listen_fd_))
     throw std::system_error(errno, std::generic_category(),
                             "configure HTTP listener");
   Logger::Info(
@@ -1952,11 +1965,12 @@ void HttpServer::run(bool handle_signals) {
         Logger::Info("server", "event=shutdown_requested signal=" +
                                    std::to_string(signal));
         stop();
+        platform::NotifyShutdownHandled();
         break;
       }
     }
     pollfd descriptor{.fd = listen_fd_, .events = POLLIN, .revents = 0};
-    const int ready = ::poll(&descriptor, 1, 100);
+    const int ready = net::PollSocket(&descriptor, 1, 100);
     if (ready < 0 && errno != EINTR)
       throw std::system_error(errno, std::generic_category(),
                               "poll HTTP listener");
@@ -1970,7 +1984,7 @@ void HttpServer::run(bool handle_signals) {
       continue;
     }
     if (stopped_.load(std::memory_order_acquire)) {
-      ::close(client_fd);
+      net::CloseSocket(client_fd);
       break;
     }
 
@@ -1980,15 +1994,19 @@ void HttpServer::run(bool handle_signals) {
     bool overloaded = false;
     {
       const std::lock_guard<std::mutex> lock(workers_mutex_);
+      const auto serving = static_cast<std::size_t>(std::ranges::count_if(
+          workers_, [](const std::unique_ptr<ConnectionWorker>& existing) {
+            return !existing->response_sent.load(std::memory_order_acquire);
+          }));
       overloaded = stopped_.load(std::memory_order_acquire) ||
-                   workers_.size() >= options_.max_connections;
+                   serving >= options_.max_connections;
       if (!overloaded) {
         worker_ptr->fd = client_fd;
         worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
-          handle_connection(client_fd);
+          handle_connection(client_fd, worker_ptr->response_sent);
           {
             const std::lock_guard<std::mutex> lock(workers_mutex_);
-            ::close(worker_ptr->fd);
+            net::CloseSocket(worker_ptr->fd);
             worker_ptr->fd = -1;
           }
           worker_ptr->done.store(true, std::memory_order_release);
@@ -2002,7 +2020,7 @@ void HttpServer::run(bool handle_signals) {
               "server_error", "overloaded");
       response.headers.emplace_back("Retry-After", "1");
       (void)SendAll(client_fd, BuildResponse(response));
-      ::close(client_fd);
+      net::CloseSocket(client_fd);
     }
   }
   reap_workers();
@@ -2070,7 +2088,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     const bool ready = (backend_ != nullptr && backend_->ready()) ||
                        (video_jobs_ != nullptr && video_jobs_->ready()) ||
                        (tts_ != nullptr && tts_->ready()) ||
-                       (asr_ != nullptr && asr_->ready()) || images_ != nullptr;
+                       (asr_ != nullptr && asr_->ready()) ||
+                       (embeddings_ != nullptr && embeddings_->ready()) ||
+                       images_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
                  "server_error", "not_ready");
@@ -2083,6 +2103,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = asr_->model_id();
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
+    } else if (embeddings_ != nullptr && embeddings_->ready()) {
+      body["model"] = embeddings_->model_id();
     } else if (images_ != nullptr) {
       body["model"] = images_->model_id();
     } else {
@@ -2093,7 +2115,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get());
+                      images_.get(), embeddings_.get());
   }
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
@@ -2137,6 +2159,23 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     }
     return HandleAudioAsrApiRequest(req, *asr_);
   }
+  // Handled before the route table. An embedding-only server has no text
+  // backend, and the stub route below must not shadow the service when a
+  // backend exists.
+  if (embeddings_ != nullptr && IsEmbeddingsApiPath(req.path)) {
+    if (device_lost())
+      return DeviceLost();
+    if (!embeddings_->ready()) {
+      return Err(503, "Service Unavailable",
+                 "EmbeddingGemma 2 service is not ready", "server_error",
+                 "embedding_service_unavailable");
+    }
+    auto response = HandleEmbeddingsApiRequest(req, *embeddings_);
+    // The request that finds the device lost runs the shutdown hook.
+    if (device_lost())
+      return DeviceLost();
+    return response;
+  }
   for (const auto& entry : routes_) {
     if (entry.first.first == req.method && entry.first.second == req.path) {
       if (req.method == "POST" && device_lost())
@@ -2149,7 +2188,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 }
 
 bool HttpServer::device_lost() {
-  if (backend_ == nullptr || !backend_->device_lost())
+  const bool lost = (backend_ != nullptr && backend_->device_lost()) ||
+                    (embeddings_ != nullptr && embeddings_->device_lost());
+  if (!lost)
     return false;
   if (options_.on_device_lost &&
       !device_lost_reported_.exchange(true, std::memory_order_acq_rel)) {
@@ -2163,10 +2204,9 @@ bool HttpServer::device_lost() {
   return true;
 }
 
-void HttpServer::handle_connection(int client_fd) {
-  const struct timeval tv{120, 0};
-  ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+void HttpServer::handle_connection(int client_fd,
+                                   std::atomic<bool>& response_sent) {
+  (void)net::SetSocketTimeouts(client_fd, 120'000);
 
   const auto start_time = std::chrono::steady_clock::now();
   HttpRequest req;
@@ -2432,6 +2472,7 @@ void HttpServer::handle_connection(int client_fd) {
       response_started = true;
       connected = SendAll(client_fd, payload);
     }
+    response_sent.store(true, std::memory_order_release);
     std::string outcome = connected ? "completed" : "disconnected";
     if (resp.stream_log) {
       resp.log_details = resp.stream_log->details;
@@ -2483,6 +2524,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   } catch (const std::exception& e) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2501,6 +2543,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   } catch (...) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2516,6 +2559,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   }
   // Act on a loss found by this request now, not at the next health probe.
   (void)device_lost();

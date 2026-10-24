@@ -8,17 +8,24 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <numeric>
 #include <semaphore>
+#include <sstream>
+#include <stdexcept>
 #include <thread>
 
+#include "src/cache/retention.hpp"
+#include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "tests/cache/fake_adapter.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 using namespace gufo;
 using namespace gufo::server;
 using namespace gufo::cache::testing;
 namespace {
+
 struct State final : TextRunnerState {
   FakeAdapter& adapter;
   cache::Slot& slot;
@@ -34,6 +41,7 @@ public:
   bool in_pass{};
   bool partial{};
   std::size_t private_blocks{128};
+  cache::Rows rows_per_chunk{4};
   mutable std::size_t through_calls{};
   bool UsesComponentCache() const override { return true; }
   TextRunnerDescriptor Descriptor() const override {
@@ -96,7 +104,7 @@ public:
                          std::shared_ptr<const void>(data, bytes.data())});
     }
     auto resources = std::make_unique<ComponentCacheResources>();
-    resources->adapter = std::make_unique<FakeAdapter>();
+    resources->adapter = std::make_unique<FakeAdapter>(rows_per_chunk);
     adapter = dynamic_cast<FakeAdapter*>(resources->adapter.get());
     resources->owner = blocks;
     resources->stream = [this, foreground = std::this_thread::get_id()]()
@@ -980,8 +988,8 @@ void ReusedConversationOutlivesOneUseRequests() {
   assert(turn(conversation) == 16);
 }
 void RestartAndCorruption() {
-  char pattern[] = "/tmp/gufo-component-serving-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-serving-test");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7};
@@ -1208,8 +1216,8 @@ void FragmentedBackingKeepsCompletePrompt() {
   runner->adapter->Append(restored_state.slot, {&next, 1}, {&next, 1});
 }
 void DiskBudgetEvictsAnUnpinnedConversation() {
-  char pattern[] = "/tmp/gufo-component-budget-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-budget-test");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1024,
                                         .staging_capacity_bytes = 7};
@@ -1245,8 +1253,8 @@ std::uintmax_t ManagedBytes(const std::filesystem::path& directory) {
   return bytes;
 }
 void LoweredDiskBudgetEvictsOldestAtStartup() {
-  char pattern[] = "/tmp/gufo-component-lowered-budget-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-lowered-budget-test");
+  const std::filesystem::path directory = temp.path();
   TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                   .capacity_bytes = 1 << 20,
                                   .staging_capacity_bytes = 7};
@@ -1278,8 +1286,8 @@ void LoweredDiskBudgetEvictsOldestAtStartup() {
   std::filesystem::remove_all(directory);
 }
 void OrphansLeaveBeforeCheckpoints() {
-  char pattern[] = "/tmp/gufo-component-orphan-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-orphan-test");
+  const std::filesystem::path directory = temp.path();
   TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                   .capacity_bytes = 1 << 20,
                                   .staging_capacity_bytes = 7};
@@ -1311,8 +1319,8 @@ void OrphansLeaveBeforeCheckpoints() {
   std::filesystem::remove_all(directory);
 }
 void StagingIsInternal() {
-  char pattern[] = "/tmp/gufo-component-staging-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-staging-test");
+  const std::filesystem::path directory = temp.path();
   // The legacy option is ignored: even a value below one four-byte row
   // still writes and restores through the internal staging buffer.
   TextRunnerDiskCacheOptions disk{.directory = directory.string(),
@@ -1353,8 +1361,8 @@ void StagingCountsAgainstRamCeiling() {
       return resources;
     }
   };
-  char pattern[] = "/tmp/gufo-component-ceiling-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-ceiling-test");
+  const std::filesystem::path directory = temp.path();
   // Pinned staging and RAM share the ceiling: an explicit 4 MiB beside the
   // internal 1 MiB of staging commits 3 MiB, whatever the ignored option says.
   for (const std::size_t option : {std::size_t{0}, std::size_t{4} << 20}) {
@@ -1366,6 +1374,111 @@ void StagingCountsAgainstRamCeiling() {
     assert(runner->committed == 3 << 20);
   }
   std::filesystem::remove_all(directory);
+}
+// Slots that pin host memory lower both measured budgets and are charged in
+// the ledger. They count once, on top of the cache's budget: backing gets the
+// whole budget unless the host ceiling binds.
+void PinnedSlotBytesCountOnce() {
+  constexpr std::size_t kPin = 512 << 10;
+  class PinningRunner final : public Runner {
+  public:
+    mutable std::size_t committed{}, limit{};
+    mutable std::vector<cache::ResourceCharge> pins;
+    TextRunnerResourceClaim ResourceClaim() const override {
+      auto claim = Runner::ResourceClaim();
+      // Automatic is half the available RAM; the ceiling is all of it.
+      claim.retained_snapshot_capacity_bytes =
+          (2 << 20) - pins.size() * kPin / 2;
+      claim.retained_snapshot_ceiling_bytes = (4 << 20) - pins.size() * kPin;
+      return claim;
+    }
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      // Each slot takes a stream as it allocates; pin one buffer per slot.
+      resources->stream = [this, &ledger,
+                           stream = std::move(resources->stream)] {
+        if (!committed)
+          pins.push_back(
+              ledger.Reserve(cache::ResourceCategory::kMetadata, kPin)
+                  .Convert());
+        return stream();
+      };
+      resources->pinned_bytes = [this] { return pins.size() * kPin; };
+      resources->commit_backing = [this, &ledger](std::size_t budget) {
+        committed = budget;
+        limit = ledger.Limits().ram_bytes;
+      };
+      return resources;
+    }
+  };
+  // Automatic, an explicit budget smaller than the pins, and one the 4 MiB
+  // host ceiling cuts to make room for them.
+  for (const auto& [requested, backing] :
+       {std::pair{0ULL, 2ULL << 20}, std::pair{1ULL << 20, 1ULL << 20},
+        std::pair{8ULL << 20, 3ULL << 20}}) {
+    auto runner = std::make_shared<PinningRunner>();
+    TextRunnerPool pool(runner, 2, {}, {.capacity_bytes = requested});
+    assert(runner->pins.size() == 2);
+    assert(runner->committed == backing);
+    assert(runner->limit == backing + 2 * kPin);
+  }
+  // Pins never raise the limit past a budget the other charges exceed: the
+  // fake backing alone holds 40 KiB.
+  bool refused = false;
+  try {
+    TextRunnerPool pool(std::make_shared<PinningRunner>(), 2, {},
+                        {.capacity_bytes = 16 << 10});
+  } catch (const std::exception&) {
+    refused = true;
+  }
+  assert(refused);
+  // Staging shares the ceiling: the limit is 4 MiB less 1 MiB of staging.
+  const TemporaryDirectory temp("gufo-component-pinned-test");
+  const std::filesystem::path directory = temp.path();
+  {
+    const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                          .capacity_bytes = 1 << 20};
+    auto runner = std::make_shared<PinningRunner>();
+    TextRunnerPool pool(runner, 2, disk, {.capacity_bytes = 8 << 20});
+    assert(runner->limit == 3 << 20);
+    assert(runner->committed == 2 << 20);
+  }
+  std::filesystem::remove_all(directory);
+}
+// Without pins the limit ends at the requested budget, whether or not the
+// runner commits backing, and a budget below what is already charged still
+// fails at startup.
+void UnpinnedRunnersKeepTheirLimit() {
+  class LimitRunner final : public Runner {
+  public:
+    bool commit{};
+    mutable cache::ResourceLedger* ledger{};
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& l, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(l, ram);
+      ledger = &l;
+      if (commit)
+        resources->commit_backing = [](std::size_t) {};
+      return resources;
+    }
+  };
+  for (const bool commit : {false, true}) {
+    auto runner = std::make_shared<LimitRunner>();
+    runner->commit = commit;
+    {
+      TextRunnerPool pool(runner, 2, {}, {.capacity_bytes = 1 << 20});
+      assert(runner->ledger->Limits().ram_bytes == 1 << 20);
+    }
+    // The fake backing alone holds 40 KiB.
+    bool refused = false;
+    try {
+      TextRunnerPool pool(runner, 2, {}, {.capacity_bytes = 16 << 10});
+    } catch (const std::exception&) {
+      refused = true;
+    }
+    assert(refused);
+  }
 }
 void DiskDirectoryHasOneOwner() {
   class CommitRunner final : public Runner {
@@ -1384,8 +1497,8 @@ void DiskDirectoryHasOneOwner() {
       return resources;
     }
   };
-  char pattern[] = "/tmp/gufo-component-owner-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-owner-test");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7};
@@ -1412,8 +1525,8 @@ void DiskDirectoryHasOneOwner() {
   std::filesystem::remove_all(directory);
 }
 void GridDoesNotSuppressFirstDiskPrompt() {
-  char pattern[] = "/tmp/gufo-component-spacing-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-spacing-test");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7};
@@ -1456,8 +1569,8 @@ void PublishedResidentCheckpointKeepsDiskStep() {
   // A published checkpoint that is still resident restores from RAM, so its
   // lookup candidate carries no disk description. The next capture within
   // the step must still be refused.
-  char pattern[] = "/tmp/gufo-component-step-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-step-test");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7,
@@ -1497,8 +1610,8 @@ void PublishedResidentCheckpointKeepsDiskStep() {
   std::filesystem::remove_all(directory);
 }
 void NearTailDiskBranchSurvivesRestart() {
-  char pattern[] = "/tmp/gufo-component-branch-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-branch-test");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7};
@@ -1557,8 +1670,8 @@ void UnbackedDeepRowsSurviveDiskRestart() {
       return resources;
     }
   };
-  char pattern[] = "/tmp/gufo-component-deep-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-deep-test");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 8,
@@ -1669,6 +1782,97 @@ void UnbackedDeepRowsSurviveDiskRestart() {
   }
   std::filesystem::remove_all(directory);
 }
+void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
+  // An over-RAM checkpoint is captured for disk only. Its rows are borrowed
+  // from the live slot, but its private state is staged in RAM backing, and
+  // two retained checkpoints fill that backing. Wide chunks keep the capture
+  // metadata within RAM.
+  const TemporaryDirectory temp("gufo-component-over-ram-test");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  auto runner = std::make_shared<Runner>();
+  runner->private_blocks = 2;
+  runner->rows_per_chunk = 4096;
+  constexpr std::size_t kRam = 448 << 10;
+  const auto previous_level = Logger::Level();
+  Logger::SetLevel(LogLevel::kInfo);
+  std::ostringstream output;
+  auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+  {
+    ComponentTextCache cache(runner, 1, kRam, disk);
+    const auto history = [](auto& lease, const auto& tokens,
+                            std::size_t boundary) {
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), boundary, false,
+                                       SnapshotPurpose::kHistory, {}));
+      assert(lease->PublishSnapshot({tokens.begin(), tokens.begin() + boundary},
+                                    lease->Capture(), false));
+    };
+    const auto append = [&](auto& lease, std::span<const TextRunnerToken> t) {
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, t, t);
+    };
+    std::vector<TextRunnerToken> prompt(65536);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    if (!protect) {
+      // The cache may reclaim another conversation's history checkpoints.
+      const std::vector<TextRunnerToken> other(4, 7);
+      auto lease = cache.Acquire(other, {}, {}, true, 0, true);
+      append(lease, std::span(other).first(2));
+      history(lease, other, 2);
+      append(lease, std::span(other).subspan(2));
+      history(lease, other, 4);
+      (void)lease->Commit({}, {}, other);
+    }
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    if (protect) {
+      // The cache keeps this turn's own edit boundaries until it commits.
+      append(lease, std::span(prompt).first(2));
+      history(lease, prompt, 2);
+      append(lease, std::span(prompt).subspan(2, 2));
+      history(lease, prompt, 4);
+      append(lease, std::span(prompt).subspan(4));
+    } else {
+      append(lease, prompt);
+    }
+    const auto bytes = lease->CaptureBytes();
+    assert(bytes > kRam);
+    assert(lease->TryReserveSnapshot(bytes, prompt.size(), false,
+                                     SnapshotPurpose::kContinuation, prompt));
+    if (protect) {
+      bool refused = false;
+      try {
+        (void)lease->Capture();
+      } catch (const cache::ResourceExhausted&) {
+        refused = true;
+      }
+      assert(refused);
+    } else {
+      // Persisting would charge the manifest's tokens again, and in this fake
+      // they cost as many bytes as the rows. This test covers the capture.
+      auto snapshot = lease->Capture();
+      assert(snapshot && snapshot->PayloadBytes() == bytes);
+    }
+    lease->Invalidate();
+  }
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous_level);
+  const auto log = output.str();
+  const auto refused =
+      log.find("event=capture_refused reason=byte_capacity tokens=65536");
+  assert(protect == (refused != std::string::npos));
+  // Only the other conversation's history is reclaimed. Edit boundaries stay.
+  const auto reclaimed =
+      "event=retention action=" +
+      std::to_string(static_cast<unsigned>(cache::RetentionAction::kRemoved)) +
+      " reason=" +
+      std::to_string(
+          static_cast<unsigned>(cache::RetentionReason::kByteCapacity));
+  assert(protect == (log.find(reclaimed) == std::string::npos));
+  assert(log.find("event=capture_failed") == std::string::npos);
+  std::filesystem::remove_all(directory);
+}
 }  // namespace
 int main() {
   PublishedResidentCheckpointKeepsDiskStep();
@@ -1703,8 +1907,12 @@ int main() {
   OrphansLeaveBeforeCheckpoints();
   StagingIsInternal();
   StagingCountsAgainstRamCeiling();
+  PinnedSlotBytesCountOnce();
+  UnpinnedRunnersKeepTheirLimit();
   DiskDirectoryHasOneOwner();
   GridDoesNotSuppressFirstDiskPrompt();
   NearTailDiskBranchSurvivesRestart();
   UnbackedDeepRowsSurviveDiskRestart();
+  OverRamCaptureStagesPrivateStateUnderPressure(false);
+  OverRamCaptureStagesPrivateStateUnderPressure(true);
 }

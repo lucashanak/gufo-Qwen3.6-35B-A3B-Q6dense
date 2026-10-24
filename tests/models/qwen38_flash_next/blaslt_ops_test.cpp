@@ -51,7 +51,8 @@ int main() {
     for (const auto [type, m, k] :
          {std::tuple{HIP_R_16F, 96, 2560}, std::tuple{HIP_R_16F, 513, 2560},
           std::tuple{HIP_R_16F, 17, 2560}, std::tuple{HIP_R_16F, 33, 96},
-          std::tuple{HIP_R_16BF, 64, 2560}, std::tuple{HIP_R_16BF, 512, 2560},
+          std::tuple{HIP_R_16BF, 64, 2560}, std::tuple{HIP_R_16BF, 128, 2560},
+          std::tuple{HIP_R_16BF, 256, 2560}, std::tuple{HIP_R_16BF, 512, 2560},
           std::tuple{HIP_R_16BF, 513, 2560}}) {
       // Prepare before inputs exist, then compare against lazy plan creation
       // in a fresh instance, including ragged shapes after the prepared one.
@@ -83,11 +84,14 @@ int main() {
                       hipMemcpyHostToDevice));
       if (k == 2560) {
         // Exercise an unaligned cache boundary, a wide prefill split and the
-        // short tails a checkpoint restore finishes a prompt with.
+        // short tails a checkpoint restore finishes a prompt with. A row's
+        // sums must not depend on its position in the batch: the indexer's
+        // BF16 scores feed a top-k whose near-ties would otherwise flip with
+        // the prefill chunking.
         for (const auto [total, boundary] :
-             {std::pair{136, 94}, std::pair{2048, 1025}, std::pair{1619, 1612},
-              std::pair{1619, 1618}, std::pair{1619, 1523},
-              std::pair{300, 293}}) {
+             {std::pair{136, 94}, std::pair{2048, 1025}, std::pair{3487, 777},
+              std::pair{1619, 1612}, std::pair{1619, 1618},
+              std::pair{1619, 1523}, std::pair{300, 293}}) {
           std::vector<float> bulk(std::size_t(m) * total), split(bulk.size());
           Require(warmed->Gemm(a.data, b.data, static_cast<float*>(c.data),
                                type, m, total, k, &error),
@@ -105,10 +109,13 @@ int main() {
           }
           Check(hipMemcpy(split.data(), c.data, split.size() * sizeof(float),
                           hipMemcpyDeviceToHost));
-          if (bulk != split)
-            std::cout << "type " << type << " m=" << m << " split " << total
-                      << " at " << boundary << " changes the rows\n";
-          Require(bulk == split, "projection changed across prefill chunks");
+          Require(bulk == split,
+                  std::string(type == HIP_R_16BF ? "BF16" : "F16") +
+                      " m=" + std::to_string(m) +
+                      " projection changed across "
+                      "prefill chunks at " +
+                      std::to_string(boundary) + " of " +
+                      std::to_string(total));
         }
       }
       // Vary shape order and use ragged sizes between the calibrated widths.
@@ -148,8 +155,8 @@ int main() {
         }
       }
     }
-    std::cout << "PASS: F16/BF16 prepared/lazy projection replay, chunk "
-                 "boundaries, ragged shapes and F64\n";
+    std::cout << "PASS: F16/BF16 prepared/lazy projection replay, F16/BF16 "
+                 "chunk boundaries, ragged shapes and F64\n";
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';
     return 1;

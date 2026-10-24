@@ -144,6 +144,10 @@ bool BlasLt::Gemm(const void* weights, const void* input, float* out,
     return UnquantizedF16Gemm(weights, static_cast<const __half*>(input), out,
                               n, m, k, stream_);
   }
+  // The library's MT32x32x64 BF16 kernel starts each 32-token tile's K loop
+  // at a block rotated by the tile's index in the batch, so a token's indexer
+  // score depended on its position modulo 128 tokens within the prefill
+  // chunk, and a top-k near-tie could select another key with the chunking.
   if (OwnBf16(type, k))
     return DenseBf16Gemm(weights, input, out, n, m, k, stream_);
   Plan* p = FindPlan(type, m, n, k, error);

@@ -1,5 +1,21 @@
 # Qwen3.8 Flash-Next experiments
 
+## Upstream 0.23.0 merge (October 24, 2026)
+
+Where upstream and this branch built the same thing, the merge keeps the side
+that satisfies the route-invariance contract more widely and measured faster.
+End-to-end exactness and speed of the merged build are still to be measured.
+
+| Overlap | Kept | Why |
+| --- | --- | --- |
+| BF16 indexer projections in K order (upstream #714) | Ours, with upstream's offset check added to `dense_gemm_bench` | Same kernel and launch; ours routes every BF16 `k == 2560` width (`BlasLt::RowIndependent`), upstream only m = 64/128/256/512 |
+| Small draft head for lone and penalized greedy requests (#733, #739) | Upstream's `MtpDraftSubsetAllowed(sampled, sessions, occupancy, planned)` | Same decision as ours (any greedy request decoding alone or in a planned batch) |
+| Unseeded sampled pricing at decoding occupancy (#703) | Upstream's `MtpPolicyConcurrency` | Not on this branch before |
+| C1 sampled small-head cycle costs (#742) | Upstream's curve for the controller's AR backoff only | The confidence gate already drafts to the budget, so the curve does not set the chain length |
+| Selector `#pragma unroll 1` on Clang 23+ (#742) | Not applicable | Applies to the scalar `SelectScoreKernel`, which the matrix-core scorer replaced |
+| KV-only predictor catch-up (#699) | Upstream's, inside our batched hipGraph | `kv_only` is part of the graph shape; pooling covers the widest grid as elsewhere; the cache-only path now passes YaRN |
+| DFlash2 `ForwardBlock` sampler argument (#705) | Both | Upstream's `sampler` comes before our `out_token_probabilities` |
+
 ## PLE rows of cold prompts (October 24, 2026)
 
 | Experiment | Outcome |
@@ -106,6 +122,40 @@ experts, shared = all rows identical), alternating binaries, median of 9.
 | Decode-once gate/up groups, split single-row groups, all gated formats grouped up to 64 rows | Component result; end-to-end pending. Q3_K/Q5_K groups with two or more rows decode each weight block once per row pair (`MoeFragment`, original vec_dot float expression, exact `__mul24` scale product); groups with one row take a second launch with the original kernel and register footprint (VGPR 186 → 46–88). MoeBatch's grouped gate/up, single down launch and epilogue now cover Q3_K/Q5_K/Q8_0 as well as Q4_K. 48-layer ms before → after, overlap 2/4/8/16/64 rows: 10.6/18.7/36.7/71.8/292 → 9.6/16.4/30.5/59.8/217; random 8/16/64: 44.8/86.7/348 → 41.6/83.4/264; shared 8/64: 33.2/259 → 18.6/139; disjoint 1–6 rows within ±3%. Per extra row (2 → 8, overlap): 4.4 → 3.5 ms. Output hashes of every layer equal the old route for Q3_K, Q4_K, Q5_K, Q8_0 gate/up × IQ4_NL, Q5_1, Q8_0 down, 1–64 rows and all four routings; the routed operator test checks 1–64 rows of every gated format against the scalar kernel bit for bit, with shared and mostly single-row routing. |
 | Fused gate/up + SwiGLU + Q8_1 and down + epilogue (two launches per layer) | Rejected: exact on every configuration, but 32-row tiles of eight 8-row waves (130 VGPRs) and row tiles that walk every expert left too few loads in flight: 120–135 GB/s against 180–200, 1.4–1.6× slower on disjoint routing; only all-shared routing gained. |
 | Decode-once groups without the single-row split; scalar group fields | Rejected: the 8-column kernel's VGPRs (186–227) slowed single-row groups 10–25%; a scheduling barrier per row only partly helped. `readfirstlane` of the group fields halved VGPRs but serialized the group loads (random 8 rows +60%). Q8_0 gate/up keeps the original kernel (no gain). |
+
+## Selector scheduling on newer LLVM (October 23, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| Keep one selector query head live on Clang 23 and newer | Retained: full head unrolling causes 304 scalar-register spills with ROCm 10.1's Clang 24; the bounded loop reduces this to 18 and VGPR use from 169 to 164. Neither 10.1 variant uses private scratch; the original Clang 23 build does. The F32 queries, FMA sequence, reduction tree and selected blocks stay unchanged. On Clang 24, the isolated 64-query × 8,192-block scorer falls from 109.3 to 76.3 µs, with identical output bytes. Clang 22 retains its original unrolling. |
+| Reproduce older activation rounding on newer compilers | Rejected: first-layer Q8 codes differ at 37 of 327,680 values; the newer compiler agrees more often with independent FP32 and FP64 calculations. Restoring the old fused remainder matches the first mixer but does not recover sampled thinking throughput. Production rounding and sampling remain unchanged. |
+| Price the actual C1 sampled draft head | Retained with the compact target path: fixed-history measurements replace full-head estimates only for eligible sampled C1 cycles. The first cycle and short tails keep their established costs; the focused short-reply control passes all 84 phases. Full target-row verification also keeps the original curve, removing a thinking/tool pause increase (111 → 120 ms, then 113 ms with the guard; all 63 focused phases pass). Full-head, greedy and concurrent curves stay unchanged. See [migration qualification and timing limits](ROCM.md). |
+
+The scorer measurement is the median of five warmed calls with production
+compiler flags. Full-model and request-level qualification are recorded in
+[quality](QUALITY.md#llvm-selector-scheduling-october-23-2026); the microbenchmark
+percentage is not an end-to-end speedup.
+
+An independent `tools/prof/prof.py` capture of the final pp2048 pass at d32K
+retains all 1,574 launches, including 45 scorer calls. Scoring falls from
+41.25 to 25.86 ms; total GPU time falls from 1203.93 to 1189.16 ms and the
+pass span from 1207.74 to 1192.95 ms. These are diagnostic profiled timings;
+the HTTP table uses separate unprofiled production runs.
+
+## Exact sampled decode (October 21, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| Skip a redundant neural proposal after an established sampled copy | Retained only with an accepted source, a full 24-token match and at least three available copies. New sources and short resume matches still use the neural proposal. Target rejection/correction, private history and restored RNG remain authoritative. |
+| Compact sampled target verification | Retained for unconstrained top-k/min-keep up to 64 and bounded penalty history. Transfer the exact top 64 unpenalized logits plus every penalized logit, then apply the existing FP64 target sampler. Grammar activation, forced reasoning closure and unsupported settings use full rows. Independent CPU sorting and full-row distributions agree bit for bit, including correction RNG. Complete transfer/selection/sampling costs for 1/3/7 rows: 94.60/273.17/594.92 → 75.84/156.63/323.45 µs. Reconstructing full CPU rows first was exact but slower and was removed. |
+| KV-only predictor catch-up when no proposal is needed | Retained: scalar and uniform cache-only cohorts stop after K/V and indexer updates; mixed cohorts preserve the original row arithmetic. No discarded attention/output/FFN residual is produced in the uniform path. Independent predictor checks and full-logit/RNG/cache replay pass. |
+| Prepare image-capable slots' stable RoPE descriptor before text graphs | Retained after a cancellation/resume control exposed a repeatable 5.8 ms first-token regression. Admission profiling locates 5.61 ms in image-context setup; the first image descriptor invalidated previously captured text graphs. Preparing the empty descriptor at session creation keeps its pointer stable. The same resumed request falls from 9.45–9.46 to 3.71 ms TTFT (main 3.62–3.78), with identical output and faster decode. Other Qwen models retain their existing lazy initialization. |
+| Recalibrate deterministic sampled draft lengths | Rejected after auditing depths 0/4096/32768, C1/2/4/6/8 and widths 1–8 with the actual small sampled head. New-code generation improved 75.27 → 81.57 tok/s, but thinking fell 51.90 → 49.18 and the focused repeat reproduced 51.67 → 49.04. That global replacement was not retained. |
+| Pack Q8 output waves and vary Q4 expert rows per wave | Rejected. Q8 variants were flat/slower after matching production allocation and rotating weights beyond MALL. Q4 one-row waves changed result bits for a sub-1% gain; exact four/eight-row variants were slower than the existing two-row path. No production GEMV changes retained. |
+| Wider lookup blocks, lookup without a sidecar and Flash-Next DFlash2 | Not retained. Wider blocks need independently qualified decode arithmetic and recurrent rollback beyond eight rows; the AR-only path currently has no speculative reserve. The available DFlash2 fork still needs an audit of its exported proposal probabilities and restore/batch fallback before a lossless port. These are separate implementation projects, not enabled features. |
+
+Matched serving gains are modest: about 1–2.5% for copying and flat ordinary
+coding/thinking. See [the focused comparison and quality limits](QUALITY.md#exact-sampled-decode-october-21-2026).
 
 ## Mid-size prefill passes (October 21, 2026)
 

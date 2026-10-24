@@ -1,29 +1,10 @@
 # Qwen3.8 Flash-Next benchmarks
 
-AMD Strix Halo `gfx1151`, 128 GB unified memory. Unsloth `UD-Q4_K_XL` target and
-shared-Q8_0 MTP sidecar; Gufo uses adaptive MTP. HTTP, greedy, thinking off.
-All Gufo tables measured October 18, 2026, with `fec4759d` and the
-validated host-memory and cache-stall fixes.
-Reference results remain unchanged from September 22–23.
-llama.cpp uses `b11069` for AR and `6fcaa16f` for MTP.
-
-Positive gain favors Gufo.
+AMD Strix Halo `gfx1151`, 128 GB unified memory. Unsloth `UD-Q4_K_XL` target
+with shared-Q8_0 MTP; adaptive drafting. HTTP, greedy, thinking off.
+Gufo `fec4759d` (October 18, 2026); llama.cpp `b11069` AR and `6fcaa16f` MTP
+(September 22–23). Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md#benchmark-method) · [Model identities](artifacts/model-identities.json)
-
-Gufo numerical regression checks pass; individual functional timing limits
-remain documented in [QUALITY.md](QUALITY.md). Historical llama.cpp MTP values are retained as requested:
-a separate check of that pin did not match its own AR output, so this review
-does not requalify those comparisons. [Review evidence](artifacts/decode-kernels-review.json).
-
-At 128K, Gufo reaches 1557.18 tok/s AR prefill and 1481.19 tok/s MTP prefill.
-All 24 single-user rows match the previous qualified capture in completion
-hashes and prompt/cache counts.
-All 63 concurrent tg128 completions match the corresponding C1 AR control.
-Repetitive MTP through 64K reports mean ± sample standard deviation across
-the sweep and one focused repeat. Initial PP dips at 16K/32K/64K did not
-repeat against current main; both observations remain included.
-Prior mixed MTP C2 repeats show two draft-controller trajectories (about 54
-and 60 tok/s, identical text), so its gain is not entirely attributable to lookup.
 
 ## Single user, autoregressive
 

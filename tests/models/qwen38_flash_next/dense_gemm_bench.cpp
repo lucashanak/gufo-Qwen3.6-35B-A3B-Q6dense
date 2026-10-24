@@ -306,10 +306,10 @@ int main(int argc, char** argv) try {
   }
 
   // BF16 indexer projections (query 512 x 2560, key 128 x 2560, and a TP2
-  // rank's halves): the library kernel against BlasLt::Gemm, which runs
-  // DenseBf16Gemm. Timed at the requested tokens; prints the largest
-  // difference from the library, and every token count up to the requested
-  // one must reproduce the full launch's rows bitwise.
+  // rank's halves): the library kernel against BlasLt::Gemm's own kernel,
+  // which sums every token in K order. Timed at the requested tokens; the two
+  // agree to rounding, and the own kernel's rows must not depend on where a
+  // token sits in the batch or on the launch width.
   {
     std::string error;
     auto blas = q::BlasLt::Create(nullptr, &error);
@@ -359,28 +359,51 @@ int main(int argc, char** argv) try {
       std::printf("%s-own", name);
       report("", MedianMs([&] { own(t); }, reps), 2.0 * tokens * m * k,
              Hash(y_own, bytes));
-      const auto full_lib = host(y_lib, std::size_t{tokens} * m);
-      const auto full_own = host(y_own, std::size_t{tokens} * m);
+      if (!q::BlasLt::RowIndependent(HIP_R_16BF, k))
+        throw std::runtime_error(std::string(name) + " runs the library");
+      lib(t);
+      own(t);
+      CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
+      const std::size_t count = std::size_t{static_cast<unsigned>(t)} * m;
+      const auto library = host(y_lib, count);
+      const auto whole = host(y_own, count);
       double worst = 0.0;
-      for (std::size_t i = 0; i < full_own.size(); ++i)
-        worst = std::max(
-            worst,
-            std::abs(static_cast<double>(full_own[i]) - full_lib[i]) /
-                std::max(1.0, std::abs(static_cast<double>(full_lib[i]))));
+      for (std::size_t i = 0; i < count; ++i)
+        worst = std::max(worst, std::abs(double{library[i]} - whole[i]));
+      // The same rows at other offsets and batch widths.
+      int moved = 0;
+      for (const int offset : {1, 31, 37, 128, 777}) {
+        if (offset >= t)
+          continue;
+        const int n = t - offset;
+        if (!blas->Gemm(
+                w, static_cast<std::uint16_t*>(x) + std::size_t(offset) * k,
+                y_own, HIP_R_16BF, m, n, k, &error))
+          throw std::runtime_error(error);
+        CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
+        const auto part =
+            host(y_own, std::size_t{static_cast<unsigned>(n)} * m);
+        if (std::memcmp(part.data(), whole.data() + std::size_t(offset) * m,
+                        part.size() * 4) != 0) {
+          ++moved;
+          std::printf("%s offset %d DIFF\n", name, offset);
+        }
+      }
       int differ = 0;
       for (int n = 1; n <= t; n += n < 160 ? 1 : 97) {
         own(n);
         CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
         const auto b = host(y_own, std::size_t{static_cast<unsigned>(n)} * m);
-        if (std::memcmp(b.data(), full_own.data(), b.size() * 4) != 0) {
+        if (std::memcmp(b.data(), whole.data(), b.size() * 4) != 0) {
           if (++differ <= 10)
             std::printf("%s n %d DIFF\n", name, n);
         }
       }
       std::printf(
-          "%s: worst relative difference from the library %.3g; widths "
-          "1..%d differing from the full launch: %d\n",
-          name, worst, t, differ);
+          "%s n %d: max |own - library| %.3g; rows changed with their "
+          "batch offset at %d of 5 offsets; widths 1..%d differing from the "
+          "full launch: %d\n",
+          name, t, worst, moved, t, differ);
       for (void* p : {static_cast<void*>(w), static_cast<void*>(x),
                       static_cast<void*>(y_lib), static_cast<void*>(y_own)})
         CheckHip(hipFree(p), "hipFree");
