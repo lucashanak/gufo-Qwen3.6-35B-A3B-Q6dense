@@ -111,40 +111,51 @@ namespace {
  * hipMallocAsync/hipFreeAsync, whose reuse of a just-freed block raced with
  * in-flight kernels on this ROCm and made prefill logits nondeterministic. */
 struct q36_stack_pool : public ggml_hip_pool {
+    struct chunk {
+        char *base;
+        size_t capacity;
+        size_t top;
+    };
+
     int device;
-    char *base = nullptr;
-    size_t capacity = 0;
-    size_t top = 0;
+    std::vector<chunk> chunks;
+    size_t cur = 0;
     std::vector<std::pair<char *, size_t>> live;
 
     explicit q36_stack_pool(int device) : device(device) {}
 
     ~q36_stack_pool() override {
-        if (base) (void)hipFree(base);
+        for (const chunk &c : chunks) (void)hipFree(c.base);
     }
 
-    void reserve(size_t bytes) {
-        if (bytes <= capacity) return;
-        /* Growing invalidates outstanding pointers, so it only happens while
-         * nothing is live; the arena starts generous to keep that true. */
-        if (top != 0) {
-            fprintf(stderr, "q36_stack_pool: arena exhausted with live allocations\n");
-            abort();
-        }
-        (void)hipDeviceSynchronize();
-        if (base) (void)hipFree(base);
-        size_t next = capacity ? capacity : (size_t) 256 << 20;
-        while (next < bytes) next *= 2;
-        HIP_CHECK(hipMalloc((void **) &base, next));
-        capacity = next;
-    }
-
+    /* Captured decode graphs keep the scratch addresses they were recorded with,
+     * so no chunk is ever freed or moved. A request that does not fit continues
+     * in the next chunk, adding one when none is left; a drained pool starts
+     * again at the first chunk, at the addresses it had before. */
     void * alloc(size_t size, size_t * actual_size) override {
         ggml_hip_set_device(device);
         const size_t aligned = (size + 255) & ~(size_t) 255;
-        if (top + aligned > capacity) reserve(top + aligned);
-        char *ptr = base + top;
-        top += aligned;
+        while (chunks.empty() || chunks[cur].top + aligned > chunks[cur].capacity) {
+            if (!chunks.empty() && cur + 1 < chunks.size()) {
+                ++cur;
+                continue;
+            }
+            size_t total = 0;
+            for (const chunk &c : chunks) total += c.capacity;
+            size_t next = total ? total : (size_t) 256 << 20;
+            while (next < aligned) next *= 2;
+            char *base = nullptr;
+            HIP_CHECK(hipMalloc((void **) &base, next));
+            chunks.push_back({base, next, 0});
+            cur = chunks.size() - 1;
+            if (cur > 0) {
+                fprintf(stderr, "q36_stack_pool: added a %zu MiB scratch chunk (%zu MiB in total)\n", next >> 20,
+                        (total + next) >> 20);
+            }
+        }
+        chunk &c = chunks[cur];
+        char *ptr = c.base + c.top;
+        c.top += aligned;
         live.emplace_back(ptr, aligned);
         if (actual_size) *actual_size = aligned;
         return ptr;
@@ -156,8 +167,12 @@ struct q36_stack_pool : public ggml_hip_pool {
             fprintf(stderr, "q36_stack_pool: non-LIFO free\n");
             abort();
         }
-        top -= live.back().second;
+        char *p = static_cast<char *>(ptr);
+        size_t i = cur;
+        while (i > 0 && (p < chunks[i].base || p >= chunks[i].base + chunks[i].capacity)) --i;
+        chunks[i].top -= live.back().second;
         live.pop_back();
+        while (cur > 0 && chunks[cur].top == 0) --cur;
     }
 };
 
