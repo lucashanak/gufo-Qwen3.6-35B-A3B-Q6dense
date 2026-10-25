@@ -359,7 +359,7 @@ void CheckDecode(std::uint32_t start_pos, std::uint32_t seed) {
   HipBuffer<float> d_q(q_count), d_out(q_count);
   HipBuffer<__half> d_k(kv_count), d_v(kv_count);
   HipBuffer<std::int8_t> d_kq(kv_count + 64), d_vq(kv_count + 64);
-  HipBuffer<__half> d_ks(kv_count / 32 + 8), d_vs(kv_count / 32 + 8);
+  HipBuffer<__half> d_ks(kv_count / 16 + 8), d_vs(kv_count / 16 + 8);
   HipBuffer<std::uint32_t> d_pos(1);
   Upload(&d_q, qv);
   Upload(&d_k, kh);
@@ -382,7 +382,7 @@ void CheckDecode(std::uint32_t start_pos, std::uint32_t seed) {
                 d_pos.get(), nullptr);
   CheckHip(hipDeviceSynchronize(), "KV8 quantization");
   std::vector<std::int8_t> kq(kv_count + 64), vq(kv_count + 64);
-  std::vector<__half> ks(kv_count / 32), vs(kv_count / 32);
+  std::vector<__half> ks(kv_count / 16), vs(kv_count / 16);
   CheckHip(hipMemcpy(kq.data(), d_kq.get(), kq.size(), hipMemcpyDeviceToHost),
            "KV8 keys");
   CheckHip(hipMemcpy(vq.data(), d_vq.get(), vq.size(), hipMemcpyDeviceToHost),
@@ -400,7 +400,7 @@ void CheckDecode(std::uint32_t start_pos, std::uint32_t seed) {
     const auto check = [&](const std::vector<__half>& f16,
                            const std::vector<std::int8_t>& q8,
                            const std::vector<__half>& scales) {
-      const double step = __half2float(scales[i / 32]);
+      const double step = __half2float(scales[i / 16]);
       const double x = __half2float(f16[i]);
       if (std::abs(q8[i] * step - x) > 0.5 * step + 1e-3 * std::abs(x) + 1e-7)
         throw std::runtime_error("KV8 value outside half a quantization step");
@@ -414,10 +414,10 @@ void CheckDecode(std::uint32_t start_pos, std::uint32_t seed) {
     const std::vector<__half>& ks;
     const std::vector<__half>& vs;
     double Key(std::size_t i) const {
-      return kq[i] * double(__half2float(ks[i / 32]));
+      return kq[i] * double(__half2float(ks[i / 16]));
     }
     double Value(std::size_t i) const {
-      return vq[i] * double(__half2float(vs[i / 32]));
+      return vq[i] * double(__half2float(vs[i / 16]));
     }
   };
   const q::KvQ8 kv{d_kq.get(), d_vq.get(), d_ks.get(), d_vs.get()};
