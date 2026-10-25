@@ -240,6 +240,10 @@ void CheckAttentionProjection(
     actual[i] = buffers.Make(bytes);
   }
   auto* position = static_cast<std::uint32_t*>(buffers.Make(4));
+  // F16 K/V staging rows the fused projection quantizes into the caches.
+  __half* rows[2] = {
+      static_cast<__half*>(buffers.Make(std::size_t(batch) * 512 * 2)),
+      static_cast<__half*>(buffers.Make(std::size_t(batch) * 512 * 2))};
   CheckHip(hipMemcpy(position, &start, 4, hipMemcpyHostToDevice),
            "attention position");
   std::vector<float> gamma(512);
@@ -274,8 +278,9 @@ void CheckAttentionProjection(
                            static_cast<float*>(actual[0]) + 8,
                            static_cast<float*>(actual[1]) + 8,
                            static_cast<std::uint8_t*>(actual[2]) + 16,
-                           static_cast<std::uint8_t*>(actual[3]) + 16, batch,
-                           position, 1e7F, 1e-6F, stream, vision.rope(), yarn))
+                           static_cast<std::uint8_t*>(actual[3]) + 16, rows[0],
+                           rows[1], batch, position, 1e7F, 1e-6F, stream,
+                           vision.rope(), yarn))
     throw std::runtime_error("attention fusion rejected the model shape");
   CheckHip(hipStreamEndCapture(stream, &graph), "attention capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
@@ -306,8 +311,9 @@ void CheckAttentionProjection(
                           static_cast<float*>(actual[0]) + 8,
                           static_cast<float*>(actual[1]) + 8,
                           static_cast<std::uint8_t*>(actual[2]) + 16,
-                          static_cast<std::uint8_t*>(actual[3]) + 16, 0,
-                          position, 1e7F, 1e-6F, nullptr, nullptr, yarn))
+                          static_cast<std::uint8_t*>(actual[3]) + 16, rows[0],
+                          rows[1], 0, position, 1e7F, 1e-6F, nullptr, nullptr,
+                          yarn))
     throw std::runtime_error("attention fusion accepted an empty batch");
   CheckHip(hipGraphExecDestroy(replay), "attention graph free");
   CheckHip(hipGraphDestroy(graph), "attention graph definition free");

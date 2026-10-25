@@ -2622,7 +2622,8 @@ __global__ void RopeKernel(float* x, std::uint32_t heads, std::uint32_t d,
   }
 }
 
-__global__ void StoreKvKernel(const float* src, std::uint8_t* cache,
+template<typename T>
+__global__ void StoreKvKernel(const T* src, std::uint8_t* cache,
                               std::uint32_t row_dim,
                               const std::uint32_t* start_pos) {
   const std::uint32_t t = blockIdx.x;
@@ -2630,7 +2631,9 @@ __global__ void StoreKvKernel(const float* src, std::uint8_t* cache,
       cache + static_cast<std::size_t>(*start_pos + t) * KvRowBytes(row_dim);
   // row_dim is a multiple of 16: a lane group is always wholly inside.
   for (std::uint32_t i = threadIdx.x; i < row_dim; i += blockDim.x) {
-    StoreKv8(row, row_dim, i, src[static_cast<std::size_t>(t) * row_dim + i]);
+    StoreKv8(
+        row, row_dim, i,
+        static_cast<float>(src[static_cast<std::size_t>(t) * row_dim + i]));
   }
 }
 
@@ -4552,8 +4555,6 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   // registers as loaded (codes plus their block scale) and widen to F16 when
   // staged, so the prefetch keeps its distance.
   constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (256 * 8);
-  constexpr std::uint32_t kKRegs = (kKeys * (kHeadDim / 8)) / 256;
-  static_assert(kKRegs * 256 == kKeys * (kHeadDim / 8), "K stages evenly");
   static_assert(kVRegs * 8 == kKvBlock, "a V slice is one scale block");
   constexpr std::size_t kRowBytes = KvRowBytes(kWmmaKvWidth);
   const std::uint32_t v_key = lane % kKeys;
@@ -4564,9 +4565,12 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     uint4 codes;
     __half scale;
   };
+  // A thread loads one whole scale block of K (16 codes, one scale): half
+  // the loads of an eight-code split.
+  static_assert(kKeys * (kHeadDim / kKvBlock) == 256, "one K block a thread");
   struct KRegs {
-    uint2 codes[kKRegs];
-    __half scale[kKRegs];
+    uint4 codes;
+    __half scale;
   };
 
   const auto load_v = [&](const Tile& tile, VRegs& dst) {
@@ -4579,32 +4583,26 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
                      : make_uint4(0u, 0u, 0u, 0u);
     dst.scale = live ? KvScale(row, kWmmaKvWidth, v_col) : __half{};
   };
-  // Coalesced: a wave reads one key row's 256 contiguous codes.
+  // Coalesced: half a wave reads one key row's 256 contiguous codes.
+  const std::uint32_t k_row = tid / (kHeadDim / kKvBlock);
+  const std::uint32_t k_dim = (tid % (kHeadDim / kKvBlock)) * kKvBlock;
   const auto load_k = [&](const Tile& tile, KRegs& dst) {
-#pragma unroll
-    for (std::uint32_t n = 0; n < kKRegs; ++n) {
-      const std::uint32_t idx = tid + (n * 256);
-      const std::uint32_t key_position = tile_key(tile, idx / (kHeadDim / 8));
-      const std::uint32_t col = k_col + ((idx % (kHeadDim / 8)) * 8);
-      const bool live = key_position < context_end;
-      const std::uint8_t* row =
-          k_cache +
-          (static_cast<std::size_t>(live ? key_position : 0) * kRowBytes);
-      dst.codes[n] = live ? *reinterpret_cast<const uint2*>(row + col)
-                          : make_uint2(0u, 0u);
-      dst.scale[n] = live ? KvScale(row, kWmmaKvWidth, col) : __half{};
-    }
+    const std::uint32_t key_position = tile_key(tile, k_row);
+    const bool live = key_position < context_end;
+    const std::uint8_t* row =
+        k_cache +
+        (static_cast<std::size_t>(live ? key_position : 0) * kRowBytes);
+    dst.codes = live ? *reinterpret_cast<const uint4*>(row + k_col + k_dim)
+                     : make_uint4(0u, 0u, 0u, 0u);
+    dst.scale = live ? KvScale(row, kWmmaKvWidth, k_col + k_dim) : __half{};
   };
 
   const auto stage_k = [&](const KRegs& regs) {
-#pragma unroll
-    for (std::uint32_t n = 0; n < kKRegs; ++n) {
-      const std::uint32_t idx = tid + (n * 256);
-      const std::uint32_t key_row = idx / (kHeadDim / 8);
-      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
-      *reinterpret_cast<uint4*>(&k_lds[(key_row * kWmmaKStride) + d8]) =
-          DequantKv8(regs.codes[n], regs.scale[n]);
-    }
+    auto* dst = &k_lds[(k_row * kWmmaKStride) + k_dim];
+    reinterpret_cast<uint4*>(dst)[0] =
+        DequantKv8(make_uint2(regs.codes.x, regs.codes.y), regs.scale);
+    reinterpret_cast<uint4*>(dst)[1] =
+        DequantKv8(make_uint2(regs.codes.z, regs.codes.w), regs.scale);
   };
   const auto stage_v = [&](const VRegs& raw) {
     const uint4 regs[kVRegs] = {
@@ -8231,8 +8229,8 @@ struct AttentionProjectionOutput {
   const float* k_gamma;
   float* query;
   float* gate;
-  std::uint8_t* keys;  ///< 8-bit cache rows (see kKvBlock)
-  std::uint8_t* values;
+  __half* keys;  ///< F16 rows [token][512], quantized into the cache after
+  __half* values;
   const std::uint32_t* position;
   float theta;
   float eps;
@@ -8630,10 +8628,6 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
             v[0] = lo;
             v[1] = hi;
           }
-          // A scale block is the 16 lanes of one half-wave at one c.
-          std::uint8_t* kv_row =
-              (key ? attention.keys : attention.values) +
-              std::size_t(*attention.position + tok) * KvRowBytes(kvwidth);
 #pragma unroll
           for (unsigned c = 0; c < 8; ++c) {
             const unsigned col = c * 32 + lane_id;
@@ -8641,8 +8635,12 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
               attention.query[tok * width + head * dim + col] = v[c];
             else if (gate)
               attention.gate[tok * width + head * dim + col] = v[c];
+            else if (key)
+              attention.keys[tok * kvwidth + head * dim + col] =
+                  __float2half_rn(v[c]);
             else
-              StoreKv8(kv_row, kvwidth, head * dim + col, v[c]);
+              attention.values[tok * kvwidth + head * dim + col] =
+                  __float2half_rn(v[c]);
           }
         }
       }
@@ -8858,6 +8856,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
                       float* gate, std::uint8_t* keys, std::uint8_t* values,
+                      __half* key_rows, __half* value_rows,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope,
@@ -8865,11 +8864,19 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
   if (n_tokens == 0 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
-      position == nullptr)
+      key_rows == nullptr || value_rows == nullptr || position == nullptr)
     return false;
-  const AttentionProjectionOutput output{q_gamma, k_gamma, query,    gate,
-                                         keys,    values,  position, theta,
-                                         eps,     rope,    yarn};
+  // The epilogue writes F16 K/V rows; quantizing them in the GEMM's epilogue
+  // tripled its time. StoreKv rounds each value to the same F16 first.
+  const AttentionProjectionOutput output{q_gamma,  k_gamma,    query,    gate,
+                                         key_rows, value_rows, position, theta,
+                                         eps,      rope,       yarn};
+  const auto quantize = [&] {
+    hipLaunchKernelGGL(StoreKvKernel<__half>, dim3(n_tokens), dim3(kThreads), 0,
+                       stream, key_rows, keys, 512U, position);
+    hipLaunchKernelGGL(StoreKvKernel<__half>, dim3(n_tokens), dim3(kThreads), 0,
+                       stream, value_rows, values, 512U, position);
+  };
   // One 256-row tile per query, gate, key or value head (52). Four row
   // tiles per token tile in launch order share each activation tile's read
   // (8.8 to 7.9 ms at 4,096 tokens). One K block per LDS stage halves the
@@ -8881,6 +8888,7 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                        dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0,
                        stream, weights, input, nullptr, n_tokens, 13312, 2560,
                        nullptr, nullptr, nullptr, nullptr, nullptr, output);
+    quantize();
     return true;
   }
   hipLaunchKernelGGL(
@@ -8888,6 +8896,7 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
       input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr, nullptr,
       nullptr, output);
+  quantize();
   return true;
 }
 
@@ -9382,8 +9391,8 @@ void StoreKv(const float* src, std::uint8_t* cache, std::uint32_t n_tokens,
              hipStream_t stream) {
   if (row_dim % kKvBlock != 0)
     return;
-  hipLaunchKernelGGL(StoreKvKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
-                     src, cache, row_dim, start_pos);
+  hipLaunchKernelGGL(StoreKvKernel<float>, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, src, cache, row_dim, start_pos);
 }
 
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,

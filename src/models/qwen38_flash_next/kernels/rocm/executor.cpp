@@ -2799,8 +2799,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       prepared = AttentionF16Gemm(
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
           l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
-          s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope, yarn_);
+          s.k_cache, s.v_cache, reinterpret_cast<__half*>(s_.k),
+          reinterpret_cast<__half*>(s_.v), n_tokens, pos, c.rope_theta,
+          c.rms_eps, stream_, s.rope, yarn_);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;

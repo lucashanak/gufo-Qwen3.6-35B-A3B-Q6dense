@@ -263,7 +263,7 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
 
 /// Stacked Q8_0 QKV projection [13312,2560], head normalization and RoPE.
 /// Writes Q/gates in F32 and the 8-bit K/V caches, preserving separate
-/// rounding.
+/// rounding. `key_rows`/`value_rows` hold n_tokens x 512 F16 staging values.
 /// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
 /// Requires at least 1024 tokens; cache capacity must include position +
 /// tokens.
@@ -271,6 +271,7 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
                       float* gate, std::uint8_t* keys, std::uint8_t* values,
+                      __half* key_rows, __half* value_rows,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
