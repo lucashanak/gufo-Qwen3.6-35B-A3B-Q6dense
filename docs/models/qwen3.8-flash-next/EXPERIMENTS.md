@@ -1,5 +1,20 @@
 # Qwen3.8 Flash-Next experiments
 
+## 8-bit K/V and K/V that grows with the context (October 25, 2026)
+
+Quality evidence is in [QUALITY.md](QUALITY.md#8-bit-kv-cache-october-25-2026),
+memory and speed in [BENCHMARKS.md](BENCHMARKS.md#kv-memory-october-25-2026).
+
+| Experiment | Outcome |
+| --- | --- |
+| 8-bit K/V with an F16 scale per 16 values (Ornith's "KV-Q8 b16" format), replacing the F16 caches of the twelve attention layers and the draft layer | Retained. 576 instead of 1,024 bytes per row and K or V; 14,596 instead of 25,348 continuation bytes per target token. Writers round to F16 first, so the fused projection and `PrepareAttention` stay byte-identical; codes use an exact reciprocal-and-remainder rounding because fast-math division differs between kernels (a first `x / d` version mismatched the CPU format by one code). Readers see f16(scale × code), so FP64 checks apply to the dequantized cache. Ornith measured 32-value scale blocks at −4/149 IQ, 16 within noise; 16 here too. |
+| F32 dequantization (cvt, multiply, round to F16) | Replaced by a packed F16 form (sign-flipped byte under 0x64 is 1152 + code, one `v_pk_sub`, one `v_pk_mul`), byte-identical hashes in both attention benches: decode attention rows 8 at d32K 153.9 → 142.6 µs, prefill WMMA 4,096 tokens at d0/d32K/d118K 15.17/20.80/21.88 → 13.32/19.23/20.33 ms (F16 13.00/18.63/19.99). |
+| Quantizing in the fused QKV projection's GEMM epilogue | Rejected: tripled the kernel (727 → 2,108 ms over a 25.7K prefill, 8% of prefill). The epilogue again writes F16 rows to idle K/V scratch and two `StoreKv` launches quantize them (8 ms per 25.7K prefill); outputs byte-identical. |
+| Whole K scale blocks per thread in sparse WMMA attention | Retained: one 16-code load and one scale per thread instead of two of each; identical hashes; sparse call at d32K/d128K 40.2/70.5 → 39.1/68.9 ms in the model (F16 37.7/67.1). |
+| Widening the next tiles' rows before the phase barrier | Rejected: moving dequantization off the softmax phase made the sparse call slower (68.9 → 70.8 ms at d128K). |
+| Growable K/V via HIP virtual memory management | Retained. `tools/bench/vmm_probe.hip` on gfx1151/ROCm 7.2.4: VMM supported, 4 KiB granularity, a graph captured over 4 chunks reads chunks mapped after capture and after unmap/remap, 0.088 ms per 2 MiB create/map/access, read bandwidth equal to `hipMalloc` (242 GB/s over 512 MiB). Each session reserves full-context virtual ranges for its 39 K, V and pooled-key buffers and maps 2 MiB chunks (or the whole buffer when smaller) before a forward, MTP step or restore writes; addresses never move, so captured graphs and borrowed views stay valid. `--kv-cache-bytes` bounds the mapped total; a growth past it first releases rows idle sessions no longer hold (after their borrowers were preserved, as an overwrite would) and otherwise fails the request with "K/V memory exhausted" before any state changes. Startup claims fixed state plus an equal share of the budget per session. |
+| Draining the stream before each growth | Rejected: cost each prefill pass its host/GPU overlap (128K prefill 1,633 → 1,546 tok/s in one round); mapping beside rows queued work uses needs no drain. |
+
 ## Upstream 0.23.0 merge (October 24, 2026)
 
 Where upstream and this branch built the same thing, the merge keeps the side
