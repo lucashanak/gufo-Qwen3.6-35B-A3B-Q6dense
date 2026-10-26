@@ -364,6 +364,36 @@ template<> struct MoeFragment<GGML_TYPE_Q5_K> {
   }
 };
 
+/// warp_reduce_sum<32> over up to 32 sums at once (scatter_reduce_sum's
+/// pairs and operands, five levels deep): lane l finishes sum
+/// l >> (5 - levels), and every lane of that group holds the same bits.
+template<int n>
+static __device__ __forceinline__ float scatter_reduce_sum32(
+    const float (&v)[n], int lane) {
+  static_assert(n <= 32);
+  constexpr int levels = n <= 1   ? 0
+                         : n <= 2 ? 1
+                         : n <= 4 ? 2
+                         : n <= 8 ? 3
+                         : n <= 16 ? 4
+                                   : 5;
+  float s[1 << levels];
+#pragma unroll
+  for (int j = 0; j < (1 << levels); ++j)
+    s[j] = j < n ? v[j] : 0.0f;
+  if constexpr (levels >= 1) scatter_level<16, (1 << levels)>(s, lane);
+  else s[0] += xor_lane<16>(s[0]);
+  if constexpr (levels >= 2) scatter_level<8, (1 << levels) / 2>(s, lane);
+  else s[0] += xor_lane<8>(s[0]);
+  if constexpr (levels >= 3) scatter_level<4, (1 << levels) / 4>(s, lane);
+  else s[0] += xor_lane<4>(s[0]);
+  if constexpr (levels >= 4) scatter_level<2, (1 << levels) / 8>(s, lane);
+  else s[0] += xor_lane<2>(s[0]);
+  if constexpr (levels >= 5) scatter_level<1, 2>(s, lane);
+  else s[0] += xor_lane<1>(s[0]);
+  return s[0];
+}
+
 template<ggml_type type, int c_rows_per_block, bool gated = false>
 __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
                   1) static __global__
@@ -432,6 +462,23 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
         }
     }
 
+    if constexpr (!gated && c_rows_per_block > 1) {
+      // One scatter butterfly for the wave's rows (scatter_reduce_sum32:
+      // the same bits as reducing each row on every lane).
+      constexpr int shift = 5 - (c_rows_per_block <= 2   ? 1
+                                 : c_rows_per_block <= 4 ? 2
+                                 : c_rows_per_block <= 8 ? 3
+                                 : c_rows_per_block <= 16 ? 4
+                                                          : 5);
+      const float value = scatter_reduce_sum32(tmp, threadIdx.x);
+      const int i = threadIdx.x >> shift;
+      if ((threadIdx.x & ((1 << shift) - 1)) == 0 && i < c_rows_per_block &&
+          uint32_t(row0 + i) < nrows_x)
+        dst[channel_dst * stride_channel_dst + dst_token * stride_col_dst +
+            row0 + i] = isfinite(value) ? value : 0.0f;
+      return;
+    }
+
     // Warp-level reduction only - no shared memory needed
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
@@ -466,35 +513,6 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
     }
 }
 
-/// warp_reduce_sum<32> over up to 32 sums at once (scatter_reduce_sum's
-/// pairs and operands, five levels deep): lane l finishes sum
-/// l >> (5 - levels), and every lane of that group holds the same bits.
-template<int n>
-static __device__ __forceinline__ float scatter_reduce_sum32(
-    const float (&v)[n], int lane) {
-  static_assert(n <= 32);
-  constexpr int levels = n <= 1   ? 0
-                         : n <= 2 ? 1
-                         : n <= 4 ? 2
-                         : n <= 8 ? 3
-                         : n <= 16 ? 4
-                                   : 5;
-  float s[1 << levels];
-#pragma unroll
-  for (int j = 0; j < (1 << levels); ++j)
-    s[j] = j < n ? v[j] : 0.0f;
-  if constexpr (levels >= 1) scatter_level<16, (1 << levels)>(s, lane);
-  else s[0] += xor_lane<16>(s[0]);
-  if constexpr (levels >= 2) scatter_level<8, (1 << levels) / 2>(s, lane);
-  else s[0] += xor_lane<8>(s[0]);
-  if constexpr (levels >= 3) scatter_level<4, (1 << levels) / 4>(s, lane);
-  else s[0] += xor_lane<4>(s[0]);
-  if constexpr (levels >= 4) scatter_level<2, (1 << levels) / 8>(s, lane);
-  else s[0] += xor_lane<2>(s[0]);
-  if constexpr (levels >= 5) scatter_level<1, 2>(s, lane);
-  else s[0] += xor_lane<1>(s[0]);
-  return s[0];
-}
 
 /// A dense K-quant projection for 1-16 tokens: every wave computes its rows for
 /// all tokens, so the weights are read from memory once and from cache for
