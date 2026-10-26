@@ -1890,6 +1890,13 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       if (session.AppendLookup(p, requests[i].stop_at_eos))
         continue;
       if (GateStops(p)) {
+        if (batch_drafts && !p.sampled &&
+            p.draft_confidence < kMtpBatchDropProbability) {
+          // Without proposals left the anchor decodes as an ordinary step;
+          // the catch-up already wrote its predictor row.
+          p.chain.pop_back();
+          p.speculative = p.chain.size() > 1;
+        }
         p.width = p.chain.size();
         continue;
       }
