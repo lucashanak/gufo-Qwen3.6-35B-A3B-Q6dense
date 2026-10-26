@@ -9082,9 +9082,23 @@ void SmallGemmForType(const void* w, const float* x, float* out,
                       hipStream_t stream) {
   if (tokens > 8) {
     const auto groups = tokens / 8;
-    hipLaunchKernelGGL((SmallGemmKernel<type, 8, true>),
-                       dim3((m + kSmallGemmRows - 1) / kSmallGemmRows, groups),
-                       dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+    const dim3 grid((m + kSmallGemmRows - 1) / kSmallGemmRows, groups);
+    // Whole four-step passes take the vector loads, as LaunchSmallGemm's.
+    bool whole = false;
+    if constexpr (type != WeightType::kQ8_0)
+      whole = (reinterpret_cast<std::uintptr_t>(w) |
+               reinterpret_cast<std::uintptr_t>(x)) %
+                      16 ==
+                  0 &&
+              k % (32 * 4 * 4) == 0;
+    if (whole)
+      hipLaunchKernelGGL((SmallGemmKernel<type, 8, true, true>), grid,
+                         dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m,
+                         k);
+    else
+      hipLaunchKernelGGL((SmallGemmKernel<type, 8, true>), grid,
+                         dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m,
+                         k);
     const auto consumed = groups * 8;
     x += std::size_t{consumed} * k;
     out += std::size_t{consumed} * m;
