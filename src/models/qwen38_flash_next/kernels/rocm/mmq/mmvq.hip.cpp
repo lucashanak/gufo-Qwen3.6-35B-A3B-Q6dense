@@ -466,6 +466,36 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
     }
 }
 
+/// warp_reduce_sum<32> over up to 32 sums at once (scatter_reduce_sum's
+/// pairs and operands, five levels deep): lane l finishes sum
+/// l >> (5 - levels), and every lane of that group holds the same bits.
+template<int n>
+static __device__ __forceinline__ float scatter_reduce_sum32(
+    const float (&v)[n], int lane) {
+  static_assert(n <= 32);
+  constexpr int levels = n <= 1   ? 0
+                         : n <= 2 ? 1
+                         : n <= 4 ? 2
+                         : n <= 8 ? 3
+                         : n <= 16 ? 4
+                                   : 5;
+  float s[1 << levels];
+#pragma unroll
+  for (int j = 0; j < (1 << levels); ++j)
+    s[j] = j < n ? v[j] : 0.0f;
+  if constexpr (levels >= 1) scatter_level<16, (1 << levels)>(s, lane);
+  else s[0] += xor_lane<16>(s[0]);
+  if constexpr (levels >= 2) scatter_level<8, (1 << levels) / 2>(s, lane);
+  else s[0] += xor_lane<8>(s[0]);
+  if constexpr (levels >= 3) scatter_level<4, (1 << levels) / 4>(s, lane);
+  else s[0] += xor_lane<4>(s[0]);
+  if constexpr (levels >= 4) scatter_level<2, (1 << levels) / 8>(s, lane);
+  else s[0] += xor_lane<2>(s[0]);
+  if constexpr (levels >= 5) scatter_level<1, 2>(s, lane);
+  else s[0] += xor_lane<1>(s[0]);
+  return s[0];
+}
+
 /// A dense K-quant projection for 1-16 tokens: every wave computes its rows for
 /// all tokens, so the weights are read from memory once and from cache for
 /// the later tokens. Each token's sum follows mul_mat_vec_q_moe's lane and
@@ -505,6 +535,32 @@ __launch_bounds__(32, 1) static __global__
                                    row_offsets[i] + kbx, kqs);
       }
     }
+  }
+  if constexpr (tokens * c_rows_per_block > 1 &&
+                tokens * c_rows_per_block <= 32) {
+    // One scatter butterfly for every sum (scatter_reduce_sum32: the same
+    // bits as reducing each sum on every lane).
+    constexpr int n = tokens * c_rows_per_block;
+    float sums[n];
+#pragma unroll
+    for (int j = 0; j < tokens; ++j)
+#pragma unroll
+      for (int i = 0; i < c_rows_per_block; ++i)
+        sums[j * c_rows_per_block + i] = tmp[j][i];
+    constexpr int shift = 5 - (n <= 2    ? 1
+                               : n <= 4  ? 2
+                               : n <= 8  ? 3
+                               : n <= 16 ? 4
+                                         : 5);
+    const int lane = threadIdx.x;
+    const float value = scatter_reduce_sum32(sums, lane);
+    const int index = lane >> shift;
+    const int j = index / c_rows_per_block;
+    const int i = index % c_rows_per_block;
+    if ((lane & ((1 << shift) - 1)) == 0 && index < n &&
+        uint32_t(row0 + i) < nrows_x)
+      dst[j * stride_col_dst + row0 + i] = isfinite(value) ? value : 0.0f;
+    return;
   }
 #pragma unroll
   for (int j = 0; j < tokens; ++j) {
@@ -690,35 +746,6 @@ struct KHeadFragment {
   }
 };
 
-/// warp_reduce_sum<32> over up to 32 sums at once (scatter_reduce_sum's
-/// pairs and operands, five levels deep): lane l finishes sum
-/// l >> (5 - levels), and every lane of that group holds the same bits.
-template<int n>
-static __device__ __forceinline__ float scatter_reduce_sum32(
-    const float (&v)[n], int lane) {
-  static_assert(n <= 32);
-  constexpr int levels = n <= 1   ? 0
-                         : n <= 2 ? 1
-                         : n <= 4 ? 2
-                         : n <= 8 ? 3
-                         : n <= 16 ? 4
-                                   : 5;
-  float s[1 << levels];
-#pragma unroll
-  for (int j = 0; j < (1 << levels); ++j)
-    s[j] = j < n ? v[j] : 0.0f;
-  if constexpr (levels >= 1) scatter_level<16, (1 << levels)>(s, lane);
-  else s[0] += xor_lane<16>(s[0]);
-  if constexpr (levels >= 2) scatter_level<8, (1 << levels) / 2>(s, lane);
-  else s[0] += xor_lane<8>(s[0]);
-  if constexpr (levels >= 3) scatter_level<4, (1 << levels) / 4>(s, lane);
-  else s[0] += xor_lane<4>(s[0]);
-  if constexpr (levels >= 4) scatter_level<2, (1 << levels) / 8>(s, lane);
-  else s[0] += xor_lane<2>(s[0]);
-  if constexpr (levels >= 5) scatter_level<1, 2>(s, lane);
-  else s[0] += xor_lane<1>(s[0]);
-  return s[0];
-}
 
 /// mul_mat_vec_dense_kq for Q4_K/Q5_K rows and 2-16 tokens (the output
 /// head's verification and batched draft rows, batched decode). Each wave decodes `c_rows` rows'
@@ -937,6 +964,32 @@ __launch_bounds__(32 * waves, 1) static __global__
                                    row_offsets[i] + kbx, kqs);
       }
     }
+  }
+  if constexpr (tokens * c_rows_per_block <= 32) {
+    // One scatter butterfly for every sum (scatter_reduce_sum32: the same
+    // bits as reducing each sum on every lane).
+    constexpr int n = tokens * c_rows_per_block;
+    float sums[n];
+#pragma unroll
+    for (int j = 0; j < tokens; ++j)
+#pragma unroll
+      for (int i = 0; i < c_rows_per_block; ++i)
+        sums[j * c_rows_per_block + i] = tmp[j][i];
+    constexpr int shift = 5 - (n <= 1    ? 0
+                               : n <= 2  ? 1
+                               : n <= 4  ? 2
+                               : n <= 8  ? 3
+                               : n <= 16 ? 4
+                                         : 5);
+    const float value = scatter_reduce_sum32(sums, lane);
+    const int index = lane >> shift;
+    const int j = index / c_rows_per_block;
+    const int i = index % c_rows_per_block;
+    if ((lane & ((1 << shift) - 1)) == 0 && index < n && t0 + j <= last &&
+        uint32_t(row0 + i) < nrows_x)
+      dst[(t0 + j) * stride_col_dst + row0 + i] =
+          isfinite(value) ? value : 0.0f;
+    return;
   }
 #pragma unroll
   for (int j = 0; j < tokens; ++j) {
