@@ -131,7 +131,7 @@ void TestRequestLogging() {
   assert(log.find("escaped\\x0a\\x1b[31m") != std::string::npos);
   // The startup confirmation is INFO-tier, so the default level reports it.
   // TestQuietTiersSuppressLifecycle covers the tiers that do not.
-  assert(log.find("event=listening") != std::string::npos);
+  assert(log.find("event=listening monotonic_us=") != std::string::npos);
 
   const CapturedLogs debug = CaptureTraffic(LogLevel::kDebug);
   assert(debug.text.find("[DEBUG]") != std::string::npos);
@@ -991,6 +991,14 @@ void TestCompatibilityRequests() {
   assert(request.response_format && request.reasoning.enabled == false &&
          request.messages.back().images.size() == 1 &&
          request.messages.back().images[0].offset == 8);
+
+  // Only detail "low" reaches the backend as a resolution bound.
+  response_body(server.Post("/v1/responses",
+                            R"({"input":[{"role":"user","content":[
+        {"type":"input_text","text":"describe"},
+        {"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"low"}]}]})"));
+  assert(server.backend->LastCall().chat.messages.back().images[0].detail ==
+         gufo::tokenization::ChatMessage::ImageDetail::kLow);
 
   const auto response = response_body(server.Post(
       "/v1/responses",
@@ -2865,6 +2873,7 @@ std::shared_ptr<gufo::server::EmbeddingService> MakeEmbeddingService(
           .model_id = "embedding-test",
           .runner =
               [](const std::vector<gufo::server::EmbeddingInput>& texts,
+                 const gufo::server::EmbeddingRequestOptions&,
                  EmbeddingBatch* batch, std::string*) {
                 for (const auto& text : texts) {
                   batch->embeddings.push_back({1.0F, 0.0F});
@@ -2879,12 +2888,13 @@ std::shared_ptr<gufo::server::EmbeddingService> MakeEmbeddingService(
 }
 
 std::string EmbeddingPost(int port, std::string_view body,
-                          std::string_view extra_headers = {}) {
-  return SendParts(
-      "127.0.0.1", port,
-      {"POST /v1/embeddings HTTP/1.1\r\n" + std::string(extra_headers) +
-       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
-       std::string(body)});
+                          std::string_view extra_headers = {},
+                          std::string_view path = "/v1/embeddings") {
+  return SendParts("127.0.0.1", port,
+                   {"POST " + std::string(path) + " HTTP/1.1\r\n" +
+                    std::string(extra_headers) +
+                    "Content-Length: " + std::to_string(body.size()) +
+                    "\r\n\r\n" + std::string(body)});
 }
 
 void TestEmbeddingService() {
@@ -2912,6 +2922,16 @@ void TestEmbeddingService() {
     assert(response.find("\"embedding\":[1,0]") != std::string::npos);
     assert(response.find("\"prompt_tokens\":4") != std::string::npos);
     assert(response.find("\"model\":\"embedding-test\"") != std::string::npos);
+    // llama.cpp's native route shares the service and the API key (#764).
+    const std::string native_request =
+        R"({"model":"embedding-test","content":[{"prompt_string":"hi"}]})";
+    ExpectStatus(EmbeddingPost(port, native_request, {}, "/embeddings"), 401);
+    const auto native =
+        EmbeddingPost(port, native_request,
+                      "Authorization: Bearer test-secret\r\n", "/embeddings");
+    ExpectStatus(native, 200);
+    assert(native.find("\r\n\r\n[{\"index\":0,\"embedding\":[[1,0]]}]") !=
+           std::string::npos);
     const auto missing_model =
         EmbeddingPost(port, R"({"model":"other","input":"hi"})",
                       "Authorization: Bearer test-secret\r\n");
@@ -2968,6 +2988,7 @@ void TestEmbeddingService() {
     assert(server.start(&error));
     std::jthread worker([&] { server.run(false); });
     ExpectStatus(EmbeddingPost(server.port(), request), 404);
+    ExpectStatus(EmbeddingPost(server.port(), request, {}, "/embeddings"), 404);
     server.stop();
     worker.join();
   }
@@ -2987,6 +3008,7 @@ void TestEmbeddingService() {
             .model_id = "embedding-test",
             .runner =
                 [](const std::vector<gufo::server::EmbeddingInput>&,
+                   const gufo::server::EmbeddingRequestOptions&,
                    gufo::server::EmbeddingBatch*, std::string*) {
                   return gufo::server::EmbeddingStatus::kDeviceLost;
                 },

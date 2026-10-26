@@ -60,6 +60,15 @@ if (ENGINE_ENABLE_HIP)
     RUN_SERIAL TRUE)
 endif()
 
+add_executable(embedding_gemma2_batch_scheduler_test batch_scheduler_test.cpp)
+target_link_libraries(embedding_gemma2_batch_scheduler_test PRIVATE
+  gufo_embedding_gemma2)
+add_test(NAME embedding_gemma2_batch_scheduler_test
+  COMMAND embedding_gemma2_batch_scheduler_test)
+set_tests_properties(embedding_gemma2_batch_scheduler_test PROPERTIES
+  LABELS "cpu;models;embedding-gemma2;scheduler"
+  TIMEOUT 120)
+
 add_executable(embedding_gemma2_tokenizer_test tokenizer_test.cpp)
 target_link_libraries(embedding_gemma2_tokenizer_test PRIVATE
   gufo_embedding_gemma2 gufo_platform)
@@ -78,6 +87,8 @@ add_executable(embedding_gemma2_embeddings_api_test
   ${PROJECT_SOURCE_DIR}/src/cli/serve/embedding_service.cpp)
 target_link_libraries(embedding_gemma2_embeddings_api_test PRIVATE
   gufo_embedding_gemma2 gufo_logging gufo_core)
+target_compile_definitions(embedding_gemma2_embeddings_api_test PRIVATE
+  GUFO_EMBEDDING_GEMMA2_NATIVE_FIXTURE="${PROJECT_SOURCE_DIR}/tests/fixtures/embedding_gemma2/llama_cpp_native_embeddings.json")
 add_test(NAME embedding_gemma2_embeddings_api_test
   COMMAND embedding_gemma2_embeddings_api_test)
 set_tests_properties(embedding_gemma2_embeddings_api_test PROPERTIES
