@@ -2594,6 +2594,19 @@ std::size_t Executor::PleDiskRows(const Session& session,
   return ngram_->CountUncached(rows);
 }
 
+void Executor::PrefetchNgram(const Session& session,
+                             std::span<const std::int32_t> tokens,
+                             std::size_t first) const {
+  const Config& c = config();
+  if (ngram_ == nullptr || c.ple_layer < 0 || first >= tokens.size())
+    return;
+  NgramHistory history = session.ngram_;
+  std::vector<std::uint32_t> rows(tokens.size() * c.ple_heads);
+  HashNgramRows(c, history, tokens, rows);
+  ngram_->Prefetch(
+      std::span<const std::uint32_t>(rows).subspan(first * c.ple_heads));
+}
+
 double Executor::PleDiskRowsPerSecond() const {
   return ngram_ != nullptr ? ngram_->DiskRowsPerSecond() : 0;
 }
