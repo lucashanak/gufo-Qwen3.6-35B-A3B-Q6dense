@@ -910,7 +910,7 @@ void CheckVectorGrouping(bool down = false, int experts = 8) {
         q::Swiglu(scalar + guard, paired_scalar + guard, count, nullptr);
         const auto gated_reference = Download(scalar, dirty.size());
         const auto gated_widths =
-            std::vector{1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 31, 32, 33, 64};
+            std::vector{1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 24, 27, 31, 32, 33, 64};
         for (int n : gated_widths) {
           CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
                              hipMemcpyHostToDevice),

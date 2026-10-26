@@ -1290,6 +1290,8 @@ struct Q4MoeFragment {
   uint16_t aux[2];
   half2 dm;
 
+  Q4MoeFragment() = default;
+
   __device__ __forceinline__ Q4MoeFragment(const void* weights, int block,
                                           int iqs) {
     const auto* w = static_cast<const block_q4_K*>(weights) + block;
