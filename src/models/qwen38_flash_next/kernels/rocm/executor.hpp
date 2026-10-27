@@ -32,6 +32,13 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
+/// Compact decode-row formats with a fused gate/up decode GEMV
+/// (qfn_mmq_moe_gated_vec); the others project gate and up separately.
+inline bool GatedVecFormat(core::GgmlType type) {
+  return type == core::GgmlType::kQ3_K || type == core::GgmlType::kQ4_K ||
+         type == core::GgmlType::kQ5_K;
+}
+
 class Executor;
 class SnapshotAllocator;
 struct ArgmaxCandidate;
@@ -530,6 +537,10 @@ private:
 
   /// An activation batch quantized once for the decode GEMVs; `data` is
   /// null when the batch is wide enough for the tiled path.
+  /// res[t][s] = the embedding row of tokens[t] for each of `streams`
+  /// copies, decoded from the table's file rows (any block format).
+  void EmbedRows(const std::int32_t* tokens, float* res, std::uint32_t n,
+                 std::uint32_t streams) const;
   struct Q8Input {
     const float* x;
     const void* data;

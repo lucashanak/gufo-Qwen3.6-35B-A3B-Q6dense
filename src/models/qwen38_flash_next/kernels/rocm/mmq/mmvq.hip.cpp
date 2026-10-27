@@ -228,26 +228,50 @@ typedef float (*vec_dot_q_hip_t)(const void * __restrict__ vbq, const block_q8_1
 
 static constexpr __device__ vec_dot_q_hip_t get_vec_dot_q_hip(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
+        case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
+        case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
+        case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
         case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
+        case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
+        case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
+        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
+        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
+        case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
+        case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
+        case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
+        case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         default:                return nullptr;
     }
 }
 
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
+        case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
         case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
         case GGML_TYPE_Q6_K:    return VDR_Q6_K_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ1_S:   return VDR_IQ1_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ1_M:   return VDR_IQ1_M_Q8_1_MMVQ;
+        case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
         default:                return 1;
     }
 }
@@ -1112,42 +1136,20 @@ void mul_mat_vec_dense_kq_dispatch(const void* weights, ggml_type type,
     launch_dense_kq_many<t>(weights, input, output, k, rows, bulk,        \
                             input_stride, stream);                        \
     return;
-      QFN_DENSE_KQ_MANY(GGML_TYPE_Q3_K)
-      QFN_DENSE_KQ_MANY(GGML_TYPE_Q4_K)
-      QFN_DENSE_KQ_MANY(GGML_TYPE_Q5_K)
-      QFN_DENSE_KQ_MANY(GGML_TYPE_Q6_K)
-      QFN_DENSE_KQ_MANY(GGML_TYPE_Q5_1)
-      QFN_DENSE_KQ_MANY(GGML_TYPE_IQ4_NL)
+      QFN_DENSE_KQ_FORMATS(QFN_DENSE_KQ_MANY)
 #undef QFN_DENSE_KQ_MANY
       default:
         GGML_ABORT("unsupported dense vector weight format");
     }
   }
   switch (type) {
-    case GGML_TYPE_Q3_K:
-      launch_dense_kq<GGML_TYPE_Q3_K>(weights, input, output, k, rows, tokens,
-                                      input_stride, stream);
-      break;
-    case GGML_TYPE_Q4_K:
-      launch_dense_kq<GGML_TYPE_Q4_K>(weights, input, output, k, rows, tokens,
-                                      input_stride, stream);
-      break;
-    case GGML_TYPE_Q5_K:
-      launch_dense_kq<GGML_TYPE_Q5_K>(weights, input, output, k, rows, tokens,
-                                      input_stride, stream);
-      break;
-    case GGML_TYPE_Q6_K:
-      launch_dense_kq<GGML_TYPE_Q6_K>(weights, input, output, k, rows, tokens,
-                                      input_stride, stream);
-      break;
-    case GGML_TYPE_Q5_1:
-      launch_dense_kq<GGML_TYPE_Q5_1>(weights, input, output, k, rows, tokens,
-                                      input_stride, stream);
-      break;
-    case GGML_TYPE_IQ4_NL:
-      launch_dense_kq<GGML_TYPE_IQ4_NL>(weights, input, output, k, rows,
-                                        tokens, input_stride, stream);
-      break;
+#define QFN_DENSE_KQ(t)                                                   \
+  case t:                                                                 \
+    launch_dense_kq<t>(weights, input, output, k, rows, tokens,           \
+                       input_stride, stream);                             \
+    break;
+    QFN_DENSE_KQ_FORMATS(QFN_DENSE_KQ)
+#undef QFN_DENSE_KQ
     default:
       GGML_ABORT("unsupported dense vector weight format");
   }
@@ -1674,50 +1676,36 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              int input_stride, hipStream_t stream,
                              const int32_t* dst_slots) {
     // dst_slots (expert-ordered slot rows) is only used by the down view.
-    GGML_ASSERT(!dst_slots || (k == 640 && experts_used == 1 && tokens > 1 &&
-                               (type == GGML_TYPE_Q5_1 ||
-                                type == GGML_TYPE_IQ4_NL ||
-                                type == GGML_TYPE_Q8_0)));
+    const bool down_view = k == 640 && experts_used == 1 && tokens > 1;
+    GGML_ASSERT(!dst_slots || (down_view && mmvq_moe_down_by_expert(type)));
     switch (type) {
-        case GGML_TYPE_Q5_1:
-          // Down projection slots have independent inputs. Wider row tiles
-          // reuse each short input without changing its dot-product sum.
-          if (k == 640 && experts_used == 1 && tokens > 1) {
-            if (tokens > 20) {
-              launch_moe<GGML_TYPE_Q5_1, 8>(
-                  weights, input, ids, output, k, rows, tokens, experts_used,
-                  input_stride, stream, dst_slots);
-            } else {
-              launch_moe<GGML_TYPE_Q5_1, 4>(
-                  weights, input, ids, output, k, rows, tokens, experts_used,
-                  input_stride, stream, dst_slots);
-            }
-            break;
-          }
-            launch_moe<GGML_TYPE_Q5_1>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
-        case GGML_TYPE_IQ4_NL:
-          if (k == 640 && experts_used == 1 && tokens > 1) {
-            if (tokens > 20) {
-              launch_moe<GGML_TYPE_IQ4_NL, 8>(
-                  weights, input, ids, output, k, rows, tokens, experts_used,
-                  input_stride, stream, dst_slots);
-            } else {
-              launch_moe<GGML_TYPE_IQ4_NL, 4>(
-                  weights, input, ids, output, k, rows, tokens, experts_used,
-                  input_stride, stream, dst_slots);
-            }
-            break;
-          }
-            launch_moe<GGML_TYPE_IQ4_NL>(weights, input, ids, output, k, rows,
-                                         tokens, experts_used, input_stride,
-                                         stream);
-            break;
+#define QFN_MOE_SMALL_BLOCKS(t)                                                \
+        case t:                                                                \
+          /* Down projection slots have independent inputs. Wider row tiles */ \
+          /* reuse each short input without changing its dot-product sum. */  \
+          if (down_view) {                                                     \
+            if (tokens > 20) {                                                 \
+              launch_moe<t, 8>(weights, input, ids, output, k, rows, tokens,   \
+                               experts_used, input_stride, stream, dst_slots); \
+            } else {                                                           \
+              launch_moe<t, 4>(weights, input, ids, output, k, rows, tokens,   \
+                               experts_used, input_stride, stream, dst_slots); \
+            }                                                                  \
+            break;                                                             \
+          }                                                                    \
+          launch_moe<t>(weights, input, ids, output, k, rows, tokens,          \
+                        experts_used, input_stride, stream);                   \
+          break;
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_Q4_0)
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_Q4_1)
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_Q5_0)
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_Q5_1)
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_IQ4_NL)
+#undef QFN_MOE_SMALL_BLOCKS
         case GGML_TYPE_Q8_0:
           // Down projection slots have independent inputs. Four rows reuse
           // each short input across more weights without changing its sum.
-          if (k == 640 && experts_used == 1 && tokens > 1) {
+          if (down_view) {
             launch_moe<GGML_TYPE_Q8_0, 4>(weights, input, ids, output, k, rows,
                                           tokens, experts_used, input_stride,
                                           stream, dst_slots);
@@ -1726,18 +1714,25 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
             launch_moe<GGML_TYPE_Q8_0>(weights, input, ids, output, k, rows, tokens,
                                           experts_used, input_stride, stream);
             break;
-        case GGML_TYPE_Q3_K:
-            launch_moe<GGML_TYPE_Q3_K>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
-        case GGML_TYPE_Q4_K:
-            launch_moe<GGML_TYPE_Q4_K>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
-        case GGML_TYPE_Q5_K:
-            launch_moe<GGML_TYPE_Q5_K>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
+#define QFN_MOE_SUPER_BLOCKS(t)                                                \
+        case t:                                                                \
+          launch_moe<t>(weights, input, ids, output, k, rows, tokens,          \
+                        experts_used, input_stride, stream);                   \
+          break;
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q2_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q3_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q4_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q5_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q6_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ2_XXS)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ2_XS)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ2_S)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ3_XXS)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ3_S)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ1_S)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ1_M)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ4_XS)
+#undef QFN_MOE_SUPER_BLOCKS
         default: GGML_ABORT("unsupported vector weight format");
     }
 }

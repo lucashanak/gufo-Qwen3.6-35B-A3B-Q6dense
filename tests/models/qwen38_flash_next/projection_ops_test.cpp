@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstddef>
@@ -10,6 +11,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/core/quant/ggml_dequant.hpp"
@@ -1149,6 +1151,230 @@ void CheckDenseKQuantWidths(GgmlType type, int rows, int cols,
     CheckHip(hipFree(ptr), "K-quant width test free");
 }
 
+/// Random blocks of any GGML block format with model-like F16 scales
+/// patched in (every other byte random): `blocks` blocks of `type`.
+std::vector<std::uint8_t> MakeBlocks(GgmlType type, std::size_t blocks,
+                                     std::uint32_t seed) {
+  const std::size_t elements = gufo::quant::QuantizedBlockElements(type);
+  const std::size_t bytes = gufo::quant::QuantizedRowBytes(type, elements);
+  std::vector<std::uint8_t> packed(blocks * bytes);
+  for (auto& b : packed)
+    b = static_cast<std::uint8_t>(NextRandom(&seed) >> 24);
+  const std::string_view name = gufo::core::ToString(type);
+  for (std::size_t i = 0; i < blocks; ++i) {
+    std::uint8_t* blk = packed.data() + i * bytes;
+    const float d =
+        (elements == 256 ? 4e-4F : 2e-3F) * (1.0F + Uniform(&seed, 0.5F));
+    const auto put = [&](std::size_t offset, float value) {
+      const __half h = __float2half(value);
+      std::memcpy(blk + offset, &h, 2);
+    };
+    if (name == "Q2_K") {
+      put(80, d);
+      put(82, 0.5F * d);
+    } else if (name == "Q3_K") {
+      put(108, d);
+    } else if (name == "Q6_K") {
+      put(208, d);
+    } else if (name == "IQ1_M") {
+      // The F16 scale is the top nibbles of the four scale words.
+      const __half h = __float2half(d);
+      std::uint16_t bits = 0;
+      std::memcpy(&bits, &h, 2);
+      for (std::size_t w = 0; w < 4; ++w) {
+        std::uint8_t& high = blk[48 + 2 * w + 1];
+        high = static_cast<std::uint8_t>((high & 0x0FU) |
+                                         (((bits >> (4 * w)) & 0xFU) << 4));
+      }
+    } else {
+      put(0, d);
+      if (name == "Q4_K" || name == "Q5_K")
+        put(2, 0.5F * d);
+      else if (name == "Q4_1" || name == "Q5_1")
+        put(2, (name == "Q4_1" ? -8.0F : -16.0F) * d);
+    }
+  }
+  return packed;
+}
+
+/// Dense decode GEMV of any block format: F64 accuracy against the
+/// dequantized weights and q8_1 activations for 1-8 tokens (F32 and
+/// pre-quantized inputs bit for bit), then every row of a 1-64 token launch
+/// bit for bit the row projected alone.
+bool CheckDenseFormat(GgmlType type, int rows, int cols, std::uint32_t seed) {
+  constexpr int kTokens = 64;
+  const std::size_t block = gufo::quant::QuantizedBlockElements(type);
+  const std::size_t row_bytes =
+      gufo::quant::QuantizedRowBytes(type, static_cast<std::size_t>(cols));
+  const auto packed =
+      MakeBlocks(type, std::size_t(rows) * (cols / block), seed);
+  std::vector<float> w(static_cast<std::size_t>(rows) * cols);
+  for (int r = 0; r < rows; ++r) {
+    if (!gufo::quant::DequantizeRow(type, packed.data() + r * row_bytes,
+                                    w.data() + std::size_t(r) * cols, cols))
+      throw std::runtime_error("dense format reference rejected its rows");
+  }
+  std::vector<float> x(static_cast<std::size_t>(kTokens) * cols);
+  for (auto& v : x)
+    v = Uniform(&seed, 2.0F);
+  std::vector<float> xq(x.size());
+  for (std::size_t b = 0; b < x.size(); b += 32) {
+    float amax = 0.0F;
+    for (std::size_t i = b; i < b + 32; ++i)
+      amax = std::max(amax, std::abs(x[i]));
+    const float d = amax / 127.0F;
+    const float dh = __half2float(__float2half(d));
+    for (std::size_t i = b; i < b + 32; ++i)
+      xq[i] = amax == 0.0F ? 0.0F : dh * std::round(x[i] / d);
+  }
+  void* dw = nullptr;
+  float* dx = nullptr;
+  void* dq = nullptr;
+  float* out = nullptr;
+  const std::size_t out_count = std::size_t(rows) * kTokens + 4;
+  CheckHip(hipMalloc(&dw, packed.size() + 4096), "format weights");
+  CheckHip(hipMalloc(&dx, x.size() * sizeof(float)), "format inputs");
+  CheckHip(hipMalloc(&dq, qfn_mmq_q8_1_bytes(kTokens, cols)),
+           "format quantized inputs");
+  CheckHip(hipMalloc(&out, out_count * sizeof(float)), "format output");
+  CheckHip(hipMemcpy(dw, packed.data(), packed.size(), hipMemcpyHostToDevice),
+           "format weights upload");
+  CheckHip(
+      hipMemcpy(dx, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "format input upload");
+  if (qfn_mmq_quantize_q8_1(dx, dq, kTokens, cols, nullptr))
+    throw std::runtime_error("format input quantization failed");
+  const std::string shape = std::string(gufo::core::ToString(type)) +
+                            " M=" + std::to_string(rows) +
+                            " K=" + std::to_string(cols);
+  const auto project = [&](int first, int n, bool pre) {
+    CheckHip(hipMemset(out, 0xA5, out_count * sizeof(float)),
+             "format output guard");
+    const int status =
+        pre ? qfn_mmq_dense_kq_vec_preq(static_cast<int>(type), dw,
+                                        static_cast<const std::uint8_t*>(dq) +
+                                            qfn_mmq_q8_1_bytes(first, cols),
+                                        out, rows, cols, n, nullptr)
+            : qfn_mmq_dense_kq_vec(static_cast<int>(type), dw,
+                                   dx + std::size_t(first) * cols, out, rows,
+                                   cols, n, nullptr);
+    if (status != 0)
+      throw std::runtime_error("format GEMV launch failed: " + shape);
+    std::vector<float> y(out_count);
+    CheckHip(hipMemcpy(y.data(), out, y.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "format output");
+    for (std::size_t i = std::size_t(n) * rows; i < out_count; ++i) {
+      if (std::bit_cast<std::uint32_t>(y[i]) != 0xA5A5A5A5U)
+        throw std::runtime_error("format GEMV overwrote its guard: " + shape);
+    }
+    y.resize(std::size_t(n) * rows);
+    return y;
+  };
+  double worst = 0.0;
+  for (int n = 1; n <= 8; ++n) {
+    const int first = kTokens - n;
+    const auto f32 = project(first, n, false);
+    if (f32 != project(first, n, true))
+      throw std::runtime_error(
+          "format GEMV differs between F32 and Q8_1 "
+          "inputs: " +
+          shape);
+    for (int t = 0; t < n; ++t) {
+      for (int r = 0; r < rows; ++r) {
+        double acc = 0.0, mag = 0.0;
+        for (int i = 0; i < cols; ++i) {
+          const double p = static_cast<double>(w[std::size_t(r) * cols + i]) *
+                           xq[std::size_t(first + t) * cols + i];
+          acc += p;
+          mag += std::abs(p);
+        }
+        worst = std::max(worst, std::abs(f32[std::size_t(t) * rows + r] - acc) /
+                                    (mag + 1e-30));
+      }
+    }
+  }
+  // F32 accumulation and the F16 block sums the affine formats read.
+  if (!(worst < 2e-3))
+    throw std::runtime_error("format GEMV error " + std::to_string(worst) +
+                             ": " + shape);
+  std::vector<float> alone(std::size_t(rows) * kTokens);
+  for (int t = 0; t < kTokens; ++t) {
+    const auto y = project(t, 1, false);
+    std::copy(y.begin(), y.end(), alone.begin() + std::size_t(t) * rows);
+  }
+  std::vector<int> widths;
+  for (int n = 2; n <= kTokens; ++n) {
+    const auto y = project(kTokens - n, n, n % 2 == 0);
+    if (std::memcmp(y.data(), alone.data() + std::size_t(kTokens - n) * rows,
+                    y.size() * sizeof(float)) != 0)
+      widths.push_back(n);
+  }
+  std::cout << "dense " << shape << ": worst |GEMV - F64| / sum|w x| " << worst
+            << (widths.empty() ? ", N=1..64 rows exact"
+                               : ", rows DEPEND on the width, first N=" +
+                                     std::to_string(widths.front()) + " of " +
+                                     std::to_string(widths.size()))
+            << '\n';
+  for (void* ptr : {dw, static_cast<void*>(dx), dq, static_cast<void*>(out)})
+    CheckHip(hipFree(ptr), "format test free");
+  return widths.empty();
+}
+
+/// Embedding rows of any block format: the device gather equals the CPU
+/// dequantization of each row (values, either sign of zero), for every
+/// stream copy, and writes nothing else.
+void CheckEmbeddingRows(GgmlType type) {
+  constexpr int kRows = 37, kCols = 2560, kTokens = 9, kStreams = 4;
+  const std::size_t block = gufo::quant::QuantizedBlockElements(type);
+  const std::size_t row_bytes = gufo::quant::QuantizedRowBytes(type, kCols);
+  const auto table = MakeBlocks(type, std::size_t(kRows) * (kCols / block),
+                                0xE3B0000U + static_cast<std::uint32_t>(type));
+  const std::vector<std::int32_t> tokens = {0, 36, 5, 5, 17, 1, 35, 22, 0};
+  void* dt = nullptr;
+  std::int32_t* di = nullptr;
+  float* out = nullptr;
+  const std::size_t count = std::size_t(kTokens) * kStreams * kCols;
+  CheckHip(hipMalloc(&dt, table.size()), "embedding table");
+  CheckHip(hipMalloc(&di, tokens.size() * sizeof(std::int32_t)),
+           "embedding tokens");
+  CheckHip(hipMalloc(&out, (count + 16) * sizeof(float)), "embedding rows");
+  CheckHip(hipMemcpy(dt, table.data(), table.size(), hipMemcpyHostToDevice),
+           "embedding table upload");
+  CheckHip(hipMemcpy(di, tokens.data(), tokens.size() * sizeof(std::int32_t),
+                     hipMemcpyHostToDevice),
+           "embedding token upload");
+  CheckHip(hipMemset(out, 0xA5, (count + 16) * sizeof(float)),
+           "embedding guard");
+  if (qfn_mmq_get_rows(static_cast<int>(type), dt, di, out, kTokens, kCols,
+                       kStreams, nullptr) != 0)
+    throw std::runtime_error("embedding gather rejected " +
+                             std::string(gufo::core::ToString(type)));
+  std::vector<float> rows(count + 16);
+  CheckHip(hipMemcpy(rows.data(), out, rows.size() * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "embedding download");
+  std::vector<float> expected(kCols);
+  for (int t = 0; t < kTokens; ++t) {
+    if (!gufo::quant::DequantizeRow(type, table.data() + tokens[t] * row_bytes,
+                                    expected.data(), kCols))
+      throw std::runtime_error("embedding reference rejected its row");
+    for (int s = 0; s < kStreams; ++s)
+      for (int i = 0; i < kCols; ++i)
+        if (rows[(std::size_t(t) * kStreams + s) * kCols + i] != expected[i])
+          throw std::runtime_error(
+              "embedding row differs from the CPU dequantization: " +
+              std::string(gufo::core::ToString(type)));
+  }
+  for (std::size_t i = count; i < rows.size(); ++i)
+    if (std::bit_cast<std::uint32_t>(rows[i]) != 0xA5A5A5A5U)
+      throw std::runtime_error("embedding gather overwrote its guard");
+  std::cout << "embedding " << gufo::core::ToString(type)
+            << ": rows equal the CPU dequantization\n";
+  for (void* ptr : {dt, static_cast<void*>(di), static_cast<void*>(out)})
+    CheckHip(hipFree(ptr), "embedding test free");
+}
+
 void CheckMtpOutputHead(float input_scale) {
   constexpr int rows = 65, cols = 2560, blocks = cols / 32;
   auto weights = MakeWeights(rows, cols, 73);
@@ -1369,6 +1595,39 @@ int main() {
     CheckDenseKQuantWidths(GgmlType::kQ6_K, 320, 10240, 0x16A610U);
     CheckDenseKQuantWidths(GgmlType::kQ5_1, 10240, 320, 0x16A320U);
     CheckDenseKQuantWidths(GgmlType::kIQ4_NL, 10240, 320, 0x16B320U);
+    for (const GgmlType type :
+         {GgmlType::kQ4_0, GgmlType::kQ4_1, GgmlType::kQ5_0, GgmlType::kQ5_1,
+          GgmlType::kQ8_0, GgmlType::kQ2_K, GgmlType::kQ3_K, GgmlType::kQ4_K,
+          GgmlType::kQ5_K, GgmlType::kQ6_K, GgmlType::kIQ2_XXS,
+          GgmlType::kIQ2_XS, GgmlType::kIQ2_S, GgmlType::kIQ3_XXS,
+          GgmlType::kIQ3_S, GgmlType::kIQ1_S, GgmlType::kIQ1_M,
+          GgmlType::kIQ4_NL, GgmlType::kIQ4_XS})
+      CheckEmbeddingRows(type);
+    bool formats = true;
+    // Every dense decode format at a trunk shape; the 32-element formats
+    // also at the mixer-up / shared-down widths with ragged rows.
+    for (const GgmlType type :
+         {GgmlType::kQ2_K, GgmlType::kQ3_K, GgmlType::kQ4_K, GgmlType::kQ5_K,
+          GgmlType::kQ6_K, GgmlType::kIQ2_XXS, GgmlType::kIQ2_XS,
+          GgmlType::kIQ2_S, GgmlType::kIQ3_XXS, GgmlType::kIQ3_S,
+          GgmlType::kIQ1_S, GgmlType::kIQ1_M, GgmlType::kIQ4_XS,
+          GgmlType::kQ4_0, GgmlType::kQ4_1, GgmlType::kQ5_0, GgmlType::kQ5_1,
+          GgmlType::kIQ4_NL})
+      formats =
+          CheckDenseFormat(type, 641, 2560,
+                           0xF0A70000U + static_cast<std::uint32_t>(type)) &&
+          formats;
+    for (const GgmlType type :
+         {GgmlType::kQ4_0, GgmlType::kQ4_1, GgmlType::kQ5_0, GgmlType::kQ5_1})
+      for (const auto& [rows, cols] :
+           {std::array<int, 2>{10241, 320}, std::array<int, 2>{2561, 640}})
+        formats =
+            CheckDenseFormat(type, rows, cols,
+                             0xF0B70000U + static_cast<std::uint32_t>(type) +
+                                 static_cast<std::uint32_t>(cols)) &&
+            formats;
+    if (!formats)
+      throw std::runtime_error("dense decode rows depend on the batch width");
     CheckW8A8Tail(320, 10240, 0x7A1320U);
     CheckW8A8Tail(640, 2560, 0x7A1640U);
     // The output projection takes the wave64 kernel from 1,024 rows; the

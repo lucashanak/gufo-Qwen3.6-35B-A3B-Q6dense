@@ -431,9 +431,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                               hipMemcpyHostToDevice, stream_),
                error))
       return false;
-    EmbedTokens(model_->token_embd().data,
-                EmbeddingType(model_->token_embd().type), base.tokens,
-                base.mtp_embd, rows, c.hidden_size, 1, stream_);
+    EmbedRows(base.tokens, base.mtp_embd, rows, 1);
     RmsNormRows(base.mtp_embd, l.nextn_enorm.f32(), base.mtp_embd, rows,
                 c.hidden_size, 1, c.rms_eps, stream_);
     for (std::size_t i = 0; i < items.size(); ++i) {
@@ -939,8 +937,8 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
   if (q8 && !QuantizeBatch(x, rows, up.cols, error))
     return false;
   if (up.decode != nullptr && gate.decode != nullptr &&
-      up.decode_type == gate.decode_type && up.rows == gate.rows &&
-      up.cols == gate.cols && rows <= 64) {
+      up.decode_type == gate.decode_type && GatedVecFormat(up.decode_type) &&
+      up.rows == gate.rows && up.cols == gate.cols && rows <= 64) {
     // GatedDense's decode GEMV over every row at once: each row's sum is
     // the per-request launch's, and the compact rows are read once.
     return qfn_mmq_moe_gated_vec(static_cast<int>(up.decode_type), gate.decode,
@@ -1236,9 +1234,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                  error)) {
         return false;
       }
-      EmbedTokens(model_->token_embd().data,
-                  EmbeddingType(model_->token_embd().type), base.tokens,
-                  base.res, rows, c.hidden_size, c.hc_count, stream_);
+      EmbedRows(base.tokens, base.res, rows, c.hc_count);
       for (std::size_t i = 0; i < items.size(); ++i) {
         items[i].session->vision_input_.Inject(
             base.res + std::size_t{offsets[i]} * c.HcDim(),
