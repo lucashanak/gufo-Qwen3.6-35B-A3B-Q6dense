@@ -1589,7 +1589,8 @@ void Executor::Unregister(const Session* session) const {
 
 bool Executor::ReserveKv(Session& session, std::uint32_t rows,
                          std::uint32_t draft_rows, std::string* error_msg,
-                         std::span<Session* const> busy) const {
+                         std::span<Session* const> busy,
+                         bool release_idle) const {
   if (!session.kv_)
     return true;
   const auto& c = config();
@@ -1611,6 +1612,8 @@ bool Executor::ReserveKv(Session& session, std::uint32_t rows,
   });
   if (growth == 0)
     return true;
+  if (!release_idle && kv_pool_->Available() < growth)
+    return false;
   std::vector<Session*> keep(busy.begin(), busy.end());
   keep.push_back(&session);
   if (kv_pool_->Available() < growth)
@@ -1627,7 +1630,7 @@ bool Executor::ReserveKv(Session& session, std::uint32_t rows,
     // The device heap can run out before the budget: release idle rows and
     // retry once.
     return buffer.Grow(want, stream_, nullptr) ||
-           (ReleaseIdleKv(buffer.GrowthBytes(want), keep) > 0 &&
+           (release_idle && ReleaseIdleKv(buffer.GrowthBytes(want), keep) > 0 &&
             buffer.Grow(want, stream_, nullptr)) ||
            buffer.Grow(want, stream_, error_msg);
   });
@@ -3519,9 +3522,23 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (graph && ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
-  if (!Run(session, key, graph, body, error_msg, true,
-           n >= kRelaxedWaitRows)) {
+  // While a long prompt pass runs, map the K/V rows of the next pass and
+  // of this pass's draft catch-up: mapping between passes left the GPU idle
+  // (7 ms per pass in `gufo bench`, up to 70 ms behind a server). Only
+  // rows the budget has free; the passes themselves reserve the rest.
+  const bool relaxed = n >= kRelaxedWaitRows;
+  const bool pregrow = relaxed && !graph && prefill_phase;
+  if (!Run(session, key, graph, body, error_msg, !pregrow, relaxed)) {
     return false;
+  }
+  if (pregrow) {
+    const auto rows = start_pos + n + static_cast<std::uint32_t>(next.size());
+    (void)ReserveKv(session, rows,
+                    session.mtp_enabled_ ? rows : session.mtp_.position,
+                    nullptr, {}, false);
+    if (!Check(hipEventRecord(pass_done_, stream_), "pass event", error_msg) ||
+        !WaitRelaxed(pass_done_, "forward", error_msg))
+      return false;
   }
   if (n_logits > 0 && logits != nullptr) {
     std::copy_n(logits_host_, static_cast<std::size_t>(n_logits) * c.vocab_size,
