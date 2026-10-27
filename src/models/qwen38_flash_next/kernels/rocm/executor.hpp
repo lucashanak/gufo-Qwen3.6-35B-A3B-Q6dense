@@ -670,9 +670,15 @@ private:
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
+  /// `relaxed` waits for a long eager pass without spinning (WaitRelaxed).
   bool Run(Session& session, std::uint64_t key, bool graph,
            const std::function<bool()>& body, std::string* error_msg,
-           bool synchronize = true) const;
+           bool synchronize = true, bool relaxed = false) const;
+  /// Waits for `event` by polling it with short sleeps: the CPU cores and
+  /// the GPU share one package power limit, and the core HIP keeps spinning
+  /// through a 16,384-row prefill pass cost that pass 1.6%.
+  bool WaitRelaxed(hipEvent_t event, const char* what,
+                   std::string* error_msg) const;
   /// Runs `body` eagerly, or replays its graph for `key`: shape words then
   /// the identity of every session whose buffers the commands name. A key
   /// runs eagerly once, then eagerly again while its graph is recorded.
@@ -707,6 +713,7 @@ private:
   hipEvent_t shexp_fork_{nullptr};
   hipEvent_t shexp_join_{nullptr};
   hipEvent_t counts_ready_{nullptr};
+  hipEvent_t pass_done_{nullptr};  ///< end of a relaxed Run
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
 

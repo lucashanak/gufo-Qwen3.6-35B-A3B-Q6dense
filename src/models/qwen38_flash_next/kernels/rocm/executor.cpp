@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -79,6 +80,10 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+// Eager passes of at least this many rows wait for the GPU in WaitRelaxed:
+// a layer's shared expert alone keeps the GPU busy for longer than a poll.
+constexpr std::uint32_t kRelaxedWaitRows = 2048;
+constexpr auto kRelaxedWaitPoll = std::chrono::microseconds(100);
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -933,8 +938,9 @@ Executor::~Executor() {
   if (blas_ != nullptr) {
     (void)hipblasDestroy(blas_);
   }
-  if (counts_ready_ != nullptr) {
-    (void)hipEventDestroy(counts_ready_);
+  for (hipEvent_t event : {counts_ready_, pass_done_}) {
+    if (event != nullptr)
+      (void)hipEventDestroy(event);
   }
   for (hipEvent_t event : {shexp_fork_, shexp_join_}) {
     if (event != nullptr)
@@ -978,6 +984,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   if (!Check(hipEventCreateWithFlags(&e->counts_ready_, hipEventDisableTiming),
              "expert counts event", error_msg) ||
+      !Check(hipEventCreateWithFlags(&e->pass_done_, hipEventDisableTiming),
+             "pass event", error_msg) ||
       !Check(hipStreamCreateWithFlags(&e->side_stream_, hipStreamNonBlocking),
              "shared expert stream", error_msg) ||
       !Check(hipEventCreateWithFlags(&e->shexp_fork_, hipEventDisableTiming),
@@ -2018,7 +2026,10 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
-  if (!Check(hipEventSynchronize(counts_ready_), "expert counts", error_msg)) {
+  if (!(n_tokens >= kRelaxedWaitRows
+            ? WaitRelaxed(counts_ready_, "expert counts", error_msg)
+            : Check(hipEventSynchronize(counts_ready_), "expert counts",
+                    error_msg))) {
     return false;
   }
   // The F16 expert GEMM launches one block per (expert, row tile of its
@@ -3271,9 +3282,19 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   return true;
 }
 
+bool Executor::WaitRelaxed(hipEvent_t event, const char* what,
+                           std::string* error_msg) const {
+  for (;;) {
+    const hipError_t status = hipEventQuery(event);
+    if (status != hipErrorNotReady)
+      return Check(status, what, error_msg);
+    std::this_thread::sleep_for(kRelaxedWaitPoll);
+  }
+}
+
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
-                   bool synchronize) const {
+                   bool synchronize, bool relaxed) const {
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -3339,6 +3360,10 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
     }
     session.warmed_.insert(key);
   }
+  if (synchronize && relaxed && !graph)
+    return Check(hipEventRecord(pass_done_, stream_), "pass event",
+                 error_msg) &&
+           WaitRelaxed(pass_done_, "forward", error_msg);
   return !synchronize ||
          Check(hipStreamSynchronize(stream_), "forward", error_msg);
 }
@@ -3494,7 +3519,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (graph && ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
-  if (!Run(session, key, graph, body, error_msg)) {
+  if (!Run(session, key, graph, body, error_msg, true,
+           n >= kRelaxedWaitRows)) {
     return false;
   }
   if (n_logits > 0 && logits != nullptr) {
@@ -4772,7 +4798,7 @@ bool Executor::MtpForward(Session& session,
                    graph ? graph_pool : pool, hidden_source, output.trace,
                    output.kv_only, subset);
   };
-  if (!Run(session, key, graph, body, error_msg)) {
+  if (!Run(session, key, graph, body, error_msg, true, n >= kRelaxedWaitRows)) {
     return false;
   }
   if (output.token != nullptr) {
