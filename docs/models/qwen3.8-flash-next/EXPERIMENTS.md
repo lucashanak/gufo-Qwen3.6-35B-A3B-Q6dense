@@ -1,5 +1,38 @@
 # Qwen3.8 Flash-Next experiments
 
+## Lower-precision MTP sidecar (October 27, 2026)
+
+Not retained: the shared-Q8_0 sidecar stays. Requantized from it with
+`llama-quantize --pure --allow-requantize` and a per-tensor type file (no
+imatrix covers `blk.48`); every other tensor is byte-identical to the
+original. Greedy output is identical on every arm (C1 5/5, the 28-question
+C8 slice 28/28, the 32.9K-token prompt, the uncensored target 5/5). Speed
+evidence: [BENCHMARKS.md](BENCHMARKS.md#lower-precision-mtp-sidecar-october-27-2026).
+
+| Sidecar | Bytes | C1 MTP | C8 slice | 32.9K prompt: accepted / decode |
+| --- | ---: | ---: | ---: | ---: |
+| Q8_0 (shipped) | 2,786,568,256 | 70.63 | 333.6 s | 138 / 52.4 (repeat 52.0) |
+| Routed experts Q5_K gate/up, Q5_1 down | 1,895,278,656 | +0.7% | | 137 / −0.9% |
+| Routed experts Q4_K gate/up, IQ4_NL down | 1,528,277,056 | +1.0% | 333.0 s | 125 / −5.6% |
+| Routed experts Q3_K gate/up, IQ4_NL down | 1,305,454,656 | +0.4% | | 110 / −8.6% |
+| Q4_K/IQ4_NL experts + Q4_K attention q/k/v, Q5_K output, Q4_K shared gate/up, Q6_K/Q5_1 mixers | 1,498,248,256 | +1.1% | 334.1 s | 87 / −15% |
+
+The draft block was not the bottleneck it looked like. A C1 cycle spends
+about 2.4 ms in the block (the 1.45 ms draft head reads the trunk's output
+rows, which the sidecar shares), and halving its bytes saves well under a
+millisecond of a 41.8 ms cycle; at C8 drafting is 5–9 ms of about 173 ms.
+That saving is within the C1 noise (an unchanged control run +0.7%), and it
+is paid back in chain length: the gate ends a chain after the first
+proposal below p = 0.85, the requantized heads cross it sooner, and the
+slice needed 4–6% more verification rounds (8,124 → 8,460 / 8,604) for
+the same tokens. At depth the drafts themselves get worse, monotonically
+with precision. The fully K-quant variant also needed a fix: the MTP
+cache-only catch-up sliced the packed attention projection's Q8_0 copy
+but not its compact decode rows (`DeviceTensor::Rows` now moves both).
+The shipped Q8_0 sidecar has no compact rows and never reached the bug,
+and these prompts stayed on the wide Q8_0 route, so the draft counts were
+identical before and after the fix.
+
 ## Single-user decode (October 27, 2026)
 
 Workload: C1 greedy, thinking off, five fixed prompts (prose, code, Czech)

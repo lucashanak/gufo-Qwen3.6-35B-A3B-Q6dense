@@ -107,6 +107,30 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 
 ![Memory occupation](artifacts/charts/memory.svg)
 
+## Lower-precision MTP sidecar (October 27, 2026)
+
+`fn-c8` `9e23078a` (`fn-mtp` `c20af263` for the K-quant attention arm,
+whose Q8_0 control is identical), v3 target, greedy unless noted.
+C1: five 384-token prompts, one session, 65,536 context (mean of five
+decode rates). Slice: eight sessions at production flags. `fnab`: 4 ×
+40,960, one round each; C1/C4/C8 are sum of rates, wall aggregate in
+brackets. Rejected; see
+[experiments](EXPERIMENTS.md#lower-precision-mtp-sidecar-october-27-2026).
+
+| Measure (tok/s) | Q8_0 | Q5_K/Q5_1 experts | Q4_K/IQ4_NL experts | Q3_K/IQ4_NL experts | Q4_K experts + attention |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HTTP C1 MTP, five prompts | 70.63 | 71.10 | 71.32 | 70.90 | 71.40 |
+| C1 acceptance (accepted / proposed) | 69.4% | 68.8% | 68.8% | 69.1% | 68.7% |
+| HTTP C1 MTP after 32.9K, 256 tokens | 52.40 / 52.03 | 51.95 | 49.47 | 47.90 | 44.83 |
+| `fnab` MTP decode 512 (prose) | 61.9 | 61.8 | 62.0 | 59.2 | 61.1 |
+| `fnab` code at 0 / 0.7 | 81.8 / 85.9 | 81.1 / 84.3 | 80.8 / 83.9 | 84.5 / 83.6 | 80.9 / 81.2 |
+| `fnab` C1 / C4 / C8 | 59.7 / 100.3 (92.6) / 193.4 (92.4) | 57.5 / 96.2 (91.6) / 197.1 (92.7) | 62.3 / 100.6 (93.8) / 194.5 (92.5) | 61.1 / 99.4 (93.7) / 196.8 (93.3) | 57.6 / 102.1 (98.8) / 193.8 (93.8) |
+| 28-question slice wall (s) / rounds | 333.6 / 8,124 | | 333.0 / 8,460 | | 334.1 / 8,604 |
+
+Uncensored target, Q8_0 → Q4_K/IQ4_NL experts: C1 59.61 → 59.54 (5/5
+identical); `fnab` prose 51.5 → 49.0, code at 0 / 0.7 74.0 / 73.4 →
+75.1 / 73.6, C1 / C4 / C8 50.4 / 86.3 / 169.0 → 50.4 / 87.6 / 172.1.
+
 ## Single-user decode (October 27, 2026)
 
 v3 recipe + shared-Q8_0 MTP, greedy, thinking off. Baseline fn-c8
