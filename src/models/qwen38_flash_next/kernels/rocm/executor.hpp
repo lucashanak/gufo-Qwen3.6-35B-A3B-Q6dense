@@ -634,7 +634,8 @@ private:
   bool WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const;
   /// Runs routed experts after the router and shared expert are ready.
   bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
-                  std::uint32_t n_tokens, std::string* error_msg) const;
+                  std::uint32_t n_tokens, std::string* error_msg,
+                  bool join_shexp = false) const;
   bool MoeBatch(const DeviceLayer& l, const float* x, float* out,
                 std::uint32_t rows, std::string* error) const;
   /// Whether a draft of `session` requesting the small head gets it.
@@ -699,7 +700,12 @@ private:
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
   mutable std::shared_ptr<void> checkpoint_storage_;
-  hipStream_t stream_{nullptr};
+  /// Every launch goes to stream_; a decode MoE swaps it for side_stream_
+  /// while it queues the shared expert (see Moe).
+  mutable hipStream_t stream_{nullptr};
+  hipStream_t side_stream_{nullptr};
+  hipEvent_t shexp_fork_{nullptr};
+  hipEvent_t shexp_join_{nullptr};
   hipEvent_t counts_ready_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
