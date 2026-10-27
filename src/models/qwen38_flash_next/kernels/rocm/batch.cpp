@@ -467,11 +467,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       // A copy or ordinary target step needs only predictor KV. Batch the
       // same invariant projections, then stop before queries, attention,
       // the output projection and FFN whose residual would be discarded.
-      auto kv = l.attn_qkv;
-      const TensorRef layout{.type = kv.type, .cols = kv.cols};
-      kv.data = static_cast<std::uint8_t*>(kv.data) +
-                std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
-      kv.rows = 2 * c.AttentionKvDim();
+      const auto kv =
+          l.attn_qkv.Rows(2 * c.AttentionQDim(), 2 * c.AttentionKvDim());
       if (!DenseBatch(kv, base.mixed, base.qg, rows, error) ||
           !DenseBatch(l.indexer_k, base.mixed, base.ik, rows, error))
         return false;

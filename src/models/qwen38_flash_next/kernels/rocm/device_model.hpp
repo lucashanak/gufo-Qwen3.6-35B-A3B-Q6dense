@@ -29,6 +29,21 @@ struct DeviceTensor {
   [[nodiscard]] const float* f32() const noexcept {
     return static_cast<const float*>(data);
   }
+
+  /// `count` rows from `first`, without copying. A K-quant projection's
+  /// compact decode rows move with its Q8_0 copy.
+  [[nodiscard]] DeviceTensor Rows(std::uint32_t first,
+                                  std::uint32_t count) const noexcept {
+    DeviceTensor t = *this;
+    t.data = static_cast<std::uint8_t*>(data) +
+             std::size_t{first} * TensorRef{.type = type, .cols = cols}.RowBytes();
+    if (decode != nullptr)
+      t.decode = static_cast<const std::uint8_t*>(decode) +
+                 std::size_t{first} *
+                     TensorRef{.type = decode_type, .cols = cols}.RowBytes();
+    t.rows = count;
+    return t;
+  }
 };
 
 struct DeviceMixer {

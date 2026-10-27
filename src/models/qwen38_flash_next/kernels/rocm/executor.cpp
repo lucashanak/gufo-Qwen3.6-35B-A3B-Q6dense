@@ -4914,11 +4914,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     // Known trunk rows replace the predictor residual on the next forward.
     // Only K/V and pooled indexer keys survive this catch-up. Slice the
     // packed Q/gate/K/V weight without copying or changing its arithmetic.
-    auto kv = l.attn_qkv;
-    const TensorRef layout{.type = kv.type, .cols = kv.cols};
-    kv.data = static_cast<std::uint8_t*>(kv.data) +
-              std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
-    kv.rows = 2 * c.AttentionKvDim();
+    const auto kv =
+        l.attn_qkv.Rows(2 * c.AttentionQDim(), 2 * c.AttentionKvDim());
     if (!project(kv, s_.mixed, s_.qg, n) ||
         !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,
                           nullptr, attn.k_cache, attn.v_cache, n, 0,
