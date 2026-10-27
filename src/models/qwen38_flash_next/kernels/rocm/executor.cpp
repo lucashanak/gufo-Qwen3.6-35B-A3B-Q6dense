@@ -1794,11 +1794,19 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
   if (!MatrixRows(n_tokens) && up.decode != nullptr &&
       gate.decode != nullptr && up.decode_type == gate.decode_type &&
       up.rows == gate.rows && up.cols == gate.cols) {
-    if (qfn_mmq_moe_gated_vec(static_cast<int>(up.decode_type), gate.decode,
-                              up.decode, x, s_.dense_ids, out,
-                              static_cast<int>(up.rows),
-                              static_cast<int>(up.cols),
-                              static_cast<int>(n_tokens), 1, 1, stream_) != 0) {
+    // The mixer that produced x usually wrote its Q8_1 rows as well.
+    const void* ready = ReadyQ8(x, n_tokens, up.cols);
+    if ((ready != nullptr
+             ? qfn_mmq_moe_gated_vec_preq(
+                   static_cast<int>(up.decode_type), gate.decode, up.decode,
+                   ready, s_.dense_ids, out, static_cast<int>(up.rows),
+                   static_cast<int>(up.cols), static_cast<int>(n_tokens), 1, 1,
+                   stream_)
+             : qfn_mmq_moe_gated_vec(
+                   static_cast<int>(up.decode_type), gate.decode, up.decode, x,
+                   s_.dense_ids, out, static_cast<int>(up.rows),
+                   static_cast<int>(up.cols), static_cast<int>(n_tokens), 1, 1,
+                   stream_)) != 0) {
       AssignError(error_msg, "gated K-quant GEMV failed");
       return false;
     }
