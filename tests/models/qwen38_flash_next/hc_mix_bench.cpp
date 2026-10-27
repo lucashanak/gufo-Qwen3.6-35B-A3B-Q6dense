@@ -163,8 +163,13 @@ int main(int argc, char** argv) {
     float* res = Values(std::size_t{kMaxTokens} * kDim, 1, 1.0F);
     float* block_out = Values(std::size_t{kMaxTokens} * kHidden, 2, 0.01F);
     float* inject = Values(std::size_t{kMaxTokens} * kStreams * parts, 3, 0.0F);
-    float* gamma = Values(kDim, 4, 0.25F, 1.0F);
-    float* inject_w = Values(std::size_t{kStreams} * kDim, 5, 0.02F);
+    // Norm and inject weights rotate with the projections: a decode step
+    // reads every mixer's from memory.
+    std::vector<float*> gammas(copies), inject_ws(copies);
+    for (int i = 0; i < copies; ++i) {
+      gammas[i] = Values(kDim, 4 + 16 * i, 0.25F, 1.0F);
+      inject_ws[i] = Values(std::size_t{kStreams} * kDim, 5 + 16 * i, 0.02F);
+    }
     auto* xn = static_cast<float*>(Device(sizeof(float) * kMaxTokens * kDim));
     void* xn_q8 = Device(qfn_mmq_q8_1_bytes(kMaxTokens, kDim));
     auto* lo = static_cast<float*>(Device(sizeof(float) * kMaxTokens * kRank));
@@ -212,13 +217,13 @@ int main(int argc, char** argv) {
         const auto old_exec = Capture(stream, [&] {
           for (int m = 0; m < mixers; ++m) {
             const int c = m % copies;
-            q::HcCombineQ8_1(res, block_out, inject, parts, gamma, xn, xn_q8, n,
-                             kHidden, kStreams, 1e-6F, stream);
+            q::HcCombineQ8_1(res, block_out, inject, parts, gammas[c], xn,
+                             xn_q8, n, kHidden, kStreams, 1e-6F, stream);
             project(down_type, down[c], xn_q8, lo, kRank, kDim, n);
             q::SiluScaleQ8_1(lo, 1.0F / kStreams, n, kRank, lo_cols, lo_q8,
                              stream);
             project(up_type, up[c], lo_q8, gate, kDim, kRank, n);
-            q::HcMixEpilogue(xn, gate, inject_w, mixed, inject, n, kHidden,
+            q::HcMixEpilogue(xn, gate, inject_ws[c], mixed, inject, n, kHidden,
                              kStreams, stream, mixed_q8);
           }
         });
@@ -226,10 +231,10 @@ int main(int argc, char** argv) {
           for (int m = 0; m < mixers; ++m) {
             const int c = m % copies;
             const q::HcFusedMix mix{
-                down[c],         up[c],     res,      block_out, inject,
-                parts,           gamma,     xn,       xn_q8,     lo,
-                lo_q8,           lo_cols,   inject_w, mixed,     mixed_q8,
-                inject,          kHidden,   kStreams, kRank,     1e-6F,
+                down[c],         up[c],     res,          block_out, inject,
+                parts,           gammas[c], xn,           xn_q8,     lo,
+                lo_q8,           lo_cols,   inject_ws[c], mixed,     mixed_q8,
+                inject,          kHidden,   kStreams,     kRank,     1e-6F,
                 1.0F / kStreams, down_type, up_type};
             if (!q::HcMixQ8Fused(state, mix, n, stream))
               throw std::runtime_error("fused mixer rejected");
