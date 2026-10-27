@@ -1,5 +1,23 @@
 # Qwen3.8 Flash-Next quality
 
+## Single-user decode, October 27, 2026
+
+The retained changes keep every row's lane order, block order, products and
+reduction tree, or only change which stream or prefetch queue carries work.
+Evidence against fn-c8 `bcac0128` (`gufo-c8up25-v1`):
+
+- Greedy C1 replies through `gufo serve` (one session, thinking off, 384
+  tokens) to five fixed prompts (CPU cache prose, a Python red-black tree,
+  TCP congestion control, Czech railway history, a C++ ISO 8601 parser) are
+  byte-identical in AR and MTP after every retained step; the final
+  candidate's AR and MTP replies to one 32,879-token prompt are identical
+  to the baseline's too.
+- All 25 `qwen38_flash_next` ctests pass, among them `hc_mix_ops` (fused
+  mixer against the separate kernels bit for bit, every decode format and
+  width), `routed_wmma_ops`, `projection_ops`, `head_ops` and `batch_graph`.
+- The eight-way 28-question slice at production flags matches the fn-c8
+  answers on all 28 questions (`slice.sh`, 333.3 s).
+
 ## Eight-way suite decode, October 27, 2026
 
 Greedy outputs do not depend on draft lengths, verification batching or

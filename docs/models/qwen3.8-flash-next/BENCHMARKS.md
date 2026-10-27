@@ -107,6 +107,32 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 
 ![Memory occupation](artifacts/charts/memory.svg)
 
+## Single-user decode (October 27, 2026)
+
+v3 recipe + shared-Q8_0 MTP, greedy, thinking off. Baseline fn-c8
+`bcac0128`, candidate the single-user decode changes on top of it
+([experiments](EXPERIMENTS.md#single-user-decode-october-27-2026)). The
+HTTP rows use `gufo serve` with one session and 65,536 context: five fixed
+prompts of 384 tokens (mean of the five decode rates) and one 32,879-token
+prompt; outputs are byte-identical between the arms.
+
+| Measure (tok/s) | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| CLI AR tg256 after pp512, two runs | 39.03 / 39.64 | 41.20 / 41.13 | +4.6% |
+| CLI MTP tg256 after pp512, two runs | 71.74 / 71.74 | 72.21 / 72.83 | +1.1% |
+| HTTP C1 AR, five prompts | 38.82 | 40.83 | +5.2% |
+| HTTP C1 MTP, five prompts | 69.53 | 70.77 | +1.8% |
+| HTTP C1 AR after 32.9K, 256 tokens, alternating | 35.17 / 34.79 | 39.15 / 39.36 | +12% |
+| HTTP C1 MTP after 32.9K | 52.13 | 53.49 | +2.6% |
+
+`fnab` (4 × 40,960, one round each), baseline → candidate: pp8192
+1,620 → 1,600 and pp32768 1,627 → 1,595 (prefill code unchanged);
+MTP decode 512 (prose) 60.9 → 62.9; code at 0 / 0.7 79.4 / 82.7 →
+81.2 / 80.1; C1 / C4 / C8 MTP (sum of rates) 62.6 / 100.9 / 195.0 →
+61.6 / 101.4 / 191.3; C4 / C8 wall aggregate 95.2 / 92.9 → 92.3 / 91.3.
+The eight-way 28-question slice at production flags takes 333.3 s
+(fn-c8 333.9 s) with all 28 answers identical.
+
 ## Eight-way suite replay (October 27, 2026)
 
 The swapctl IQ suite (149 questions, `core` tier) replayed greedy by eight

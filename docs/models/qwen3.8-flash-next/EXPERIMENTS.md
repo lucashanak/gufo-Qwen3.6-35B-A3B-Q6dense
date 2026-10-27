@@ -1,5 +1,57 @@
 # Qwen3.8 Flash-Next experiments
 
+## Single-user decode (October 27, 2026)
+
+Workload: C1 greedy, thinking off, five fixed prompts (prose, code, Czech)
+of 384 tokens through `gufo serve` with one session (AR and MTP servers),
+one 32.9K-token prompt for depth, and CLI `gufo bench` pp512/tg256 with
+five repetitions (AR and MTP) for timing. Every retained step is
+byte-identical to fn-c8 `bcac0128` on all prompts in both modes. Speed and
+quality evidence: [BENCHMARKS.md](BENCHMARKS.md#single-user-decode-october-27-2026),
+[QUALITY.md](QUALITY.md#single-user-decode-october-27-2026).
+
+Kernel trace of the baseline AR token (167 tokens; median 26.1 ms profiled,
+25.3 ms unprofiled = 39.6 tok/s), per token, against the bytes each class
+streams at the measured 240 GB/s:
+
+| Class | Launches | ms | Floor ms | Notes |
+| --- | ---: | ---: | ---: | --- |
+| Fused HC mixers | 94 | 4.45 | 2.1 | 47 µs each for 5.15 MB (Q6_K down, Q5_1 up) |
+| Dense K-quant/Q8_0 GEMVs | 253 | 9.92 | 8.5 | SSM in 3.90 (218 GB/s), SSM out 1.55, head 1.55 (231 GB/s), attention 1.09, Q8_0 attn out + shared down 1.44 |
+| Routed and shared experts | 288 | 6.94 | 5.6 | gate/up 3.38 (199 GB/s), down 2.59 (186 GB/s), shared 0.51, top-k 0.24, epilogue 0.13 |
+| GatedDeltaNet | 156 | 1.24 | 0.95 | recurrence 0.93 at bandwidth, conv/prep/epilogue 0.31 |
+| Router, alpha/beta, indexer | 96 | 0.91 | 0.7 | |
+| Attention | 54 | 0.37 | — | |
+| Idle | | 2.2 | | ~2 µs between graph kernels (1.84 µs for an empty one, unprofiled); PLE wait 0.2–0.4; host 0.1–0.3 |
+
+Bytes per token about 4.2 GB, a 17.5 ms floor: the token ran at 69% of
+it. A C1 MTP cycle (median 41.8 ms, 2.58 tokens) spent 35.9 ms in the
+verifying trunk (experts 16.2, dense 11.0, mixers 4.6, GDN 2.45 including
+0.74 ms of rollback restores), 3.8 ms in draft steps (the 98,304-row draft
+head 1.45 ms at 230 GB/s) and 1.1 ms waiting for PLE rows before layer 1.
+After the retained changes an AR token takes 25.0 ms profiled (24.3 ms
+unprofiled = 41.2 tok/s): 910 launches, mixers 4.02 ms, idle 1.4 ms
+instead of 3.3 (the forked shared expert's and the router's kernels now
+overlap, so their summed durations grow).
+
+| Experiment | Outcome |
+| --- | --- |
+| Load a fused mixer's decode-format down blocks ahead of their products | Retained. A down tile's wave streams its row alone, one block per iteration; it now loads the largest whole-row split of blocks fitting about 180 registers (Q6_K at one token: 20 blocks) before the products, in the original order. `hc_mix_ops` bitwise. `hc_mix_bench` (norm and inject weights now rotate with the projections) Q6_K/Q5_1 at 1–5 tokens: 43.0/46.1/50.7/54.4/58.9 → 34.8/39.5/42.3/47.9/56.6 µs; IQ4_NL 32.1/37.8/43.0/50.3 → 28.2/31.9/33.1/35.7, so its fused width rises from 1 to 4 tokens. In the model 47.0 → 43.7 µs per mixer; AR tg256 39.61 → 40.07 tok/s. Rejected: the whole row ahead (spills, 72.8 µs), loading the first blocks before the combine wait (38.1 µs, bits changed), weights before activations (no change). |
+| Prefetch the PLE rows of single-session MTP chains while they are drafted | Retained. The C1 path never queued its chain rows, so verification waited for them at layer 1 (1.1 ms per cycle in the trace). Anchor, copies and each draft now go to `PrefetchNgram` as in batched decode: gather cache hits 20% → 75% on the five prompts, MTP mean 69.66 → 71.09 tok/s (every prompt faster). |
+| Read the mixer's Q8_1 rows in the decode shared expert | Retained. The gated shared expert quantized x again although the mixer had written its Q8_1 rows (as the routed experts already read them): 48 fewer launches per token. AR tg256 40.07 → 40.32. |
+| Run a single row's shared expert on a forked stream | Retained. Its three latency-bound launches (gated 11 µs, quantize, Q8_0 down 10 µs) overlap the router, top-k and routed experts and join before the epilogue. AR tg256 40.32 → 41.1 tok/s (+1.9%); CLI MTP tg256 72.5 → 72.7 (draft steps fork, verification does not). Forking verification rows as well: MTP −0.8% (72.1). |
+| Fork the GDN alpha/beta projection beside the stacked SSM projection; fork the indexer keys beside the attention projection | Rejected: within noise (+0.2%); both overlap bandwidth-bound GEMVs and save only a launch gap. |
+| Split the decode suffix graph after the PLE layer and the next one, so the ~900-node launch (0.35–1.1 ms of host time) overlaps them | Rejected: tg256 40.0 against 40.3. While the host wrote the second graph, the first one's kernels ran up to three times slower with 5.5 µs gaps. |
+| Unroll the gated expert GEMV for K 2560 (every load ahead) | Rejected: `routed_vec_bench` gate/up 3.38 → 4.43 ms per 48 layers, and the output hashes changed. |
+| C1 confidence gate 0.85 → 0.7 / 0.5; 0.92; dropping a final proposal below 0.2–0.45 | Rejected: MTP set −3.0% / −7.1%; the others within noise (+0.2–0.6% against +0.4% for an unchanged control). |
+| MoE epilogue in the mixer's combine; top-k in the router's last block; rollback restores folded into the next GDN step | Not built. Each combine block would recompute all ten slot sums for its stream (≤ 1 µs saved per mixer); top-k saves about 2.5 µs per layer; the restores rewrite 227 MB of state on a rejected cycle (0.74 ms per cycle) and would need a device-side pending-rollback flag in every GDN graph. |
+
+In the model the mixers stay slower than the benchmark (43.7 against about
+33 µs of kernel time): without the down tiles a mixer takes 26.1 µs, so
+the 2.69 MB down phase runs at about 153 GB/s in the model against 200 in
+`hc_mix_bench`; keeping the activations in L1 did not change it. The cause
+is not located.
+
 ## Eight-way suite decode (October 26–27, 2026)
 
 Workload: the swapctl IQ suite replayed greedy by eight workers at the
