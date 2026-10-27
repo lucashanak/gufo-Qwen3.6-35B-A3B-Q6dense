@@ -1,5 +1,17 @@
 # Qwen3.8 Flash-Next quality
 
+## Long-prompt prefill, October 27, 2026
+
+Both retained changes are host-side: how the inference thread waits for a
+long pass, and when the next pass's K/V chunks are mapped. No kernel,
+argument or launch order changes. Evidence against fn-c8 `9e23078a`:
+
+- Greedy replies (256 tokens, thinking off) through `gufo serve` at
+  production flags to an 8,779-token Markdown prompt, a 21,022-token C++
+  source and a 34,812-token concatenation (16,384-row passes) are
+  byte-identical in AR and MTP.
+- All 25 `qwen38_flash_next` ctests pass on the candidate build.
+
 ## Single-user decode, October 27, 2026
 
 The retained changes keep every row's lane order, block order, products and

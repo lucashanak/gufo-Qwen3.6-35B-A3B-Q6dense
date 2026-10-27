@@ -1,5 +1,73 @@
 # Qwen3.8 Flash-Next experiments
 
+## Long-prompt prefill (October 27, 2026)
+
+Workload: v3 recipe + shared-Q8_0 MTP, `gufo bench` pp2K–pp128K and cold
+HTTP prompts of 7.3K–58K tokens through `gufo serve` at production flags
+(eight sessions, 262,144 context, 20 GiB K/V). Kernel traces per trunk
+pass of `gufo bench` pp65536 (16,384-row passes at depth 0/16K/32K/48K;
+pp8192 is one 8,192-row pass at 598.6 µs/token), µs per prompt token:
+
+| Class | d0 | d16K | d32K | d48K | Share at d48K | Ceiling |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Routed experts (paired gate/up, down) | 160.5 | 159.0 | 159.6 | 159.3 | 25.4% | 29.5 TFLOPS |
+| GDN stacked projection + convolution | 97.9 | 98.6 | 98.9 | 98.4 | 15.7% | 31.0 TFLOPS |
+| GDN output projection | 35.2 | 35.1 | 35.1 | 35.1 | 5.6% | 32.2 TFLOPS |
+| GDN recurrence | 44.1 | 44.2 | 44.0 | 44.0 | 7.0% | 48 head blocks on 20 WGPs |
+| Attention QKV / output projections | 43.4 | 43.3 | 43.3 | 43.6 | 6.9% | 28.5 / 25.7 TFLOPS |
+| Sparse + dense attention | 50.7 | 63.1 | 64.1 | 64.8 | 10.3% | grows only to ~d16K (union of four selections) |
+| Indexer projections, scores, selection | 7.2 | 12.2 | 17.4 | 22.6 | 3.6% | +5.2 per 16K of depth |
+| HC up / down projections | 47.8 | 47.7 | 47.7 | 47.8 | 7.6% | 23.9 / 29.4 TFLOPS |
+| HC combines (MoE epilogue fused) | 69.0 | 68.8 | 68.9 | 68.8 | 11.0% | 170–196 GB/s of ~240 |
+| Shared expert, router | 31.4 | 31.3 | 31.2 | 31.3 | 5.0% | 23.3 TFLOPS |
+| Other (norms, quantize, PLE, embed) | 11.0 | 11.2 | 11.0 | 10.9 | 1.7% | |
+| Trunk pass | 598.1 | 614.4 | 621.2 | 626.5 | | |
+| Draft block catch-up + pass boundary | 6.4 | 6.4 | 6.4 | 14.0 | | the last includes the head |
+
+The GPU is 99.9% busy inside a pass. It runs at the package power limit
+(119 W socket power, slow-PPT throttle residency rising), near 2.2 GHz, so
+the WMMA ceiling is about 40 CUs × 512 FLOP/clock × 2.2 GHz = 45 TFLOPS:
+the GEMMs run at 52–72% of it, the combines at 70–80% of DRAM bandwidth.
+Extrapolated, the indexer reaches about 45 µs/token (7%) in the last pass of a 128K prompt.
+
+`gufo bench` against `gufo serve` on the same token counts (the probe's
+"8K"/"32K" prompts are 7,316/26,538 tokens): bench 1,660/1,696 tok/s,
+HTTP 1,595–1,672/1,589–1,711. A kernel trace of both runs the same
+kernels within 1–2% per kernel, and the server's request overhead
+(tokenization, queue, snapshot 12–14 ms, first token) is under 40 ms.
+The gap is:
+
+- GPU clock. A core spinning in `hipEventSynchronize` and
+  `hipStreamSynchronize` draws about 6.6 W of the 119 W package budget
+  (`gpu_metrics`: two cores at 6.5–7.3 W at 4.3 GHz while other cores
+  idle at 0.02 W). One extra spinning core cut pp16384 from 1,702 to
+  1,614 tok/s (three: 1,584). Both paths spun the inference thread for the
+  whole pass; the HTTP server also shares the package with whatever else
+  runs on the host: on CT200 swapctl's snapshot worker spends about 1 s of
+  CPU every 5 s.
+- Back-to-back long prompts behind several sessions. With `--sessions 8`
+  or `2` the first cold 26.5K prompt runs at 1,661–1,711 tok/s and the
+  following ones at 1,595–1,622 (GPU clock 2,170 → 2,060 MHz, `gpu_metrics`
+  GFX power 29 → 26 W at the same 119 W socket power; core power 2–5 W and
+  DRAM traffic about 50/25 GB/s read/write in both). Not with
+  `--sessions 1` (1,662/1,664/1,666), not when the next prompt follows 30 s
+  later, and not the RAM prompt cache (`--cache-ram-bytes 0` the same:
+  1,711 then 1,622/1,612). The kernel trace of the second request shows
+  only compute-bound kernels 4–6% slower; no other GPU work and no extra
+  CPU thread run. Cause not located.
+- K/V mapping between passes: 7 ms per pass in `gufo bench`, 30–70 ms
+  behind the server (single 2 MiB chunk mappings took up to 10 ms).
+
+| Experiment | Outcome |
+| --- | --- |
+| Wait for long passes without spinning a core | Retained. Eager passes of 2,048 rows or more (prompt passes and the draft block's prompt catch-up) poll the expert-count event and an end-of-pass event with 100 µs sleeps instead of HIP's spinning waits; the shared expert queued behind the count event keeps the GPU busier than one poll. GPU work, launch order and arguments are unchanged. `gufo bench` pp16384, alternating twice (r=2): 1,706.6/1,704.6 → 1,733.6/1,733.2 tok/s; the inference thread drops from 100% to under 10% CPU; 2,048- and 4,096-row passes keep their 4–5 ms of idle. Final A/B in [BENCHMARKS.md](BENCHMARKS.md#long-prompt-prefill-october-27-2026): pp32K–pp128K +1.7–2.9%, 57K-token TTFT −1.2%. `ROC_ACTIVE_WAIT_TIMEOUT=0` alone did not stop the spin. |
+| Map the next pass's K/V rows before waiting for a pass | Retained. A relaxed pass maps the rows of the next pass and of its own draft catch-up from the budget's free bytes (idle sessions are not released for it), after queuing the whole pass; their zero fills queue behind it. Trace through `gufo serve` (26.5K and 52K cold prompts): GPU idle from the end of one trunk pass to the start of the next 37–75 → 13–31 ms. |
+| Map them right after the pass's first layer instead | Rejected: the mappings overran the queued layer, 25–87 ms idle inside the pass. |
+| 64-token tiles for the GDN stacked projection (198 instead of 254 VGPRs) | Rejected: still one 8-wave block per CU (seven waves per SIMD), twice the weight decode per product; pp16384 1,737.7 → 1,705.4. |
+| Split the GDN recurrence in two launches and project the first half's rows on a side stream while the second half runs | Rejected although exact (a recurrence split is a pass split; every projected row keeps its K order): pp16384 1,739.6 → 1,710.1 (two rounds). The concurrent GEMM slows the recurrence on the critical path more than it hides. |
+| Skip fully masked row blocks of a sparse attention tile | Not built. Exact (a masked row's tile multiplies its state by exactly 1 and adds 0), but the S waves are bound to row blocks, so only the PV phase of skipped blocks shrinks: estimated under 1% of prefill. Two queries × 24 heads per tile would cut the union's compute by a third but changes every row's tile partition and with it the online-softmax rounding. |
+| Split a GDN head over two blocks to balance 48 heads on 20 WGPs | Not built: the gated norm needs the whole head, so the raw rows would make a round trip (about 400 MB per layer and 16K pass), costing about what the balance saves. |
+
 ## Single-user decode (October 27, 2026)
 
 Workload: C1 greedy, thinking off, five fixed prompts (prose, code, Czech)

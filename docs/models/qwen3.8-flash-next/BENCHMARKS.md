@@ -107,6 +107,49 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 
 ![Memory occupation](artifacts/charts/memory.svg)
 
+## Long-prompt prefill (October 27, 2026)
+
+v3 recipe + shared-Q8_0 MTP. Baseline: fn-c8 `9e23078a` built with the
+candidate's toolchain; candidate: the two host-side prefill changes
+([experiments](EXPERIMENTS.md#long-prompt-prefill-october-27-2026)). Greedy
+256-token replies to 8,779/21,022/34,812-token prompts through `gufo serve`
+at production flags are byte-identical in AR and MTP; all 25
+`qwen38_flash_next` ctests pass.
+
+| `gufo bench` MTP prefill (tok/s), r=1 | Baseline (two rounds) | Candidate (two rounds) |
+| --- | ---: | ---: |
+| pp2048 | 1,683.7 / 1,692.1 | 1,675.3 / 1,613.9 |
+| pp4096 | 1,701.7 / 1,699.9 | 1,757.4 / 1,637.1 |
+| pp8192 | 1,743.4 / 1,688.5 | 1,754.7 / 1,675.6 |
+| pp16384 | 1,722.2 / 1,697.3 | 1,743.3 / 1,664.2 |
+| pp32768 | 1,699.2 / 1,683.1 | 1,724.5 / 1,716.3 |
+| pp65536 | 1,660.0 / 1,660.1 | 1,699.1 / 1,693.4 |
+| pp131072 (one round) | 1,612.2 | 1,658.8 |
+
+Round order baseline, candidate, candidate, baseline. Below 16K the
+second candidate round fell 4–5% across every size, inside this
+machine's run-to-run spread; traces of 2,048- and 4,096-row passes show
+the same 4–5 ms of idle in both builds. A focused pp16384 alternation
+(r=2, two rounds) measured 1,706.6/1,704.6 → 1,733.6/1,733.2.
+
+HTTP, cold prompts through `gufo serve` (production flags), first and
+second request:
+
+| Measure | Baseline | Candidate |
+| --- | ---: | ---: |
+| TTFT, 57,240-token prompt | 34.37 / 36.29 s | 33.95 / 35.86 s |
+| `fnab` pp8192 (7,316 tokens), median of 3, two rounds | 1,619.8 / 1,611.4 | 1,724.5 / 1,633.5 |
+| `fnab` pp32768 (26,538 tokens), median of 3, two rounds | 1,591.8 / 1,591.7 | 1,609.9 / 1,614.2 |
+| Lowest host MemAvailable during the TTFT runs | 30 GiB | 30 GiB |
+
+`fnab` decode, baseline → candidate, two rounds (base, cand, cand, base):
+prose 512 60.0/62.7 → 62.5/60.8, code at 0 84.7/82.1 → 80.1/81.0, code at
+0.7 83.7/81.3 → 83.2/81.1 tok/s; C1/C4/C8 MTP sum of rates
+59.5/96.7/191.8 and 59.9/99.4/190.5 → 57.5/97.9/192.0 and
+61.0/101.4/188.0. Decode and verification never reach the changed waits
+(they apply from 2,048 rows); the code-at-0 difference is inside its
+per-run range (79.4–87.1 across the four runs).
+
 ## Single-user decode (October 27, 2026)
 
 v3 recipe + shared-Q8_0 MTP, greedy, thinking off. Baseline fn-c8
