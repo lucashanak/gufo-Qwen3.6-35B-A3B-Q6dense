@@ -1,5 +1,33 @@
 # Qwen3.8 Flash-Next quality
 
+## Eight-way suite decode, October 27, 2026
+
+Greedy outputs do not depend on draft lengths, verification batching or
+PLE row prefetching; the kernel changes keep each row's lane order, block
+order, products and reduction tree. Evidence, at production flags:
+
+- The 28-question slice (see [experiments](EXPERIMENTS.md#eight-way-suite-decode-october-2627-2026))
+  is byte-identical to the baseline (`9b9cbcb9`) on all 28 answers after
+  every retained step and every rejected experiment.
+- Operator checks against single-token launches, bit for bit:
+  `routed_wmma_ops` (gated widths 1–64, 24 and 27 added, rows 64/65),
+  `projection_ops` (dense K-quant widths 2–64 for Q4_K, Q6_K, Q5_1, IQ4_NL;
+  small projections 1–64), `head_ops` (1–8 rows), `hc_mix_ops`; `ngram_test`
+  checks that prefetched rows land in the row cache and a later gather reads
+  no disk rows; `batch_graph` passes.
+- The full 149-question replay is not deterministic run to run, also for an
+  unchanged binary: `9b9cbcb9` and `c9b4fc82` (identical Flash-Next code)
+  differ on 3/149 answers (reason_20, sysadm_17, lcagg_01), and the same
+  binary changes reason_20 or czech_15 between a full replay and a
+  replay of three or four of these questions. Each differing answer diverges after 4.5K–10.7K
+  characters of reasoning. The candidate differs from the `c9b4fc82` run on
+  3/149 (reason_20, czech_15, lcagg_01) and from the `9b9cbcb9` run on 2/149
+  (czech_15, sysadm_17); its reason_20, sysadm_17 and lcagg_01 answers each
+  equal one of the baseline runs, and it generated exactly the `9b9cbcb9`
+  run's 147,686 tokens. The source of the baseline's run-to-run divergence
+  (a path whose rows depend on batch composition or timing) is not yet
+  located.
+
 ## 8-bit K/V cache, October 25, 2026
 
 K and V of the twelve attention layers and the draft layer are stored as

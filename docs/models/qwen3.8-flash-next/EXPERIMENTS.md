@@ -1,5 +1,44 @@
 # Qwen3.8 Flash-Next experiments
 
+## Eight-way suite decode (October 26–27, 2026)
+
+Workload: the swapctl IQ suite replayed greedy by eight workers at the
+production flags (8 × 262,144, `--kv-cache-bytes 21474836480`,
+`--reasoning-budget-fraction 0.7`). Iterations ran a fixed 28-question slice
+(every fifth question of each category by output length, longest first;
+120K prompt and 28K generated tokens); every retained step is
+byte-identical to the baseline on all 28 answers. Baseline slice 370.9 s,
+76.6 tok/s. Speed and quality evidence:
+[BENCHMARKS.md](BENCHMARKS.md#eight-way-suite-replay-october-27-2026),
+[QUALITY.md](QUALITY.md#eight-way-suite-decode-october-27-2026).
+
+Kernel trace of the baseline at C8 (one cycle, 24 verified rows, 205 ms):
+routed experts 101 ms (gate/up 65, down 28), dense projections 55 (Q4_K
+trunk GEMVs 28, HC mixers 11, router 6, Q8_0 4.5), GatedDeltaNet 15,
+attention 6, predictor 8, idle 17 (7.5 of it waiting for PLE rows). Each
+extra verified row cost about 7 ms (experts 3.9, dense 1.9): a C8 cycle
+returned 2.85 tokens per session against 10.9 ms per token for plain decoding.
+After the retained changes a cycle at ~22 rows takes 173 ms: experts 84,
+dense 48, GatedDeltaNet 11, predictor 9, attention 6, idle 12.5 (profiled).
+
+| Experiment | Outcome |
+| --- | --- |
+| Four output rows per wave in the grouped gate/up GEMVs (shared and single-row groups, batched and up to eight rows) | Retained. Each input's activations serve four rows; shared groups decode each row's block once for all inputs. `routed_vec_bench` (48 layers, Q3_K/IQ4_NL), gate/up ms at 24 rows: overlap 61.7 → 49.2, random 79.6 → 69.8, shared 31.5 → 24.0; at 8 rows overlap 19.7 → 17.5; output hashes unchanged; `routed_wmma_ops` gated widths 1–64 (24 and 27 added) bitwise. Slice 370.9 → 352.6 s. |
+| Skip verifying a planned batch's final proposal below 0.6 head confidence | Retained. Acceptance of verified C8 drafts by head confidence (slice): 0.1–0.2 22%, 0.3–0.4 44%, 0.4–0.5 53%, 0.5–0.6 59%, 0.6–0.7 71%, 0.7–0.8 76%, 0.8–0.9 86%, ≥0.9 97%. A row cost about 6 ms against about 10 ms per token, so the final proposal of a gated chain pays only above roughly 0.55. A chain left with its anchor alone decodes as an ordinary step (its predictor row is already written). Thresholds 0.35/0.5/0.65/0.8: slice 347.9/345.9/345.8/349.3 s against 352.6. |
+| Prefetch the PLE rows of batched decode chains while drafts are proposed | Retained. The verification gather of about 450 rows (≈45% from disk) waited 7.5 ms per C8 cycle with only layer 0 queued; anchors, copies and each new draft now queue their rows on the reader pool's idle workers (`NgramTable::Prefetch`, cache-only reads), and the gather finds them cached: wait 7.5 → 0.3 ms per cycle. Slice 345.8 → 340.2 s. |
+| Vector-load small projection for batches over eight rows | Retained. Grouped (> 8 rows) router, alpha/beta and indexer launches took the bounds-checked scalar loads; they now take the whole-pass vector loads that ≤ 8 rows used. `projection_ops` widths 1–64 bitwise. Slice 339.7 → 338.2 s (within noise). |
+| One scatter butterfly for the sums of the 2–8 token and pass dense kernels | Retained. The HC up projection (K 320) spent most of a wave on sixteen separate 32-lane reductions; `scatter_reduce_sum32` gives the same bits. `route_exact_bench` hc_up Q5_1 at 8/16/32 rows: 20.0/42.7/84.4 → 15.7/29.5/54.0 µs. `projection_ops`, `head_ops`, `hc_mix_ops` pass. Slice 338.2 → 334.1 s. |
+| One scatter butterfly in the routed down projection | Retained. Shared routing at 24 rows: down 20.9 → 18.6 ms; bandwidth-bound routing unchanged; `routed_wmma_ops` passes. Slice within noise. |
+| Batched indexer projections across sessions | Rejected: removes 168 launches per C8 cycle, bitwise (`batch_graph`), slice 333.7 against 333.6 s. |
+| Single-row expert groups on a forked capture stream, overlapping the shared groups | Rejected: no change in `routed_vec_bench` (a two-stream probe overlaps a WMMA and a streaming kernel only 16%). |
+| Eight rows per wave for shared groups | Rejected: slower (overlap 24 rows 63.4 against 49.2 ms) and fast-math contraction changed the hashes. |
+| Grid-y bounds for the batched gate/up launches; unrolling the K 2560 loop | Rejected: no change; unrolled +40% (register pressure). |
+| One launch for every dense K-quant token, the last pass ragged (skipping groups past the batch) | Rejected: at 24 rows the Q4_K trunk GEMVs took 34.2 instead of 27.7 ms (16 + 8 rows in two launches). |
+| A 24-token pass for 17–24 rows | Rejected: `route_exact_bench` −8 to −11% (weights in MALL), model unchanged. |
+| Decoding Q6_K/Q5_1 codes once per pass (`DenseFragment`) | Rejected: no change; the reductions, not the decode, bounded the HC kernels. |
+| Continue drafting while the product of confidence-based acceptance estimates stays above 0.55 or 0.45, instead of the 0.85 gate | Rejected: slice 334.4/336.9 against 333.6 s. |
+| Prefill blocking decode | Not changed. The scheduler alternates one prefill step with one decode cycle, and a step under load is the model's 16,384-token capacity: a 22K prompt stalls the other seven sessions for about 13 s. Over the suite prefill takes 275 s (428,563 prompt tokens, 235 s of them in prompts over 4K) of the 1,717 s baseline. The GPU stays busy, so smaller interleaved chunks only add pass overhead; overlapping prefill with decode on a second stream recovers at most the 16% a two-stream WMMA/streaming probe overlapped (graph forks of small kernels: 30%), and fusing prefill rows into decode passes cannot share weight reads because each row keeps its route. Faster prefill kernels remain the lever. |
+
 ## 8-bit K/V and K/V that grows with the context (October 25, 2026)
 
 Quality evidence is in [QUALITY.md](QUALITY.md#8-bit-kv-cache-october-25-2026),

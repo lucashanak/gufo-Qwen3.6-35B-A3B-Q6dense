@@ -107,6 +107,34 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 
 ![Memory occupation](artifacts/charts/memory.svg)
 
+## Eight-way suite replay (October 27, 2026)
+
+The swapctl IQ suite (149 questions, `core` tier) replayed greedy by eight
+workers at the production flags: v3 recipe + shared-Q8_0 MTP, 8 × 262,144,
+`--kv-cache-bytes 21474836480`, `--reasoning-budget-fraction 0.7`,
+`--cache-ram-bytes 4294967296`. Baseline `c9b4fc82` (fn-kvmem + upstream
+0.25.0); candidate `fn-c8` on the same base. Prefill is the sum of each
+request's prompt tokens over its prefill rate; decode is the rest of the wall.
+
+| Measure | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Wall (s) | 1,716.7 | 1,546.9 | −9.9% |
+| Generated tokens | 147,180 | 147,686 | |
+| Aggregate (tok/s) | 85.7 | 95.5 | +11.4% |
+| Prefill (s, 428,563 prompt tokens) | 274.8 | 274.6 | 0% |
+| Wall minus prefill (s) | 1,441.9 | 1,272.3 | −11.8% |
+| 28-question slice wall (s) / aggregate (tok/s) | 366.1 / 77.6 | 333.9 / 85.1 | −8.8% / +9.7% |
+
+`fnab` (4 × 40,960, one round each), tok/s:
+
+| Measure | Baseline | Candidate |
+| --- | ---: | ---: |
+| pp8192 / pp32768 | 1,623 / 1,603 | 1,612 / 1,602 |
+| MTP decode 512 (prose) | 60.2 | 58.9 |
+| MTP code at 0 / 0.7 | 78.7 / 75.8 | 80.0 / 83.3 |
+| C1 / C4 / C8 MTP (sum of rates) | 58.6 / 84.3 / 181.0 | 58.9 / 101.3 / 193.7 |
+| C4 / C8 wall aggregate | 80.2 / 87.1 | 95.7 / 90.9 |
+
 ## K/V memory (October 25, 2026)
 
 v3 recipe + shared-Q8_0 MTP, `serve` with `--cache-ram-bytes 4294967296`.
