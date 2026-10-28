@@ -1158,10 +1158,20 @@ struct Routing {
 };
 
 /// Paired 128-row gate/up launch (the wide prefill route): F16 SwiGLU rows.
+std::vector<__half> SeparateSwiglu(const Routing& r, const void* gate,
+                                   const void* up, q::WeightType type,
+                                   const __half* x, std::size_t m,
+                                   std::size_t k, std::uint32_t tile_rows,
+                                   std::vector<float>* gate_out = nullptr);
+
+/// The wide prefill gate/up route: the paired kernel, or for IQ4_XS (which
+/// has none) the separate launches at the 128-token tile height.
 std::vector<__half> PairedSwiglu(const Routing& r, const void* gate,
                                  const void* up, q::WeightType type,
                                  const __half* x, std::size_t m,
                                  std::size_t k) {
+  if (type == q::WeightType::kIQ4_XS)
+    return SeparateSwiglu(r, gate, up, type, x, m, k, 128);
   std::uint32_t n = 0;
   auto* tiles = r.Tiles(128, &n);
   auto* out = Upload(std::vector<__half>(r.slots * m, __float2half(-7.0F)));
@@ -1182,7 +1192,7 @@ std::vector<__half> SeparateSwiglu(const Routing& r, const void* gate,
                                    const void* up, q::WeightType type,
                                    const __half* x, std::size_t m,
                                    std::size_t k, std::uint32_t tile_rows,
-                                   std::vector<float>* gate_out = nullptr) {
+                                   std::vector<float>* gate_out) {
   std::uint32_t n = 0;
   auto* tiles = r.Tiles(tile_rows, &n);
   auto* g = Upload(std::vector<float>(r.slots * m, -7.0F));
@@ -1596,6 +1606,10 @@ int main() {
            {q::WeightType::kQ5_1, q::WeightType::kIQ4_NL, q::WeightType::kQ8_0,
             q::WeightType::kQ5_0, q::WeightType::kQ4_0})
         routes = (formats_only || CheckPassRoutes(gate, down)) && routes;
+    for (const auto down : {q::WeightType::kIQ4_NL, q::WeightType::kQ5_1})
+      routes =
+          (formats_only || CheckPassRoutes(q::WeightType::kIQ4_XS, down)) &&
+          routes;
     using gufo::core::GgmlType;
     for (const GgmlType down :
          {GgmlType::kQ4_0, GgmlType::kQ4_1, GgmlType::kQ5_0, GgmlType::kQ5_1,
@@ -1656,6 +1670,11 @@ int main() {
       ok = Ok(Run(type, 97, 1, 8, 129, 640, 0x50A40002U, 16)) && ok;
       ok = Ok(Run(type, 3000, 1, 64, 2560, 640, 0x50A40004U, 48)) && ok;
     }
+    // IQ4_XS gate/up view (the IQ4_XS mixes' experts) at every tile.
+    for (const std::uint32_t tile : {16U, 48U, 128U})
+      ok = Ok(Run(q::WeightType::kIQ4_XS, 300, 10, 64, 640, 2560,
+                  0x14C40000U + tile, tile)) &&
+           ok;
     // Q8_0 down view (five layers keep Q8_0 down projections).
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,
                 128)) &&

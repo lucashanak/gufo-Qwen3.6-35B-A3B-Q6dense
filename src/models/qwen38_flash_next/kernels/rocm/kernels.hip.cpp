@@ -5500,6 +5500,7 @@ __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
          : kType == WeightType::kQ5_K   ? (k / 256) * kQ5KBlockBytes
          : kType == WeightType::kQ3_K   ? (k / 256) * kQ3KBlockBytes
          : kType == WeightType::kIQ4_NL ? (k / 32) * 18
+         : kType == WeightType::kIQ4_XS ? (k / 256) * 136
          : kType == WeightType::kQ4_0   ? (k / 32) * 18
          : kType == WeightType::kQ5_0   ? (k / 32) * 22
          : kType == WeightType::kQ5_1   ? (k / 32) * sizeof(Q5_1Block)
@@ -5583,7 +5584,8 @@ __launch_bounds__(256) __global__
   constexpr bool kQ5K = kType == WeightType::kQ5_K;
   // IQ4_NL, Q5_0 and Q4_0 take the Q8_0 route once their values are
   // expanded to signed bytes.
-  constexpr bool kIQ4 = kType == WeightType::kIQ4_NL;
+  constexpr bool kIQ4 =
+      kType == WeightType::kIQ4_NL || kType == WeightType::kIQ4_XS;
   constexpr bool kSmall =
       kType == WeightType::kQ5_0 || kType == WeightType::kQ4_0;
   constexpr bool kQ8 = kType == WeightType::kQ8_0 || kIQ4 || kSmall;
@@ -5727,10 +5729,28 @@ __launch_bounds__(256) __global__
     for (int u = 0; u < (kQ5 ? 0 : kWaveRowTiles); ++u) {
       if constexpr (kIQ4) {
         // block_iq4_nl: d, then elements 0-15 / 16-31 as low / high nibbles.
-        const auto* blk = f_ptr[u] + ((kb0 + f_c) * 18);
-        f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
+        // An IQ4_XS K32 block is the same codes with the F16 scale
+        // d * (ls - 32) of its super-block's six-bit sub-block scale.
+        const std::uint8_t* qs_bytes;
+        if constexpr (kType == WeightType::kIQ4_XS) {
+          const int kb = kb0 + f_c;
+          const auto* sb = f_ptr[u] + ((kb / 8) * 136);
+          const int ib = kb % 8;
+          const std::uint16_t scales_h =
+              *reinterpret_cast<const std::uint16_t*>(sb + 2);
+          const int ls = ((sb[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) |
+                         (((scales_h >> (2 * ib)) & 3) << 4);
+          const float d = __half2float(*reinterpret_cast<const __half*>(sb));
+          f_dm[u] = __builtin_bit_cast(std::uint16_t,
+                                       __float2half(d * float(ls - 32)));
+          qs_bytes = sb + 8 + (16 * ib);
+        } else {
+          const auto* blk = f_ptr[u] + ((kb0 + f_c) * 18);
+          f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
+          qs_bytes = blk + 2;
+        }
         uint4 qs;
-        __builtin_memcpy(&qs, blk + 2, 16);
+        __builtin_memcpy(&qs, qs_bytes, 16);
         f_codes[u] = make_uint4(IQ4NLBytes(qs.x), IQ4NLBytes(qs.y),
                                 IQ4NLBytes(qs.z), IQ4NLBytes(qs.w));
         f_codes_hi[u] =
@@ -8190,6 +8210,12 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
           dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
           swiglu_gate, out, out_half, m, k);
       return true;
+    case WeightType::kIQ4_XS:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ4_XS, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k);
+      return true;
     case WeightType::kQ5_0:
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_0, kBM, BN, kBK>),
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
@@ -8227,7 +8253,7 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    std::size_t m, std::size_t k, hipStream_t stream) {
   const std::size_t block_elems =
       (type == WeightType::kQ3_K || type == WeightType::kQ4_K ||
-       type == WeightType::kQ5_K)
+       type == WeightType::kQ5_K || type == WeightType::kIQ4_XS)
           ? 256
           : 64;
   if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
@@ -8244,6 +8270,18 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
     case 128: {
+      if (type == WeightType::kIQ4_XS) {
+        // IQ4_XS gate/up has no paired kernel: prefill runs these 128-token
+        // tiles separately (each token's sums are the 16/48-row tiles').
+        constexpr int kBM = 128;
+        const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM),
+                        n_tiles);
+        hipLaunchKernelGGL(
+            (RoutedF16GEMMKernel<WeightType::kIQ4_XS, kBM, 128, 2>), grid,
+            dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
+            rows_out, swiglu_gate, out, out_half, m, k);
+        return true;
+      }
       if (out_half == nullptr || swiglu_gate != nullptr)
         return false;
       const dim3 grid(static_cast<unsigned int>((m + 127) / 128), n_tiles);
