@@ -1759,6 +1759,25 @@ void Executor::DropReadyQ8() const {
   pending_combine_ = {};  // a cancelled pass may have left one
 }
 
+void Executor::EmbedRows(const std::int32_t* tokens, float* res,
+                         std::uint32_t n, std::uint32_t streams) const {
+  // A tied K-quant head keeps the file's rows as its decode rows.
+  const DeviceTensor& t = model_->token_embd();
+  const void* table = t.decode != nullptr ? t.decode : t.data;
+  const GgmlType type = t.decode != nullptr ? t.decode_type : t.type;
+  if (type == GgmlType::kF32 || type == GgmlType::kF16 ||
+      type == GgmlType::kBF16 || type == GgmlType::kQ8_0) {
+    EmbedTokens(table, SmallType(type), tokens, res, n, config().hidden_size,
+                streams, stream_);
+    return;
+  }
+  // Validated at upload: every block format has a gather.
+  (void)qfn_mmq_get_rows(static_cast<int>(type), table, tokens, res,
+                         static_cast<int>(n),
+                         static_cast<int>(config().hidden_size),
+                         static_cast<int>(streams), stream_);
+}
+
 bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
                         Q8Input* q, std::string* error_msg) const {
   q->x = x;
@@ -1823,8 +1842,8 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           std::string* error_msg) const {
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
-  if (!MatrixRows(n_tokens) && up.decode != nullptr &&
-      gate.decode != nullptr && up.decode_type == gate.decode_type &&
+  if (!MatrixRows(n_tokens) && up.decode != nullptr && gate.decode != nullptr &&
+      up.decode_type == gate.decode_type && GatedVecFormat(up.decode_type) &&
       up.rows == gate.rows && up.cols == gate.cols) {
     // The mixer that produced x usually wrote its Q8_1 rows as well.
     const void* ready = ReadyQ8(x, n_tokens, up.cols);
@@ -1844,9 +1863,11 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
     }
     return true;
   }
+  // Compact decode rows without a gated kernel take the separate
+  // projections below, never their Q8_0 copies (as GatedDenseBatch does).
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
-      gate.type == GgmlType::kQ8_0 && up.rows == gate.rows &&
-      up.cols == gate.cols) {
+      gate.type == GgmlType::kQ8_0 && up.decode == nullptr &&
+      gate.decode == nullptr && up.rows == gate.rows && up.cols == gate.cols) {
     Q8Input xq;
     if (!Quantize(x, n_tokens, up.cols, &xq, error_msg)) {
       return false;
@@ -2124,29 +2145,8 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
     rc = qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
                          E, U, stream_);
   } else {
-    switch (w.type) {
-      case GgmlType::kQ3_K:
-        rc = qfn_mmq_q3_K_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kQ4_K:
-        rc = qfn_mmq_q4_K_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kQ5_K:
-        rc = qfn_mmq_q5_K_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kQ5_1:
-        rc = qfn_mmq_q5_1_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kIQ4_NL:
-        rc = qfn_mmq_iq4_nl_moe_raw(w.data, x, ids, out, M, K, T, E, U,
-                                    stream_);
-        break;
-      case GgmlType::kQ8_0:
-        rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      default:
-        break;
-    }
+    rc = qfn_mmq_moe_raw(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
+                         E, U, stream_);
   }
   if (rc != 0) {
     AssignError(error_msg, "expert GEMM failed");
@@ -3130,9 +3130,12 @@ bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
   return ExpertMatrixRows(n_tokens) &&
          (l.ffn_gate_exps.type == GgmlType::kQ3_K ||
           l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-          l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
+          l.ffn_gate_exps.type == GgmlType::kQ5_K ||
+          l.ffn_gate_exps.type == GgmlType::kIQ4_XS) &&
          l.ffn_up_exps.type == l.ffn_gate_exps.type &&
          (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
+          l.ffn_down_exps.type == GgmlType::kQ5_0 ||
+          l.ffn_down_exps.type == GgmlType::kQ4_0 ||
           l.ffn_down_exps.type == GgmlType::kIQ4_NL ||
           l.ffn_down_exps.type == GgmlType::kQ8_0) &&
          c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
@@ -3171,37 +3174,38 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // Prefill pairs the gate/up projections and applies SwiGLU without
     // materializing the gate; decode-time batches keep separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
-    const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
-                                     ? WeightType::kQ5_K
-                                 : l.ffn_gate_exps.type == GgmlType::kQ3_K
-                                     ? WeightType::kQ3_K
-                                     : WeightType::kQ4_K;
+    const auto gate_type = static_cast<WeightType>(l.ffn_gate_exps.type);
+    // IQ4_XS has no paired kernel: its prefill tiles take the separate
+    // launches at the wide map's 128-token height.
+    const bool paired = gate_type != WeightType::kIQ4_XS;
+    const bool wide = routed_wide_tiles_ != 0;
+    const std::uint32_t gate_tiles =
+        wide ? routed_wide_tiles_ : routed_n_tiles_;
+    const std::uint32_t gate_rows = wide ? 128 : routed_tile_rows_;
     const bool gated_ok =
-        routed_wide_tiles_ != 0
+        wide && paired
             ? RoutedGatedF16Gemm(l.ffn_gate_exps.data, l.ffn_up_exps.data,
                                  gate_type, x_half, s_.routed_tiles,
                                  routed_wide_tiles_, s_.routed_bounds,
                                  s_.rows_token, s_.rows_slot, up_half,
                                  c.expert_ff, c.hidden_size, stream_)
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
-                             s_.routed_tiles, routed_n_tiles_,
-                             routed_tile_rows_, s_.routed_bounds, s_.rows_token,
-                             s_.rows_slot, nullptr, s_.gate_e, nullptr,
-                             c.expert_ff, c.hidden_size, stream_) &&
+                             s_.routed_tiles, gate_tiles, gate_rows,
+                             s_.routed_bounds, s_.rows_token, s_.rows_slot,
+                             nullptr, s_.gate_e, nullptr, c.expert_ff,
+                             c.hidden_size, stream_) &&
                RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half,
-                             s_.routed_tiles, routed_n_tiles_,
-                             routed_tile_rows_, s_.routed_bounds, s_.rows_token,
-                             s_.rows_slot, s_.gate_e, nullptr, up_half,
-                             c.expert_ff, c.hidden_size, stream_));
+                             s_.routed_tiles, gate_tiles, gate_rows,
+                             s_.routed_bounds, s_.rows_token, s_.rows_slot,
+                             s_.gate_e, nullptr, up_half, c.expert_ff,
+                             c.hidden_size, stream_));
     if (!gated_ok) {
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }
-    const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
-                                     ? WeightType::kQ8_0
-                                 : l.ffn_down_exps.type == GgmlType::kIQ4_NL
-                                     ? WeightType::kIQ4_NL
-                                     : WeightType::kQ5_1;
+    // WmmaExperts admits only the down formats the F16 route decodes; the
+    // GGUF ids are the WeightType values.
+    const auto down_type = static_cast<WeightType>(l.ffn_down_exps.type);
     // Prefill takes the gate/up map's 128-token tiles: each wave decodes its
     // rows' weights once for up to 128 tokens.
     const bool wide_down = routed_wide_tiles_ != 0;
@@ -3630,8 +3634,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                "token upload", error_msg)) {
       return false;
     }
-    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
-                s_.tokens, s_.res, n, c.hidden_size, c.hc_count, stream_);
+    EmbedRows(s_.tokens, s_.res, n, c.hc_count);
     session.vision_input_.Inject(s_.res, start_pos, n, c.hidden_size,
                                  c.hc_count, stream_);
   }
@@ -4939,8 +4942,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
              "token upload", error_msg)) {
     return false;
   }
-  EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
-              s_.tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
+  EmbedRows(s_.tokens, s_.mtp_embd, n, 1);
   // MTP embeds shifted token IDs. Visual information arrives in the trunk
   // hidden stream; image embeddings belong only to the target input.
   RmsNormRows(s_.mtp_embd, l.nextn_enorm.f32(), s_.mtp_embd, n, c.hidden_size,
@@ -5010,6 +5012,12 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     const TensorRef layout{.type = kv.type, .cols = kv.cols};
     kv.data = static_cast<std::uint8_t*>(kv.data) +
               std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
+    if (kv.decode != nullptr) {
+      // Block-format rows: the K/V slice of the compact decode rows too.
+      const TensorRef compact{.type = kv.decode_type, .cols = kv.cols};
+      kv.decode = static_cast<const std::uint8_t*>(kv.decode) +
+                  std::size_t{2} * c.AttentionQDim() * compact.RowBytes();
+    }
     kv.rows = 2 * c.AttentionKvDim();
     if (!project(kv, s_.mixed, s_.qg, n) ||
         !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,

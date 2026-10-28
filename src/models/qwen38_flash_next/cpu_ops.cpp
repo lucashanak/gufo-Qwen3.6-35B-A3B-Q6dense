@@ -13,49 +13,8 @@ void DequantizeRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
                    float* out) {
   const std::uint8_t* src = t.Expert(e) + row * t.RowBytes();
   const std::size_t k = t.cols;
-  switch (t.type) {
-    case GgmlType::kF32:
-      std::memcpy(out, src, k * sizeof(float));
-      break;
-    case GgmlType::kF16:
-      for (std::size_t i = 0; i < k; ++i) {
-        std::uint16_t h = 0;
-        std::memcpy(&h, src + 2 * i, 2);
-        out[i] = gufo::quant::Fp16ToFloat(h);
-      }
-      break;
-    case GgmlType::kBF16:
-      for (std::size_t i = 0; i < k; ++i) {
-        std::uint16_t h = 0;
-        std::memcpy(&h, src + 2 * i, 2);
-        const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
-        std::memcpy(out + i, &bits, 4);
-      }
-      break;
-    case GgmlType::kQ8_0:
-      gufo::quant::DequantizeQ8_0(src, out, k);
-      break;
-    case GgmlType::kQ5_1:
-      gufo::quant::DequantizeQ5_1(src, out, k);
-      break;
-    case GgmlType::kIQ4_NL:
-      gufo::quant::DequantizeIQ4_NL(src, out, k);
-      break;
-    case GgmlType::kQ3_K:
-      gufo::quant::DequantizeQ3_K(src, out, k);
-      break;
-    case GgmlType::kQ4_K:
-      gufo::quant::DequantizeQ4_K(src, out, k);
-      break;
-    case GgmlType::kQ5_K:
-      gufo::quant::DequantizeQ5_K(src, out, k);
-      break;
-    case GgmlType::kQ6_K:
-      gufo::quant::DequantizeQ6_K(src, out, k);
-      break;
-    default:
-      std::memset(out, 0, k * sizeof(float));
-      break;
+  if (!gufo::quant::DequantizeRow(t.type, src, out, k)) {
+    std::memset(out, 0, k * sizeof(float));
   }
 }
 

@@ -32,12 +32,20 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_MMQ_DIR}/mmid.hip.cpp
     ${QFN_MMQ_DIR}/mmvq.hip.cpp
     ${QFN_MMQ_DIR}/moe_wave64.hip.cpp
-    ${QFN_MMQ_DIR}/quantize.hip.cpp)
+    ${QFN_MMQ_DIR}/quantize.hip.cpp
+    ${QFN_MMQ_DIR}/getrows.hip.cpp
+    ${QFN_MMQ_DIR}/mmq_formats_a.hip.cpp
+    ${QFN_MMQ_DIR}/mmq_formats_b.hip.cpp
+    ${QFN_MMQ_DIR}/mmq_formats_c.hip.cpp)
 
   add_library(gufo_qwen38_flash_next_mmq STATIC ${QFN_MMQ_SOURCES})
   set_source_files_properties(${QFN_MMQ_SOURCES} PROPERTIES LANGUAGE HIP)
   set_source_files_properties(${QFN_MMQ_DIR}/moe_wave64.hip.cpp
     PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")
+  # Embedding rows must equal the CPU dequantization bit for bit: no fused
+  # or reassociated products.
+  set_source_files_properties(${QFN_MMQ_DIR}/getrows.hip.cpp
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
   set_target_properties(gufo_qwen38_flash_next_mmq PROPERTIES
     HIP_STANDARD 17
     HIP_STANDARD_REQUIRED ON

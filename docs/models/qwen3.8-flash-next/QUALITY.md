@@ -102,6 +102,42 @@ the frontier logits after every step, production flags: 262,144 context,
   each, 1,425 s / 1,456 s).
 - All 25 `qwen38_flash_next` ctests pass.
 
+## GGUF formats, October 28, 2026
+
+New formats leave the production recipes' arithmetic alone: their tensors
+take the same kernels as before. Evidence (fn-formats against fn-prefill
+`13c2897c`, v3 recipe + shared-Q8_0 MTP):
+
+- Greedy C1 replies (five fixed prompts, 384 tokens, thinking off) are
+  byte-identical in AR (5/5) and MTP (5/5); the eight-way 28-question slice
+  at production flags matches on all 28 questions.
+- All 25 `qwen38_flash_next` ctests pass. New operator checks, every format:
+  - `ggml_dequant_test`: `DequantizeRow` of random blocks of all 18 block
+    formats hashes to gguf-py's NumPy dequantization bit for bit.
+  - `projection_ops`: the embedding gather equals the CPU dequantization for
+    19 formats; every dense decode format's GEMV is within 2e-3 of an F64
+    reference (relative to Σ|w·x|) and each of 1–64 rows is bit for bit the
+    row projected alone (trunk shape, and 320/640-wide rows for the 32-element
+    formats).
+  - `routed_wmma_ops`: for 14 gate/up and 6 down formats the routed vector
+    kernel matches F64, its rows are the same at every width and paired; the
+    tiled MMQ route matches F64 and its rows are bit for bit the same in
+    every prompt pass (1, 7, 9, 33 tokens, half the prompt); WMMA Q5_0/Q4_0
+    down and IQ4_XS gate/up rows agree across 16/48/128-token tiles and
+    prompt passes (`CheckPassRoutes`).
+  - `ngram_test`: Q5_0, Q4_0, Q4_1 and Q5_1 PLE tables decode as the CPU
+    dequantization through cold and cached gathers.
+
+A standard llama.cpp **Q4_K_M** of the Q8_0 source (unsloth imatrix;
+Q4_K/Q6_K trunk, Q6_K head, Q4_K embedding and inject rows, Q4_K experts
+with Q5_0/Q8_0 down, Q5_0 mixer `up` and PLE table, F16 PLE taps; 119 GB)
+loads and answers coherently. Greedy AR and MTP C1 replies are
+byte-identical (5/5), and the eight-way slice equals the same 28 questions
+sent one at a time (28/28), so batched decoding and verification rows equal
+isolated ones. Of the 22 slice questions with a short final answer, 20
+match the v3 recipe's (`reason_03` and `lcagg_16` differ; this is a sanity
+check, not a quality score).
+
 ## Long-prompt prefill, October 27, 2026
 
 Both retained changes are host-side: how the inference thread waits for a

@@ -431,9 +431,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                               hipMemcpyHostToDevice, stream_),
                error))
       return false;
-    EmbedTokens(model_->token_embd().data,
-                EmbeddingType(model_->token_embd().type), base.tokens,
-                base.mtp_embd, rows, c.hidden_size, 1, stream_);
+    EmbedRows(base.tokens, base.mtp_embd, rows, 1);
     RmsNormRows(base.mtp_embd, l.nextn_enorm.f32(), base.mtp_embd, rows,
                 c.hidden_size, 1, c.rms_eps, stream_);
     for (std::size_t i = 0; i < items.size(); ++i) {
@@ -471,6 +469,12 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       const TensorRef layout{.type = kv.type, .cols = kv.cols};
       kv.data = static_cast<std::uint8_t*>(kv.data) +
                 std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
+      if (kv.decode != nullptr) {
+        // Block-format rows: the K/V slice of the compact decode rows too.
+        const TensorRef compact{.type = kv.decode_type, .cols = kv.cols};
+        kv.decode = static_cast<const std::uint8_t*>(kv.decode) +
+                    std::size_t{2} * c.AttentionQDim() * compact.RowBytes();
+      }
       kv.rows = 2 * c.AttentionKvDim();
       if (!DenseBatch(kv, base.mixed, base.qg, rows, error) ||
           !DenseBatch(l.indexer_k, base.mixed, base.ik, rows, error))
@@ -939,8 +943,8 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
   if (q8 && !QuantizeBatch(x, rows, up.cols, error))
     return false;
   if (up.decode != nullptr && gate.decode != nullptr &&
-      up.decode_type == gate.decode_type && up.rows == gate.rows &&
-      up.cols == gate.cols && rows <= 64) {
+      up.decode_type == gate.decode_type && GatedVecFormat(up.decode_type) &&
+      up.rows == gate.rows && up.cols == gate.cols && rows <= 64) {
     // GatedDense's decode GEMV over every row at once: each row's sum is
     // the per-request launch's, and the compact rows are read once.
     return qfn_mmq_moe_gated_vec(static_cast<int>(up.decode_type), gate.decode,
@@ -1003,6 +1007,30 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                               rows, c.num_experts, c.num_experts_used,
                               stream_) != 0 ||
         qfn_mmq_moe_vec(
+            static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
+            base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
+            rows * c.num_experts_used, c.num_experts, 1, stream_) != 0)
+      return Fail(error, "batched routed vector projection failed");
+    MoeEpilogue(base.down_e, base.weights, base.shexp_out,
+                base.router + c.num_experts, c.num_experts + 1, out, rows,
+                c.num_experts_used, c.hidden_size, stream_);
+    return true;
+  }
+  if (l.ffn_up_exps.type == gate_type &&
+      l.ffn_up_exps.rows == l.ffn_gate_exps.rows &&
+      l.ffn_up_exps.cols == l.ffn_gate_exps.cols &&
+      l.ffn_up_exps.experts == l.ffn_gate_exps.experts) {
+    // Formats without the gated kernel: MoeExperts' decode route (paired
+    // vector projections, SwiGLU, then the down projection's slot rows) over
+    // every row at once. Each row's sums do not depend on the launch width.
+    if (qfn_mmq_moe_vec(static_cast<int>(gate_type), l.ffn_gate_exps.data, x,
+                        base.ids, base.gate_e, c.expert_ff, c.hidden_size, rows,
+                        c.num_experts, c.num_experts_used, stream_,
+                        l.ffn_up_exps.data, base.up_e) != 0)
+      return Fail(error, "batched routed pair projection failed");
+    Swiglu(base.gate_e, base.up_e,
+           std::size_t{rows} * c.num_experts_used * c.expert_ff, stream_);
+    if (qfn_mmq_moe_vec(
             static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
             base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
             rows * c.num_experts_used, c.num_experts, 1, stream_) != 0)
@@ -1236,9 +1264,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                  error)) {
         return false;
       }
-      EmbedTokens(model_->token_embd().data,
-                  EmbeddingType(model_->token_embd().type), base.tokens,
-                  base.res, rows, c.hidden_size, c.hc_count, stream_);
+      EmbedRows(base.tokens, base.res, rows, c.hc_count);
       for (std::size_t i = 0; i < items.size(); ++i) {
         items[i].session->vision_input_.Inject(
             base.res + std::size_t{offsets[i]} * c.HcDim(),
