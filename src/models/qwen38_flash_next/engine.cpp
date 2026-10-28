@@ -943,8 +943,15 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
            (remaining / 2 + kRampAlign - 1) / kRampAlign * kRampAlign});
     return n;
   };
+  const std::size_t ratio =
+      std::max<std::uint32_t>(1, model_->config().compress_ratio);
   for (std::size_t off = 0; off < tokens.size();) {
     std::size_t n = pass_tokens(tokens.size() - off, ramp);
+    // A following pass starts on a selection block (WmmaCausalAttention).
+    if (const auto end = tokens_.size() + n;
+        prefill && off + n < tokens.size() && end % ratio != 0 &&
+        n > end % ratio)
+      n -= end % ratio;
     // Extended-context attention can fall back from WMMA to the per-token
     // kernel. Its checkpoint must end a pass: the fused in-pass path requires
     // WMMA for both query groups. Preserve ordinary split-pass arithmetic on

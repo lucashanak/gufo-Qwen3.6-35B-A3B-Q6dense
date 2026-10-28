@@ -2531,6 +2531,10 @@ public:
                 // Each pass reads every routed expert, so a short budget
                 // beside decoders repeats that read per few hundred tokens.
                 .active_prefill_tokens = model_->PrefillCapacity(),
+                // Sparse prefill tiles group four queries from each pass
+                // start: one selection block (compress ratio).
+                .prefill_alignment =
+                    std::max<std::size_t>(1, model_->config().compress_ratio),
             },
         .persistence = persistence_,
     };

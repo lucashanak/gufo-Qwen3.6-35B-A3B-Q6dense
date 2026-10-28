@@ -573,6 +573,13 @@ void Attention(const float* q, const std::uint8_t* k_cache,
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
 /// Returns false when the visible extent exceeds 262,144 tokens; the caller
 /// falls back to Attention.
+/// With a mask, each tile packs four consecutive queries from the first row
+/// and gathers the union of their selections, so a row's rounding depends on
+/// which queries share its tile. A prompt split therefore matches one pass
+/// only when every pass after the first starts on a multiple of four.
+/// Session::Feed keeps its own passes there, and the serving runner rounds
+/// pass ends and checkpoints to TextRunnerCapabilities::prefill_alignment
+/// (asserted in TextRunnerPool::Request::Prefill).
 bool WmmaCausalAttention(const float* q, const float* gate,
                          const std::uint8_t* k_cache,
                          const std::uint8_t* v_cache, const std::uint32_t* mask,

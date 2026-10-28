@@ -132,6 +132,10 @@ struct TextRunnerCapabilities {
   /// Prompt tokens between active decode rounds when `--prefill-chunk` is
   /// not given. Zero keeps the server default.
   std::size_t active_prefill_tokens{0};
+  /// Prefill continues a prompt exactly only from positions divisible by
+  /// this. Intermediate pass ends and published prompt checkpoints are
+  /// rounded down to it; one keeps every position.
+  std::size_t prefill_alignment{1};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
