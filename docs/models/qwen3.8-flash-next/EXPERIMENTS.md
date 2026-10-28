@@ -1,5 +1,49 @@
 # Qwen3.8 Flash-Next experiments
 
+## GGUF formats (October 28, 2026)
+
+Goal: load the standard llama.cpp mixes of this model (and unsloth's UD
+mixes) without retyping them, keeping the exactness contract. Dry runs of
+`llama-quantize` (a qwen4exp-capable build) over the Q8_0 source list the
+formats each mix writes: K-quants and IQ formats on the 2,560/6,144/10,240
+columns; Q5_0 (Q4_K mixes), Q5_1, IQ4_NL or Q4_0 (Q2_K/IQ2 mixes) on the
+640-wide down projections, the 320-wide mixer `up` rows and the 160-wide PLE
+table; Q6_K/Q5_K heads; any format for `token_embd` and the four HC inject
+rows; F16 PLE taps.
+
+| Experiment | Outcome |
+| --- | --- |
+| Decode GEMV, routed vector and tiled MMQ dispatch for every block format | Retained. The vendored kernels implement every format; the adapter's tables were trimmed. Every dense format's rows are bit for bit the same at 1–64 tokens; the routed vector kernel's rows at every width and paired; the tiled route's rows across prompt passes (`projection_ops`, `routed_wmma_ops`). |
+| Q2_K dense decode rows at different widths | Fixed: `vec_dot_q2_K_q8_1_impl_mmvq` let fast-math contract its sums differently per caller unroll (N=2 differed from N=1). Explicit `__fmaf_rn`/`__fmul_rn` roundings, Q2_K only. |
+| Tiled MMQ rows across prompt passes | Fixed: the DS4 (Q4_1, Q5_1, Q4_K, Q5_K, IQ1_S), Q3_K-layout (Q3_K, IQ2_XS, IQ2_S) and Q2_K WMMA dot products changed 30–90% of the output values (rounding-level, up to 0.2 relative on near-zero outputs) with the column's position in the tile (fast-math contraction per unrolled column tile; a fixed tile width did not help). The same explicit roundings as the existing Q8_0 fix make every format pass-invariant. The production recipes never take these routes (their prefill experts are WMMA). |
+| Exact embedding gather for every format | Retained: `qfn_mmq_get_rows`, compiled without fast-math, equals the CPU dequantization, which in turn equals gguf-py's NumPy dequantizers bit for bit over random blocks of all 18 formats. An untied table keeps only its file rows. |
+| WMMA down projection for Q5_0 / Q4_0 | Retained: their codes enter the Q8_0 route as signed bytes (`code − 16` / `code − 8`), so Q4_K mixes keep the WMMA prefill route. Rows are bit for bit the same across 16/48/128-token tiles and prompt passes. |
+| WMMA gate/up for IQ4_XS | Retained: a K32 block is IQ4_NL's codes with the F16 scale `d·(ls − 32)`; without a paired kernel, prefill runs gate and up separately on the wide map's 128-token tiles, bit for bit the 16/48-token tiles. |
+| Batched decode steps of formats without the gated kernel | Retained: one paired vector launch, SwiGLU and one down launch over all rows (MoeExperts' decode route over every row) instead of eight-row chunks. |
+| Quantized HC inject rows, F16 PLE taps | Widened to F32 on the host at upload; the fused mixer and PLE convolution read F32. |
+| Native IQ4_XS against the IQ4_NL retype of the uncensored model | Not run: the original IQ4_XS file is no longer on disk. |
+
+Production recipe speed (`fnab.sh`, v3 + MTP, four sessions; 13c2897c and
+the branch alternating twice, median of three per cell; same arithmetic):
+
+| Cell | 13c2897c | fn-formats |
+| --- | ---: | ---: |
+| prefill 7.3K | 1,644.8 / 1,693.9 | 1,644.7 / 1,635.3 |
+| prefill 26.5K | 1,694.6 / 1,620.4 | 1,618.9 / 1,613.7 |
+| prose decode | 61.6 / 61.9 | 60.6 / 60.9 |
+| code decode (T=0 / 0.7) | 81.6–81.9 / 81.7–82.1 | 82.2–86.0 / 81.7–86.3 |
+| C1 / C4 / C8 | 59.9–60.2 / 100.0–100.7 / 193.9–195.4 | 58.7–61.9 / 99.2–101.5 / 192.5–197.6 |
+
+Within run-to-run noise except prose decode (−1.6% in both rounds, ranges
+overlapping in the second) and C1 AR in the greedy prompt set (39.37 →
+39.02/39.01 tok/s, −0.9%, one run each); MTP C1 −0.1/−0.2%, the eight-way
+slice 331.3 → 330.8/331.8 s. Inconclusive at this sample size.
+
+The self-made Q4_K_M (on the 1M-record dataset, so PLE row reads stall
+more than the 16K-record v3 file; not a format comparison): prefill
+1,407/1,459 tok/s, prose 50.6, code 68.7, C1/C4/C8 53.0/72.1/146.1; the
+eight-way slice 412.9 s.
+
 ## Long-prompt prefill (October 27, 2026)
 
 Workload: v3 recipe + shared-Q8_0 MTP, `gufo bench` pp2K–pp128K and cold

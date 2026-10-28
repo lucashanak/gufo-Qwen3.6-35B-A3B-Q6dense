@@ -1,7 +1,8 @@
 # Qwen3.8 Flash-Next
 
 Hybrid recurrent/QSA mixture-of-experts text/image model on gfx1151.
-Supported target: `unsloth/Qwen3.8-Flash-Next-GGUF`, **UD-Q4_K_XL** (four shards).
+Supported target: `unsloth/Qwen3.8-Flash-Next-GGUF`, **UD-Q4_K_XL** (four shards);
+standard llama.cpp mixes load too (see [GGUF formats](#gguf-formats)).
 Optional shared-Q8 MTP predictor; optional BF16 vision projector.
 Original unquantized-model and GGUF-conversion parity remain unqualified.
 
@@ -106,6 +107,31 @@ attention kernel rather than the fused WMMA kernel. Memory grows with used
 context and selected rollback depth (about 27.5 KiB per context token with
 MTP, measured on gfx1151); admission reserves the configured capacity before
 creating sessions.
+
+## GGUF formats
+
+Every GGML block format that `llama-quantize` writes for this model loads:
+Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
+IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS, besides F32/F16/BF16, in the
+tensor classes below. The routed experts take every format except IQ1_M,
+which the tiled prefill kernels do not implement.
+
+| Tensors | Formats | Decode | Prefill |
+| --- | --- | --- | --- |
+| `token_embd` | any | exact row gather (`qfn_mmq_get_rows`) | same |
+| `output`, trunk, shared expert, PLE projections, `ssm_alpha`/`ssm_beta` | Q8_0, F16/BF16/F32, or any block format | the file's rows (`qfn_mmq_dense_kq_vec`) | their Q8_0 re-encoding (W8A8 / F16 GEMMs) |
+| HC mixers | as above (320-wide `up`: 32-element formats); `inject` any format, widened to F32 unless Q8_0/BF16 | fused kernel for Q8_0, Q6_K/Q5_1 and IQ4_NL; others separate GEMVs | Q8_0 re-encoding |
+| Routed gate/up | all but IQ1_M | Q3_K/Q4_K/Q5_K/Q8_0 gated kernel; others paired vector kernel + SwiGLU (batched steps too) | Q3_K/Q4_K/Q5_K (paired) and IQ4_XS (separate 128-token tiles): WMMA; others tiled MMQ |
+| Routed down (640 wide) | 32-element formats | vector kernel | Q5_1, Q5_0, Q4_0, IQ4_NL, Q8_0: WMMA (with a WMMA gate/up); others tiled MMQ |
+| `per_layer_token_embd` (160 wide) | 32-element formats, BF16 | CPU decode of disk rows | same |
+| `ple_conv1d` | F32, F16, BF16 (widened to F32) | | |
+
+The exactness contract holds for every format: a decode row is bit for bit
+the same alone, in a batched step and as an MTP verification row, and a
+prompt row does not depend on the pass that computes it
+(`projection_ops`, `routed_wmma_ops`; [Quality](QUALITY.md#gguf-formats-october-28-2026)).
+Formats outside the fast routes cost speed, not exactness; measured costs
+are in [Experiments](EXPERIMENTS.md#gguf-formats-october-28-2026).
 
 ## Images
 
