@@ -434,8 +434,55 @@ struct Uploader {
     return d;
   }
 
+  /// A tensor its kernels read as F32 (taps, inject rows), widened exactly
+  /// from any other file format on the host.
+  DeviceTensor CopyF32(const TensorRef& t) {
+    if (t.empty() || t.type == core::GgmlType::kF32 || !ok) {
+      return Copy(t);
+    }
+    DeviceTensor d;
+    const std::size_t count = t.ElementCount();
+    void* ptr = nullptr;
+    if (Allocate(&ptr, count * sizeof(float) + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(t.name));
+      return d;
+    }
+    if (Measuring()) {
+      return d;
+    }
+    allocations.push_back(ptr);
+    bytes += count * sizeof(float) + kTailMargin;
+    std::vector<float> host(count);
+    const auto* src = static_cast<const std::uint8_t*>(t.data);
+    for (std::size_t r = 0; r < t.rows * t.experts; ++r) {
+      if (!gufo::quant::DequantizeRow(t.type, src + r * t.RowBytes(),
+                                      host.data() + r * t.cols, t.cols)) {
+        Fail("cannot widen " + std::string(t.name) + " to F32");
+        return d;
+      }
+    }
+    if (hipMemcpy(ptr, host.data(), count * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemset(static_cast<std::uint8_t*>(ptr) + count * sizeof(float), 0,
+                  kTailMargin) != hipSuccess) {
+      Fail("upload failed for " + std::string(t.name));
+      return d;
+    }
+    d.data = ptr;
+    d.type = core::GgmlType::kF32;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = static_cast<std::uint32_t>(t.experts);
+    return d;
+  }
+
   DeviceMixer Mixer(const HcMixer& m) {
-    return {Copy(m.norm), Copy(m.down), Copy(m.up), Copy(m.inject)};
+    // Q8_0 and BF16 inject rows keep their projection; other formats are
+    // widened to the F32 rows the fused mixer reads.
+    const bool keep = m.inject.type == core::GgmlType::kQ8_0 ||
+                      m.inject.type == core::GgmlType::kBF16;
+    return {Copy(m.norm), Copy(m.down), Copy(m.up),
+            keep ? Copy(m.inject) : CopyF32(m.inject)};
   }
 
   DeviceLayer Layer(const LayerWeights& l) {
@@ -489,7 +536,7 @@ struct Uploader {
     d.ple_norm_key = Copy(l.ple_norm_key);
     d.ple_norm_query = Copy(l.ple_norm_query);
     d.ple_norm_conv = Copy(l.ple_norm_conv);
-    d.ple_conv1d = Copy(l.ple_conv1d);
+    d.ple_conv1d = CopyF32(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
     d.ffn_gate_exps = Copy(l.ffn_gate_exps);
     d.ffn_up_exps = Copy(l.ffn_up_exps);

@@ -127,8 +127,17 @@ struct Binder {
                 GgmlType::kF32, GgmlType::kIQ4_NL, GgmlType::kQ5_1,
                 GgmlType::kQ5_0, GgmlType::kQ4_1, GgmlType::kQ4_0});
     if (with_inject) {
+      // llama.cpp mixes quantize the four inject rows with the trunk; the
+      // device widens any format but Q8_0 and BF16 to F32.
       m.inject = Get(prefix + "_inject.weight", hc_dim, c.hc_count, 1,
-                     {GgmlType::kF32, GgmlType::kQ8_0, GgmlType::kBF16});
+                     {GgmlType::kF32,   GgmlType::kQ8_0,    GgmlType::kBF16,
+                      GgmlType::kF16,   GgmlType::kQ4_0,    GgmlType::kQ4_1,
+                      GgmlType::kQ5_0,  GgmlType::kQ5_1,    GgmlType::kQ2_K,
+                      GgmlType::kQ3_K,  GgmlType::kQ4_K,    GgmlType::kQ5_K,
+                      GgmlType::kQ6_K,  GgmlType::kIQ2_XXS, GgmlType::kIQ2_XS,
+                      GgmlType::kIQ2_S, GgmlType::kIQ3_XXS, GgmlType::kIQ3_S,
+                      GgmlType::kIQ1_S, GgmlType::kIQ1_M,   GgmlType::kIQ4_NL,
+                      GgmlType::kIQ4_XS});
     }
     return m;
   }
@@ -215,8 +224,9 @@ struct Binder {
           Get(p + "ple_norm_query.weight", hc_dim, 1, 1, {GgmlType::kF32});
       l.ple_norm_conv =
           Get(p + "ple_norm_conv.weight", hc_dim, 1, 1, {GgmlType::kF32});
+      // llama.cpp writes the 4-wide taps as F16; the device widens them.
       l.ple_conv1d = Get(p + "ple_conv1d.weight", c.ple_conv_kernel, hc_dim, 1,
-                         {GgmlType::kF32});
+                         {GgmlType::kF32, GgmlType::kF16, GgmlType::kBF16});
     }
 
     // A BF16 router is widened and narrowed to F16 like the F32 one.
