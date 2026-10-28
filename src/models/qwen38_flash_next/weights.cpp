@@ -114,11 +114,14 @@ struct Binder {
     m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, {GgmlType::kF32});
     // Block-format mixers decode from their compact rows (see
     // KQuantProjection). The up projection's 320 columns rule out K-quants.
-    m.down = Get(
-        prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
-        {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32,
-         GgmlType::kIQ4_NL, GgmlType::kQ5_1, GgmlType::kQ3_K, GgmlType::kQ4_K,
-         GgmlType::kQ5_K, GgmlType::kQ6_K, GgmlType::kIQ4_XS});
+    m.down =
+        Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
+            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32,
+             GgmlType::kIQ4_NL, GgmlType::kQ5_1, GgmlType::kQ3_K,
+             GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
+             GgmlType::kIQ4_XS, GgmlType::kQ2_K, GgmlType::kIQ2_XXS,
+             GgmlType::kIQ2_XS, GgmlType::kIQ2_S, GgmlType::kIQ3_XXS,
+             GgmlType::kIQ3_S, GgmlType::kIQ1_S, GgmlType::kIQ1_M});
     m.up = Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
                {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
                 GgmlType::kF32, GgmlType::kIQ4_NL, GgmlType::kQ5_1,
@@ -144,14 +147,21 @@ struct Binder {
     // llama.cpp falls back to Q5_0 / Q5_1 / IQ4_NL / Q4_0 on the 640-wide
     // rows that K-quants cannot cover.
     const auto projection = {
-        GgmlType::kQ8_0, GgmlType::kBF16,   GgmlType::kF16,  GgmlType::kF32,
-        GgmlType::kQ3_K, GgmlType::kQ4_K,   GgmlType::kQ5_K, GgmlType::kQ6_K,
-        GgmlType::kQ5_1, GgmlType::kIQ4_NL, GgmlType::kQ5_0, GgmlType::kQ4_1,
-        GgmlType::kQ4_0, GgmlType::kIQ4_XS};
-    const auto experts = {GgmlType::kQ3_K, GgmlType::kQ4_K,  GgmlType::kQ5_K,
-                          GgmlType::kQ6_K, GgmlType::kQ5_1,  GgmlType::kIQ4_NL,
-                          GgmlType::kQ8_0, GgmlType::kQ5_0,  GgmlType::kQ4_1,
-                          GgmlType::kQ4_0, GgmlType::kIQ4_XS};
+        GgmlType::kQ8_0,    GgmlType::kBF16,   GgmlType::kF16,
+        GgmlType::kF32,     GgmlType::kQ3_K,   GgmlType::kQ4_K,
+        GgmlType::kQ5_K,    GgmlType::kQ6_K,   GgmlType::kQ5_1,
+        GgmlType::kIQ4_NL,  GgmlType::kQ5_0,   GgmlType::kQ4_1,
+        GgmlType::kQ4_0,    GgmlType::kIQ4_XS, GgmlType::kQ2_K,
+        GgmlType::kIQ2_XXS, GgmlType::kIQ2_XS, GgmlType::kIQ2_S,
+        GgmlType::kIQ3_XXS, GgmlType::kIQ3_S,  GgmlType::kIQ1_S,
+        GgmlType::kIQ1_M};
+    const auto experts = {
+        GgmlType::kQ3_K,    GgmlType::kQ4_K,   GgmlType::kQ5_K,
+        GgmlType::kQ6_K,    GgmlType::kQ5_1,   GgmlType::kIQ4_NL,
+        GgmlType::kQ8_0,    GgmlType::kQ5_0,   GgmlType::kQ4_1,
+        GgmlType::kQ4_0,    GgmlType::kIQ4_XS, GgmlType::kQ2_K,
+        GgmlType::kIQ2_XXS, GgmlType::kIQ2_XS, GgmlType::kIQ2_S,
+        GgmlType::kIQ3_XXS, GgmlType::kIQ3_S,  GgmlType::kIQ1_S};
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);

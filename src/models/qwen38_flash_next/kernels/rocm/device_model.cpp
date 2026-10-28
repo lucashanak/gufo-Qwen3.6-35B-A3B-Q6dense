@@ -40,6 +40,14 @@ bool CompactDecodeFormat(core::GgmlType type) {
     case core::GgmlType::kQ5_0:
     case core::GgmlType::kQ4_1:
     case core::GgmlType::kQ4_0:
+    case core::GgmlType::kQ2_K:
+    case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ3_S:
+    case core::GgmlType::kIQ1_S:
+    case core::GgmlType::kIQ1_M:
     case core::GgmlType::kIQ4_XS:
       return true;
     default:
@@ -66,6 +74,14 @@ bool ExpertFormat(core::GgmlType type) {
     case core::GgmlType::kQ5_0:
     case core::GgmlType::kQ4_1:
     case core::GgmlType::kQ4_0:
+    case core::GgmlType::kQ2_K:
+    case core::GgmlType::kQ6_K:
+    case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ3_S:
+    case core::GgmlType::kIQ1_S:
     case core::GgmlType::kIQ4_XS:
       return true;
     default:
