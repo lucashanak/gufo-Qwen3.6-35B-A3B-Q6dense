@@ -135,6 +135,20 @@ the 2.69 MB down phase runs at about 153 GB/s in the model against 200 in
 `hc_mix_bench`; keeping the activations in L1 did not change it. The cause
 is not located.
 
+Second round (October 28, branch `fn-decode2` from fn-exact `412c35d3`),
+all rejected; nothing was committed. Residency is one limiter: at 231 VGPRs
+(occupancy 6 waves per SIMD, three 8-wave blocks per WGP) only 60 of the
+fused mixer's 120 blocks are resident, so half the mix units start after
+the down phase without their up rows loaded (the trace shows the last block
+starting at 33.5 of 35.7 µs).
+
+| Experiment | Outcome |
+| --- | --- |
+| Stage the down activations in LDS (≤ 3 tokens) and size the grid to the resident blocks | Rejected: `hc_mix_bench` (48 mixers, 16 copies) Q6_K/Q5_1 T1 29.2 → 29.1 µs, T3 33.4 → 39.0 (37 KB of LDS halves residency). |
+| Full residency at one token: down blocks ahead 20 → 8 (72-register budget), up rows ahead 16 → 8, activations in LDS at one token | Rejected: 231 → 119 VGPRs without spills, 120 blocks resident; T1/T2 29.1/32.2 → 28.2/31.3 µs but T4/T5 35.9/41.1 → 39.1/44.5. Model: CLI AR tg256 41.21 → 39.97 tok/s (lower clock, within noise), HTTP C1 AR set +0.6%, 5/5 byte-identical. The MTP measurement ran together with the item below: tg256 72.85 → 60.01, C1 set −0.7%, only 2/5 identical (which change broke identity was not isolated). |
+| Rollback restores on their own stream, overlapping the next draft steps (event wait before every trunk entry point) | Dropped without a separate measurement; see the combined MTP result above. |
+| A ring prefetch of the down blocks (fully unrolled, each slot reloaded after its product) | Rejected: the compiler hoisted the loads; 256 VGPRs with 164–1179 spilled at T2–T8, T4 73 µs. |
+
 ## Eight-way suite decode (October 26–27, 2026)
 
 Workload: the swapctl IQ suite replayed greedy by eight workers at the
