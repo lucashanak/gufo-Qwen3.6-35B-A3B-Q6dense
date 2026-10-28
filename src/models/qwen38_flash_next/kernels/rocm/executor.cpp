@@ -3102,7 +3102,9 @@ bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
           l.ffn_gate_exps.type == GgmlType::kQ4_K ||
           l.ffn_gate_exps.type == GgmlType::kQ5_K ||
           l.ffn_gate_exps.type == GgmlType::kIQ4_XS ||
-          l.ffn_gate_exps.type == GgmlType::kIQ3_S) &&
+          l.ffn_gate_exps.type == GgmlType::kIQ3_S ||
+          l.ffn_gate_exps.type == GgmlType::kIQ3_XXS ||
+          l.ffn_gate_exps.type == GgmlType::kIQ2_XS) &&
          l.ffn_up_exps.type == l.ffn_gate_exps.type &&
          (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
           l.ffn_down_exps.type == GgmlType::kQ5_0 ||
@@ -3146,10 +3148,11 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // materializing the gate; decode-time batches keep separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
     const auto gate_type = static_cast<WeightType>(l.ffn_gate_exps.type);
-    // IQ4_XS and IQ3_S have no paired kernel: their prefill tiles take the
-    // separate launches at the wide map's 128-token height.
-    const bool paired =
-        gate_type != WeightType::kIQ4_XS && gate_type != WeightType::kIQ3_S;
+    // The importance formats have no paired kernel: their prefill tiles
+    // take the separate launches at the wide map's 128-token height.
+    const bool paired = gate_type == WeightType::kQ3_K ||
+                        gate_type == WeightType::kQ4_K ||
+                        gate_type == WeightType::kQ5_K;
     const bool wide = routed_wide_tiles_ != 0;
     const std::uint32_t gate_tiles =
         wide ? routed_wide_tiles_ : routed_n_tiles_;
