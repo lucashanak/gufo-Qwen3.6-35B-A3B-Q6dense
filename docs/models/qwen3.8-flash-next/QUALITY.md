@@ -49,14 +49,51 @@ the frontier logits after every step, production flags: 262,144 context,
   pre-KV8 diagnostic tree (`/opt/gufo-fn-kvdiag`, F16 K/V) with a KV8 server.
 - Sparse prefill is exact only for passes that start on a four-token
   boundary: the WMMA tiles group four queries from the pass start and
-  gather the union of their selections (`SparseSplitChecks` tests aligned
-  splits only). `lcagg_14`/`lcagg_19` prefilled as one pass against two
-  passes ending 3, 4, 5 and 6 tokens before the prompt end: the 3-token
-  split (an aligned boundary) is identical, the others change the prompt
-  logits (`lcagg_14` changes its 40th token). Single-turn requests never
-  split there (their stable prefix is empty; grid checkpoints are multiples
-  of 2,048), but a restored multi-turn boundary can.
-- IQ replays through `gufo serve` at production flags (eight sessions,
+  gather the union of their selections. `lcagg_14`/`lcagg_19` prefilled as
+  one pass against two passes ending 3, 4, 5 and 6 tokens before the prompt
+  end: the 3-token split (an aligned boundary) is identical, the others
+  change the prompt logits (`lcagg_14` changes its 40th token). The server
+  therefore keeps every pass that continues a prompt on a multiple of four
+  (`TextRunnerCapabilities::prefill_alignment`, 4 for Flash-Next): budget
+  limited passes end there (a budget below four runs to the next multiple),
+  and the stable final-user-turn boundary, grid, shared and complete-prompt
+  checkpoints are rounded down to it, so a restore re-prefills at most three
+  tokens. `Session::Feed` aligns its own passes the same way. A prefill
+  frontier that is not aligned is not kept as a live continuation; decoded
+  frontiers are (decode rows never match prompt rows anyway).
+  `TextRunnerPool::Request::Prefill` asserts that every step after a
+  request's first starts aligned, and `WmmaCausalAttention` documents the
+  invariant (an engine-level assert would trip model tests that split
+  prompts off the alignment on purpose and compare like with like). The
+  snapshot payload version is 21.
+- `tests/functional/cache_alignment_qwen38.py` (server, `--sessions 2
+  --context 40960`, 4 GiB RAM cache): four conversations whose final user
+  turn ends at 2,944–2,947 tokens (all four residues). A seeds the cache, B
+  continues the conversation; B restored from RAM in the same server and
+  from `--cache-disk` after a restart equals B on a fresh server byte for
+  byte (reasoning and answer, 84–160 greedy tokens), in AR and in MTP, and
+  every restore starts at 2,944. The same test against `13c2897c` restores
+  at 2,944/2,945/2,946/2,947 and the 2,946 case changes its output from RAM
+  and from disk. `component_text_cache_test` checks the planning with a fake
+  runner (pass ends 8/16/24/32/41 for a 41-token prompt at budget 10, an
+  in-pass capture at 40, restores at 32 and 40, a budget of 3 running to the
+  next multiple of four); it and `text_model_runner_test`,
+  `text_generation_scheduler_test` and `continuation_cache_test` pass.
+- On the 28-question slice the final tree differs from the first fix on four
+  long prompts (`lcagg_09`, `lcagg_18`, `longctx_13`, `longctx_16`), which
+  the server had split off the alignment. Their reasoning now equals a
+  single-pass AR prefill through the engine API (`exact_probe`, no MTP,
+  one `Sync`) over its whole length; the earlier server output diverged
+  from it after 173–647 characters.
+- Cache model tests on the final tree: `continuation_adapter_test`,
+  `growable_kv_test` and `snapshot_test` pass (a first `snapshot_test` run
+  aborted with a rocBLAS handle-destructor error while other agents shared
+  the GPU; the rerun passed every check).
+- The final tree's 28-question slice is byte-identical between eight
+  workers in order and six workers in reverse order (303.0 s / 334.3 s,
+  25,653 tokens each).
+- IQ replays of the first fix (`6d380176`) through `gufo serve` at
+  production flags (eight sessions,
   262,144 context, 20 GiB K/V, KV8, MTP, `--reasoning-budget-fraction 0.6`,
   4 GiB RAM cache): the 28-question slice is byte-identical between eight
   workers in order and six workers in reverse order (304.2 s / 327.9 s),
