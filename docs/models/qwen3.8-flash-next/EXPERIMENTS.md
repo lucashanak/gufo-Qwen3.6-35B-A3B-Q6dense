@@ -15,6 +15,36 @@ flags. Evidence: [QUALITY.md](QUALITY.md#exactness-at-the-sparse-budget-october-
 | Prefill alignment in the server (pass ends and prompt checkpoints rounded down to four tokens) | Retained. Keeps the engine's four-query union tiles; a restore re-prefills at most three tokens. Four long slice answers change (`lcagg_09`, `lcagg_18`, `longctx_13`, `longctx_16`, prompts of 5,754–22,368 tokens): their prompts were split off the alignment before. Their reasoning now equals a single-pass AR prefill through the engine (`exact_probe`, no MTP) over its whole length (750–2,300 characters; 6,678 for the probe's 1,500-token `lcagg_09`), where the previous server's diverged after 173–647 characters. Slice 304 → 303 s; `fnab.sh` against `13c2897c`: pp8192 1703/1642, pp32768 1635/1621, decode 59.6/62.0, C1 55.9/56.4, C4 99.8/95.7, C8 193.9/195.3 tok/s: within run-to-run noise. |
 | Exact sparse prefill for any split (one query per WMMA tile) | Not built: the union tiles are the sparse window's speed (one or three queries per tile measured slower, [October 23](#indexer-and-sparse-attention-at-depth-october-23-2026)). |
 
+## Back-to-back long prompts (October 28, 2026)
+
+Workload: cold 26.5K-token prompts sent back to back through `gufo serve`
+at production flags, `gpu_metrics` power and per-thread context switches
+sampled every 1–4 s. The 4–5% slowdown of the second prompt behind
+`--sessions 2` or `8` (previous section) is a thread waking about 1,000
+times a second on Strix Halo's second CCD (CPUs 8–15, 29 here). Socket
+power stays at 119 W, but its non-GFX, non-core share rises from 84–86 to
+89–91 W, so GFX drops from ~30 to ~27 W and the clock from ~2,240 to
+~2,110 MHz. The same waking thread on CCD0 (CPUs 16–22) costs nothing.
+Causal test: gufo pinned to CCD0, one session, plus a synthetic thread on
+CPU 10 sleeping 1/3/10 ms: 1,716 → 1,631–1,636 / 1,690 / 1,695 tok/s.
+
+Two threads wake that often during a long pass:
+
+- The RAM cache's idle-spill worker of the slot that served the previous
+  request polls every millisecond whether the device is idle. Hence only
+  with a second slot, only while the slot holds borrowed rows, and not
+  after a 30 s pause.
+- The inference thread itself, polling each 2,048+-row pass's events
+  every 100 µs (about 6,650 wake-ups/s). It slows every long prompt by the
+  same 4–5% whenever the scheduler places it on CCD1.
+
+| Experiment | Outcome |
+| --- | --- |
+| Back off idle-spill polling while the device stays busy | Retained. A deferred spill sleeps 1 → 2 → … → 32 ms, and back to 1 ms after a copied chunk; only the optional spill waits longer. The poller stays under 50 wake-ups/s. Sessions 2, 26.5K prompts: 1,706/1,623/1,623 → 1,719/1,717/1,720 tok/s. |
+| Sleep through predicted prompt-pass waits | Retained. A layer's expert-count wait (170–240 ms at 16K rows) is predicted per row from the same layer of the previous pass and the last layer of the same kind in this pass; the thread sleeps 92% of the shorter prediction, then polls every millisecond. Unpredicted waits poll at an eighth of the time waited, 100 µs–1 ms. Inference-thread wake-ups 6,650 → ~100/s. Pinned to CCD1: 1,638–1,644 → 1,690–1,731 tok/s; to CCD0 1,622–1,628 → 1,632–1,648 (that pair ran beside another agent's work, c0 3–5%). |
+| Sleep 95% of the prediction, then poll every 500 µs | Rejected: layer waits vary by up to 4%, the oversleeps idle the GPU: 1,636–1,674 vs 1,690–1,711 at 92%. |
+| Pin decode to CCD0 | Not needed: C1/C8 decode on CCD1 vs CCD0 within ±1.5% either way (C1 code 79.5–80.5 vs 80.9–81.4, C8 114.6–114.9 vs 112.7–113.7 tok/s); decode's spinning waits are short. |
+
 ## Long-prompt prefill (October 27, 2026)
 
 Workload: v3 recipe + shared-Q8_0 MTP, `gufo bench` pp2K–pp128K and cold
@@ -69,7 +99,8 @@ The gap is:
   later, and not the RAM prompt cache (`--cache-ram-bytes 0` the same:
   1,711 then 1,622/1,612). The kernel trace of the second request shows
   only compute-bound kernels 4–6% slower; no other GPU work and no extra
-  CPU thread run. Cause not located.
+  CPU thread run. Cause: a waking thread on the second CCD, see
+  [Back-to-back long prompts](#back-to-back-long-prompts-october-28-2026).
 - K/V mapping between passes: 7 ms per pass in `gufo bench`, 30–70 ms
   behind the server (single 2 MiB chunk mappings took up to 10 ms).
 

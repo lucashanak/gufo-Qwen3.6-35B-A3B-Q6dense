@@ -84,6 +84,13 @@ constexpr std::uint32_t kVecBatch = 8;
 // a layer's shared expert alone keeps the GPU busy for longer than a poll.
 constexpr std::uint32_t kRelaxedWaitRows = 2048;
 constexpr auto kRelaxedWaitPoll = std::chrono::microseconds(100);
+// A predicted wait sleeps through most of it and then polls this often;
+// unpredicted waits poll at an eighth of the time waited, at most this often.
+constexpr auto kRelaxedWaitCoarsePoll = std::chrono::milliseconds(1);
+// Share of a predicted expert-count wait slept at once. Layer waits vary by
+// up to 4%; 0.95 overslept often enough to idle the GPU (16K prompt passes,
+// Strix Halo: 1,662-1,674 vs 1,709-1,711 tok/s at 0.92).
+constexpr double kCountsWaitShare = 0.92;
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -2029,10 +2036,32 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
-  if (!(n_tokens >= kRelaxedWaitRows
-            ? WaitRelaxed(counts_ready_, "expert counts", error_msg)
-            : Check(hipEventSynchronize(counts_ready_), "expert counts",
-                    error_msg))) {
+  if (n_tokens >= kRelaxedWaitRows) {
+    // A prompt pass waits once per layer (170-240 ms at 16K rows) for the
+    // counts. Its layers repeat with the attention pattern and scale with the
+    // rows, so a measured layer predicts the next of its kind.
+    auto& cur = counts_wait_us_per_row_;
+    auto& prev = counts_wait_us_per_row_prev_;
+    if (cur.size() >= 4 * std::size_t{c.num_layers})
+      cur.clear();  // passes that never reached a pass-end wait
+    const std::size_t layer = cur.size();
+    const std::size_t period = c.full_attention_interval;
+    // The shorter of two predictions: the same layer in the previous pass,
+    // and the last layer of the same kind in this one.
+    double per_row = 0.0;
+    if (layer < prev.size())
+      per_row = prev[layer];
+    if (layer >= period && (per_row == 0.0 || cur[layer - period] < per_row))
+      per_row = cur[layer - period];
+    const double expect_us = kCountsWaitShare * per_row * n_tokens;
+    double waited_us = 0.0;
+    if (!WaitRelaxed(counts_ready_, "expert counts", error_msg, expect_us,
+                     &waited_us)) {
+      return false;
+    }
+    cur.push_back(waited_us / n_tokens);
+  } else if (!Check(hipEventSynchronize(counts_ready_), "expert counts",
+                    error_msg)) {
     return false;
   }
   // The F16 expert GEMM launches one block per (expert, row tile of its
@@ -3287,13 +3316,32 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 }
 
 bool Executor::WaitRelaxed(hipEvent_t event, const char* what,
-                           std::string* error_msg) const {
-  for (;;) {
-    const hipError_t status = hipEventQuery(event);
-    if (status != hipErrorNotReady)
-      return Check(status, what, error_msg);
-    std::this_thread::sleep_for(kRelaxedWaitPoll);
+                           std::string* error_msg, double expect_us,
+                           double* waited_us) const {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+  const auto elapsed = [&] { return Clock::now() - start; };
+  hipError_t status = hipEventQuery(event);
+  if (status == hipErrorNotReady && expect_us > 0.0)
+    std::this_thread::sleep_for(
+        std::chrono::duration<double, std::micro>(expect_us));
+  for (; status == hipErrorNotReady; status = hipEventQuery(event)) {
+    // Past a prediction, or after waiting long, a coarse poll bounds both
+    // the wake-ups and the delay; short waits keep the fine poll.
+    const auto step = expect_us > 0.0 ? Clock::duration(kRelaxedWaitCoarsePoll)
+                                      : std::clamp<Clock::duration>(
+                                            elapsed() / 8, kRelaxedWaitPoll,
+                                            kRelaxedWaitCoarsePoll);
+    std::this_thread::sleep_for(step);
   }
+  if (waited_us != nullptr)
+    *waited_us = std::chrono::duration<double, std::micro>(elapsed()).count();
+  // The end of a prompt pass: its layer waits predict the next pass.
+  if (event == pass_done_ && !counts_wait_us_per_row_.empty()) {
+    counts_wait_us_per_row_prev_.swap(counts_wait_us_per_row_);
+    counts_wait_us_per_row_.clear();
+  }
+  return Check(status, what, error_msg);
 }
 
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
