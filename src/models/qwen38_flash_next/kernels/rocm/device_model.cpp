@@ -40,6 +40,7 @@ bool CompactDecodeFormat(core::GgmlType type) {
     case core::GgmlType::kQ5_0:
     case core::GgmlType::kQ4_1:
     case core::GgmlType::kQ4_0:
+    case core::GgmlType::kIQ4_XS:
       return true;
     default:
       return false;
@@ -65,6 +66,7 @@ bool ExpertFormat(core::GgmlType type) {
     case core::GgmlType::kQ5_0:
     case core::GgmlType::kQ4_1:
     case core::GgmlType::kQ4_0:
+    case core::GgmlType::kIQ4_XS:
       return true;
     default:
       return false;

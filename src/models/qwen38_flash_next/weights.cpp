@@ -114,11 +114,11 @@ struct Binder {
     m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, {GgmlType::kF32});
     // Block-format mixers decode from their compact rows (see
     // KQuantProjection). The up projection's 320 columns rule out K-quants.
-    m.down =
-        Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32,
-             GgmlType::kIQ4_NL, GgmlType::kQ5_1, GgmlType::kQ3_K,
-             GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K});
+    m.down = Get(
+        prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
+        {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32,
+         GgmlType::kIQ4_NL, GgmlType::kQ5_1, GgmlType::kQ3_K, GgmlType::kQ4_K,
+         GgmlType::kQ5_K, GgmlType::kQ6_K, GgmlType::kIQ4_XS});
     m.up = Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
                {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
                 GgmlType::kF32, GgmlType::kIQ4_NL, GgmlType::kQ5_1,
@@ -147,11 +147,11 @@ struct Binder {
         GgmlType::kQ8_0, GgmlType::kBF16,   GgmlType::kF16,  GgmlType::kF32,
         GgmlType::kQ3_K, GgmlType::kQ4_K,   GgmlType::kQ5_K, GgmlType::kQ6_K,
         GgmlType::kQ5_1, GgmlType::kIQ4_NL, GgmlType::kQ5_0, GgmlType::kQ4_1,
-        GgmlType::kQ4_0};
-    const auto experts = {GgmlType::kQ3_K, GgmlType::kQ4_K, GgmlType::kQ5_K,
-                          GgmlType::kQ6_K, GgmlType::kQ5_1, GgmlType::kIQ4_NL,
-                          GgmlType::kQ8_0, GgmlType::kQ5_0, GgmlType::kQ4_1,
-                          GgmlType::kQ4_0};
+        GgmlType::kQ4_0, GgmlType::kIQ4_XS};
+    const auto experts = {GgmlType::kQ3_K, GgmlType::kQ4_K,  GgmlType::kQ5_K,
+                          GgmlType::kQ6_K, GgmlType::kQ5_1,  GgmlType::kIQ4_NL,
+                          GgmlType::kQ8_0, GgmlType::kQ5_0,  GgmlType::kQ4_1,
+                          GgmlType::kQ4_0, GgmlType::kIQ4_XS};
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
