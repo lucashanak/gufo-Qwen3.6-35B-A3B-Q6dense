@@ -138,6 +138,25 @@ isolated ones. Of the 22 slice questions with a short final answer, 20
 match the v3 recipe's (`reason_03` and `lcagg_16` differ; this is a sanity
 check, not a quality score).
 
+unsloth's public **UD-IQ4_XS** (IQ3_S experts in 47 layers, IQ4_XS in one,
+IQ4_NL/Q8_0 down, Q6_K head, Q8_0 trunk) and **UD-Q2_K_XL** (IQ2_XS experts
+with IQ3_XXS in some layers, IQ4_NL down, Q5_K/Q6_K trunk, Q4_K head, Q5_K
+embedding) load without retyping and answer coherently; for both, greedy AR
+and MTP C1 replies are byte-identical (5/5) and the eight-way slice equals
+the questions sent one at a time (28/28).
+
+A test-only "kitchen" GGUF (v3 with single layers retyped through
+`llama-quantize --tensor-type`: Q2_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S,
+IQ1_S, Q6_K, Q4_0 and IQ4_XS experts; Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 down;
+IQ4_XS/Q2_K/IQ3_S/IQ2_XXS/IQ2_S/Q6_K attention and SSM tensors, IQ1_M/IQ2_XS/
+Q4_0/Q4_1 HC tensors, a Q2_K inject, IQ4_XS embedding) passes the same three
+checks: coherent replies, AR == MTP 5/5, eight-way slice == one at a time
+28/28.
+
+On v3 the branch binary equals 13c2897c byte for byte: greedy AR and MTP C1
+5/5 and the eight-way slice 28/28. The final rebuild after a whitespace-only
+clang-format pass was checked with AR C1 only (5/5).
+
 ## Long-prompt prefill, October 27, 2026
 
 Both retained changes are host-side: how the inference thread waits for a

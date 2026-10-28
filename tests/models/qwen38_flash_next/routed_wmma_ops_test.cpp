@@ -1170,7 +1170,8 @@ std::vector<__half> PairedSwiglu(const Routing& r, const void* gate,
                                  const void* up, q::WeightType type,
                                  const __half* x, std::size_t m,
                                  std::size_t k) {
-  if (type == q::WeightType::kIQ4_XS)
+  if (type == q::WeightType::kIQ4_XS || type == q::WeightType::kIQ3_S ||
+      type == q::WeightType::kIQ3_XXS || type == q::WeightType::kIQ2_XS)
     return SeparateSwiglu(r, gate, up, type, x, m, k, 128);
   std::uint32_t n = 0;
   auto* tiles = r.Tiles(128, &n);
@@ -1608,7 +1609,10 @@ int main() {
         routes = (formats_only || CheckPassRoutes(gate, down)) && routes;
     for (const auto down : {q::WeightType::kIQ4_NL, q::WeightType::kQ5_1})
       routes =
-          (formats_only || CheckPassRoutes(q::WeightType::kIQ4_XS, down)) &&
+          (formats_only || (CheckPassRoutes(q::WeightType::kIQ4_XS, down) &&
+                            CheckPassRoutes(q::WeightType::kIQ3_S, down) &&
+                            CheckPassRoutes(q::WeightType::kIQ3_XXS, down) &&
+                            CheckPassRoutes(q::WeightType::kIQ2_XS, down))) &&
           routes;
     using gufo::core::GgmlType;
     for (const GgmlType down :
@@ -1670,11 +1674,14 @@ int main() {
       ok = Ok(Run(type, 97, 1, 8, 129, 640, 0x50A40002U, 16)) && ok;
       ok = Ok(Run(type, 3000, 1, 64, 2560, 640, 0x50A40004U, 48)) && ok;
     }
-    // IQ4_XS gate/up view (the IQ4_XS mixes' experts) at every tile.
-    for (const std::uint32_t tile : {16U, 48U, 128U})
-      ok = Ok(Run(q::WeightType::kIQ4_XS, 300, 10, 64, 640, 2560,
-                  0x14C40000U + tile, tile)) &&
-           ok;
+    // IQ4_XS / IQ3_S gate/up views (the UD-IQ4_XS mix's experts), every tile.
+    for (const auto type : {q::WeightType::kIQ4_XS, q::WeightType::kIQ3_S,
+                            q::WeightType::kIQ3_XXS, q::WeightType::kIQ2_XS})
+      for (const std::uint32_t tile : {16U, 48U, 128U})
+        ok = Ok(Run(type, 300, 10, 64, 640, 2560,
+                    0x14C40000U + tile + static_cast<std::uint32_t>(type),
+                    tile)) &&
+             ok;
     // Q8_0 down view (five layers keep Q8_0 down projections).
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,
                 128)) &&
