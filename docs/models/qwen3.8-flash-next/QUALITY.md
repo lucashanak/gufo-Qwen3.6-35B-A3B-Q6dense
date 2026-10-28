@@ -51,6 +51,10 @@ Q4_0/Q4_1 HC tensors, a Q2_K inject, IQ4_XS embedding) passes the same three
 checks: coherent replies, AR == MTP 5/5, eight-way slice == one at a time
 28/28.
 
+On v3 the branch binary equals 13c2897c byte for byte: greedy AR and MTP C1
+5/5 and the eight-way slice 28/28. The final rebuild after a whitespace-only
+clang-format pass was checked with AR C1 only (5/5).
+
 ## Long-prompt prefill, October 27, 2026
 
 Both retained changes are host-side: how the inference thread waits for a
