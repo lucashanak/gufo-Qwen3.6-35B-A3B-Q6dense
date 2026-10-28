@@ -6,7 +6,9 @@
 // bandwidth and an FNV-1a hash of every layer's output.
 //
 // routed_vec_bench [reps] [gate format] [down format] [routing] [rows,...]
-//   formats: q3_k q4_k q5_k q8_0 / iq4_nl q5_1 q8_0 (default q3_k iq4_nl);
+//   formats: q3_k q4_k q5_k q8_0 (gated kernel), q2_k q6_k q4_0 iq2_xxs
+//   iq3_xxs iq3_s iq4_xs (paired vector kernel and SwiGLU) / iq4_nl q5_1
+//   q5_0 q4_0 q8_0 (default q3_k iq4_nl);
 //   routing: disjoint, random, overlap, shared or all (default all).
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -35,8 +37,9 @@ constexpr int kFf = 640;
 constexpr int kLayers = 48;
 
 // GGML type ids.
-constexpr int kQ5_1 = 7, kQ8_0 = 8, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13,
-              kIQ4_NL = 20;
+constexpr int kQ4_0 = 2, kQ5_0 = 6, kQ5_1 = 7, kQ8_0 = 8, kQ2_K = 10,
+              kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14, kIQ2_XXS = 16,
+              kIQ3_XXS = 18, kIQ4_NL = 20, kIQ3_S = 21, kIQ4_XS = 23;
 
 struct Format {
   const char* name;
@@ -54,7 +57,21 @@ const Format kFormats[] = {
     {"iq4_nl", kIQ4_NL, 32, 18, 0, false},
     {"q5_1", kQ5_1, 32, 24, 0, true},
     {"q8_0", kQ8_0, 32, 34, 0, false},
+    {"q4_0", kQ4_0, 32, 18, 0, false},
+    {"q5_0", kQ5_0, 32, 22, 0, false},
+    {"q2_k", kQ2_K, 256, 84, 80, true},
+    {"q6_k", kQ6_K, 256, 210, 208, false},
+    {"iq2_xxs", kIQ2_XXS, 256, 66, 0, false},
+    {"iq3_xxs", kIQ3_XXS, 256, 98, 0, false},
+    {"iq3_s", kIQ3_S, 256, 110, 0, false},
+    {"iq4_xs", kIQ4_XS, 256, 136, 0, false},
 };
+
+/// Formats with the gated gate/up kernel; the others take MoeExperts'
+/// paired vector projections and SwiGLU.
+bool Gated(int type) {
+  return type == kQ3_K || type == kQ4_K || type == kQ5_K || type == kQ8_0;
+}
 
 const Format& FindFormat(const std::string& name) {
   for (const Format& f : kFormats)
@@ -184,6 +201,7 @@ struct Buffers {
   float* router;   // [rows][experts + 1]
   float* shared;   // [rows][hidden]
   float* gate_e;   // [rows][used][ff]
+  float* up_e;     // [rows][used][ff] (paired formats)
   float* down_e;   // [rows][used][hidden]
   float* out;      // [layer][rows][hidden]
 };
@@ -200,10 +218,16 @@ void RunLayer(const Buffers& b, int layer, int rows, int stages) {
   // MoeExperts for up to eight rows, MoeBatch's grouped route above.
   const float* x = b.x + lr * kHidden;
   const std::int32_t* ids = b.ids + lr * kUsed;
-  if ((stages & kGate) &&
+  if ((stages & kGate) && Gated(b.gf->type) &&
       qfn_mmq_moe_gated_vec(b.gf->type, b.gate, b.up, x, ids, b.gate_e, kFf,
                             kHidden, rows, kExperts, kUsed, g_stream) != 0)
     throw std::runtime_error("gated launch failed");
+  if ((stages & kGate) && !Gated(b.gf->type)) {
+    if (qfn_mmq_moe_vec(b.gf->type, b.gate, x, ids, b.gate_e, kFf, kHidden,
+                        rows, kExperts, kUsed, g_stream, b.up, b.up_e) != 0)
+      throw std::runtime_error("paired launch failed");
+    q::Swiglu(b.gate_e, b.up_e, std::size_t{rows} * kUsed * kFf, g_stream);
+  }
   if ((stages & kDown) &&
       qfn_mmq_moe_vec(b.df->type, b.down, b.gate_e, ids, b.down_e, kHidden, kFf,
                       rows * kUsed, kExperts, 1, g_stream) != 0)
@@ -298,6 +322,7 @@ int main(int argc, char** argv) {
     constexpr int kMaxRows = 64;
     b.router = Alloc<float>(std::size_t{kMaxRows} * (kExperts + 1));
     b.gate_e = Alloc<float>(std::size_t{kMaxRows} * kUsed * kFf);
+    b.up_e = Alloc<float>(std::size_t{kMaxRows} * kUsed * kFf);
     b.down_e = Alloc<float>(std::size_t{kMaxRows} * kUsed * kHidden);
     {
       std::uint32_t seed = 0x51ED;

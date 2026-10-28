@@ -5501,6 +5501,7 @@ __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
          : kType == WeightType::kQ3_K   ? (k / 256) * kQ3KBlockBytes
          : kType == WeightType::kIQ4_NL ? (k / 32) * 18
          : kType == WeightType::kIQ4_XS ? (k / 256) * 136
+         : kType == WeightType::kIQ3_S  ? (k / 256) * 110
          : kType == WeightType::kQ4_0   ? (k / 32) * 18
          : kType == WeightType::kQ5_0   ? (k / 32) * 22
          : kType == WeightType::kQ5_1   ? (k / 32) * sizeof(Q5_1Block)
@@ -5519,6 +5520,108 @@ __device__ __forceinline__ std::uint32_t SpreadHighBits(std::uint32_t bits) {
   // 0x00204081 = 1 + 2^7 + 2^14 + 2^21: bit b of `bits` lands at 8b, every
   // cross term falls off the 0x01010101 mask.
   return (__umul24(bits, 0x00204081U) & 0x01010101U) << 4U;
+}
+
+/// ggml's iq3s_grid (llama.cpp, MIT): four magnitudes per entry.
+// clang-format off
+__constant__ std::uint32_t kIq3sGridDev[512] = {
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+};
+// clang-format on
+
+/// The 32 signed codes of IQ3_S K32 block `ib` of super-block `sb` (110
+/// bytes: d, qs[64], qh[8], signs[32], scales[4]): elements 0-15 in `lo`,
+/// 16-31 in `hi`; the F16 scale d * (1 + 2 * scale) in `scale`.
+__device__ __forceinline__ void IQ3SBlockBytes(const std::uint8_t* sb, int ib,
+                                               uint4& lo, uint4& hi,
+                                               std::uint32_t& scale) {
+  const std::uint8_t qh = sb[66 + ib];
+  std::uint32_t words[8];
+#pragma unroll
+  for (int l = 0; l < 4; ++l) {
+    const std::uint32_t signs = sb[74 + 4 * ib + l];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const std::uint32_t index =
+          sb[2 + 8 * ib + 2 * l + h] |
+          ((static_cast<std::uint32_t>(qh) << (8 - 2 * l - h)) & 256U);
+      // Byte b negated where sign bit 4h + b is set: magnitudes are odd, so
+      // (g ^ m) + 1 never carries into the next byte.
+      const std::uint32_t bits = (signs >> (4 * h)) & 0xFU;
+      const std::uint32_t mask =
+          (__umul24(bits, 0x00204081U) & 0x01010101U) * 0xFFU;
+      words[2 * l + h] = (kIq3sGridDev[index] ^ mask) + (mask & 0x01010101U);
+    }
+  }
+  lo = make_uint4(words[0], words[1], words[2], words[3]);
+  hi = make_uint4(words[4], words[5], words[6], words[7]);
+  const int nibble = (sb[106 + ib / 2] >> (4 * (ib % 2))) & 0xF;
+  const float d = __half2float(*reinterpret_cast<const __half*>(sb));
+  scale = __builtin_bit_cast(std::uint16_t,
+                             __float2half(d * float(1 + 2 * nibble)));
 }
 
 /// Four Q5_0 / Q4_0 codes (one per byte, below 32) as value + 128, the form
@@ -5588,7 +5691,8 @@ __launch_bounds__(256) __global__
       kType == WeightType::kIQ4_NL || kType == WeightType::kIQ4_XS;
   constexpr bool kSmall =
       kType == WeightType::kQ5_0 || kType == WeightType::kQ4_0;
-  constexpr bool kQ8 = kType == WeightType::kQ8_0 || kIQ4 || kSmall;
+  constexpr bool kIQ3S = kType == WeightType::kIQ3_S;
+  constexpr bool kQ8 = kType == WeightType::kQ8_0 || kIQ4 || kSmall || kIQ3S;
   constexpr bool kQ3K = kType == WeightType::kQ3_K;
   // 16-byte code chunks per row and stage: Q4_K's nibble pair and Q5_1's
   // two nibble blocks are two, Q8_0's two byte blocks are four.
@@ -5756,6 +5860,10 @@ __launch_bounds__(256) __global__
         f_codes_hi[u] =
             make_uint4(IQ4NLBytes(qs.x >> 4U), IQ4NLBytes(qs.y >> 4U),
                        IQ4NLBytes(qs.z >> 4U), IQ4NLBytes(qs.w >> 4U));
+      } else if constexpr (kIQ3S) {
+        const int kb = kb0 + f_c;
+        IQ3SBlockBytes(f_ptr[u] + ((kb / 8) * 110), kb % 8, f_codes[u],
+                       f_codes_hi[u], f_dm[u]);
       } else if constexpr (kSmall) {
         // block_q5_0: d, the high-bit word, 16 code bytes; block_q4_0: d,
         // 16 code bytes. Elements 0-15 / 16-31 are low / high nibbles.
@@ -8216,6 +8324,12 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
           dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
           swiglu_gate, out, out_half, m, k);
       return true;
+    case WeightType::kIQ3_S:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ3_S, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k);
+      return true;
     case WeightType::kQ5_0:
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_0, kBM, BN, kBK>),
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
@@ -8253,7 +8367,8 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    std::size_t m, std::size_t k, hipStream_t stream) {
   const std::size_t block_elems =
       (type == WeightType::kQ3_K || type == WeightType::kQ4_K ||
-       type == WeightType::kQ5_K || type == WeightType::kIQ4_XS)
+       type == WeightType::kQ5_K || type == WeightType::kIQ4_XS ||
+       type == WeightType::kIQ3_S)
           ? 256
           : 64;
   if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
@@ -8270,16 +8385,23 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
     case 128: {
-      if (type == WeightType::kIQ4_XS) {
-        // IQ4_XS gate/up has no paired kernel: prefill runs these 128-token
-        // tiles separately (each token's sums are the 16/48-row tiles').
+      if (type == WeightType::kIQ4_XS || type == WeightType::kIQ3_S) {
+        // IQ4_XS / IQ3_S gate/up have no paired kernel: prefill runs these
+        // 128-token tiles separately (each token's sums are the 16/48-row
+        // tiles').
         constexpr int kBM = 128;
         const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM),
                         n_tiles);
-        hipLaunchKernelGGL(
-            (RoutedF16GEMMKernel<WeightType::kIQ4_XS, kBM, 128, 2>), grid,
-            dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
-            rows_out, swiglu_gate, out, out_half, m, k);
+        if (type == WeightType::kIQ4_XS)
+          hipLaunchKernelGGL(
+              (RoutedF16GEMMKernel<WeightType::kIQ4_XS, kBM, 128, 2>), grid,
+              dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
+              rows_out, swiglu_gate, out, out_half, m, k);
+        else
+          hipLaunchKernelGGL(
+              (RoutedF16GEMMKernel<WeightType::kIQ3_S, kBM, 128, 2>), grid,
+              dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
+              rows_out, swiglu_gate, out, out_half, m, k);
         return true;
       }
       if (out_half == nullptr || swiglu_gate != nullptr)
