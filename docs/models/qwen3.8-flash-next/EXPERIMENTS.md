@@ -35,9 +35,10 @@ the branch alternating twice, median of three per cell; same arithmetic):
 | C1 / C4 / C8 | 59.9–60.2 / 100.0–100.7 / 193.9–195.4 | 58.7–61.9 / 99.2–101.5 / 192.5–197.6 |
 
 Within run-to-run noise except prose decode (−1.6% in both rounds, ranges
-overlapping in the second) and C1 AR in the greedy prompt set (39.37 →
-39.02/39.01 tok/s, −0.9%, one run each); MTP C1 −0.1/−0.2%, the eight-way
-slice 331.3 → 330.8/331.8 s. Inconclusive at this sample size.
+overlapping in the second; inconclusive). The greedy C1 prompt set in one
+lock hold, alternating: AR 40.40/40.46 → 40.40/40.36 tok/s (earlier single
+runs at another time: 39.37 → 39.02/39.01); MTP C1 −0.1/−0.2%; the
+eight-way slice 331.3 → 330.8/331.8 s.
 
 The self-made Q4_K_M (on the 1M-record dataset, so PLE row reads stall
 more than the 16K-record v3 file; not a format comparison): prefill
