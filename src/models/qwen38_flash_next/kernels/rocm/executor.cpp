@@ -3103,6 +3103,8 @@ bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
           l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
          l.ffn_up_exps.type == l.ffn_gate_exps.type &&
          (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
+          l.ffn_down_exps.type == GgmlType::kQ5_0 ||
+          l.ffn_down_exps.type == GgmlType::kQ4_0 ||
           l.ffn_down_exps.type == GgmlType::kIQ4_NL ||
           l.ffn_down_exps.type == GgmlType::kQ8_0) &&
          c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
@@ -3167,11 +3169,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }
-    const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
-                                     ? WeightType::kQ8_0
-                                 : l.ffn_down_exps.type == GgmlType::kIQ4_NL
-                                     ? WeightType::kIQ4_NL
-                                     : WeightType::kQ5_1;
+    // WmmaExperts admits only the down formats the F16 route decodes; the
+    // GGUF ids are the WeightType values.
+    const auto down_type = static_cast<WeightType>(l.ffn_down_exps.type);
     // Prefill takes the gate/up map's 128-token tiles: each wave decodes its
     // rows' weights once for up to 128 tokens.
     const bool wide_down = routed_wide_tiles_ != 0;
@@ -4959,6 +4959,12 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     const TensorRef layout{.type = kv.type, .cols = kv.cols};
     kv.data = static_cast<std::uint8_t*>(kv.data) +
               std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
+    if (kv.decode != nullptr) {
+      // Block-format rows: the K/V slice of the compact decode rows too.
+      const TensorRef compact{.type = kv.decode_type, .cols = kv.cols};
+      kv.decode = static_cast<const std::uint8_t*>(kv.decode) +
+                  std::size_t{2} * c.AttentionQDim() * compact.RowBytes();
+    }
     kv.rows = 2 * c.AttentionKvDim();
     if (!project(kv, s_.mixed, s_.qg, n) ||
         !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,
