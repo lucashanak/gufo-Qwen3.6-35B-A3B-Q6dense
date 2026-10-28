@@ -121,7 +121,7 @@ which the tiled prefill kernels do not implement.
 | `token_embd` | any | exact row gather (`qfn_mmq_get_rows`) | same |
 | `output`, trunk, shared expert, PLE projections, `ssm_alpha`/`ssm_beta` | Q8_0, F16/BF16/F32, or any block format | the file's rows (`qfn_mmq_dense_kq_vec`) | their Q8_0 re-encoding (W8A8 / F16 GEMMs) |
 | HC mixers | as above (320-wide `up`: 32-element formats); `inject` any format, widened to F32 unless Q8_0/BF16 | fused kernel for Q8_0, Q6_K/Q5_1 and IQ4_NL; others separate GEMVs | Q8_0 re-encoding |
-| Routed gate/up | all but IQ1_M | Q3_K/Q4_K/Q5_K/Q8_0 gated kernel; others paired vector kernel + SwiGLU (batched steps too) | Q3_K/Q4_K/Q5_K (paired) and IQ4_XS (separate 128-token tiles): WMMA; others tiled MMQ |
+| Routed gate/up | all but IQ1_M | Q3_K/Q4_K/Q5_K/Q8_0 gated kernel; others paired vector kernel + SwiGLU (batched steps too) | Q3_K/Q4_K/Q5_K (paired), IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XS (separate 128-token tiles): WMMA; others tiled MMQ |
 | Routed down (640 wide) | 32-element formats | vector kernel | Q5_1, Q5_0, Q4_0, IQ4_NL, Q8_0: WMMA (with a WMMA gate/up); others tiled MMQ |
 | `per_layer_token_embd` (160 wide) | 32-element formats, BF16 | CPU decode of disk rows | same |
 | `ple_conv1d` | F32, F16, BF16 (widened to F32) | | |

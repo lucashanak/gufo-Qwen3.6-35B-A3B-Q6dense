@@ -36,6 +36,13 @@ isolated ones. Of the 22 slice questions with a short final answer, 20
 match the v3 recipe's (`reason_03` and `lcagg_16` differ; this is a sanity
 check, not a quality score).
 
+unsloth's public **UD-IQ4_XS** (IQ3_S experts in 47 layers, IQ4_XS in one,
+IQ4_NL/Q8_0 down, Q6_K head, Q8_0 trunk) and **UD-Q2_K_XL** (IQ2_XS experts
+with IQ3_XXS in some layers, IQ4_NL down, Q5_K/Q6_K trunk, Q4_K head, Q5_K
+embedding) load without retyping and answer coherently; for both, greedy AR
+and MTP C1 replies are byte-identical (5/5) and the eight-way slice equals
+the questions sent one at a time (28/28).
+
 ## Long-prompt prefill, October 27, 2026
 
 Both retained changes are host-side: how the inference thread waits for a

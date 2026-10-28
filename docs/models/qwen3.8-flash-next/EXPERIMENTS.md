@@ -19,6 +19,7 @@ rows; F16 PLE taps.
 | Exact embedding gather for every format | Retained: `qfn_mmq_get_rows`, compiled without fast-math, equals the CPU dequantization, which in turn equals gguf-py's NumPy dequantizers bit for bit over random blocks of all 18 formats. An untied table keeps only its file rows. |
 | WMMA down projection for Q5_0 / Q4_0 | Retained: their codes enter the Q8_0 route as signed bytes (`code − 16` / `code − 8`), so Q4_K mixes keep the WMMA prefill route. Rows are bit for bit the same across 16/48/128-token tiles and prompt passes. |
 | WMMA gate/up for IQ4_XS | Retained: a K32 block is IQ4_NL's codes with the F16 scale `d·(ls − 32)`; without a paired kernel, prefill runs gate and up separately on the wide map's 128-token tiles, bit for bit the 16/48-token tiles. |
+| WMMA gate/up for IQ3_S, IQ3_XXS, IQ2_XS | Retained: their signed grid values (at most 62 in magnitude) enter the Q8_0 route as bytes with the F16 sub-block scale (IQ2_XS two per K32 block, as Q3_K). `routed_gemm_bench` over one 16,384-token layer (top-10 of 512, IQ4_NL down): gate/up IQ3_S 127.3 → 45.6 ms, IQ3_XXS 127.3 → 42.8, IQ2_XS 150.6 → 43.3, IQ4_XS 124.6 → 43.0 (Q3_K paired: 34.8); the down projection then takes the WMMA route too (123 → 19 ms). |
 | Batched decode steps of formats without the gated kernel | Retained: one paired vector launch, SwiGLU and one down launch over all rows (MoeExperts' decode route over every row) instead of eight-row chunks. |
 | Quantized HC inject rows, F16 PLE taps | Widened to F32 on the host at upload; the fused mixer and PLE convolution read F32. |
 | Native IQ4_XS against the IQ4_NL retype of the uncensored model | Not run: the original IQ4_XS file is no longer on disk. |
@@ -44,6 +45,23 @@ The self-made Q4_K_M (on the 1M-record dataset, so PLE row reads stall
 more than the 16K-record v3 file; not a format comparison): prefill
 1,407/1,459 tok/s, prose 50.6, code 68.7, C1/C4/C8 53.0/72.1/146.1; the
 eight-way slice 412.9 s.
+
+Public mixes through the same probe (both on the 1M-record dataset):
+
+| Cell | UD-IQ4_XS (MMQ prefill) | UD-Q2_K_XL, MMQ prefill | UD-Q2_K_XL, WMMA prefill |
+| --- | ---: | ---: | ---: |
+| prefill 7.3K / 26.5K | 1,105.6 / 1,128.8 | 1,101.3 / 1,051.6 | 1,521.5 / 1,512.1 |
+| prose / code decode | 42.8 / 60.3 | 47.4 / 67.4 | 46.9 / 66.5 |
+| C1 / C4 / C8 | 43.9 / 60.9 / 125.2 | 50.4 / 65.4 / 126.2 | 44.1 / 63.2 / 127.8 |
+| eight-way slice | 452.2 s | | 378.2 s |
+
+The WMMA column differs from the MMQ one only in the prefill expert route;
+its decode cells differ by run-to-run noise (PLE rows from disk). The
+routed decode stage (`routed_vec_bench`, 48 layers, random routing, IQ4_NL
+down): IQ3_S gate/up 5.97 ms per forward at one row against Q3_K's 3.47
+(same bytes; the paired vector kernel and IQ3_S's grid decode), 39.96 vs
+24.56 at eight rows, 320.1 vs 149.9 at 64; IQ4_XS 4.31 against Q4_K's 4.06;
+Q2_K 3.09; Q6_K 6.17. A gated IQ3_S kernel is not built.
 
 ## Long-prompt prefill (October 27, 2026)
 
