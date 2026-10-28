@@ -43,6 +43,14 @@ embedding) load without retyping and answer coherently; for both, greedy AR
 and MTP C1 replies are byte-identical (5/5) and the eight-way slice equals
 the questions sent one at a time (28/28).
 
+A test-only "kitchen" GGUF (v3 with single layers retyped through
+`llama-quantize --tensor-type`: Q2_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S,
+IQ1_S, Q6_K, Q4_0 and IQ4_XS experts; Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 down;
+IQ4_XS/Q2_K/IQ3_S/IQ2_XXS/IQ2_S/Q6_K attention and SSM tensors, IQ1_M/IQ2_XS/
+Q4_0/Q4_1 HC tensors, a Q2_K inject, IQ4_XS embedding) passes the same three
+checks: coherent replies, AR == MTP 5/5, eight-way slice == one at a time
+28/28.
+
 ## Long-prompt prefill, October 27, 2026
 
 Both retained changes are host-side: how the inference thread waits for a
