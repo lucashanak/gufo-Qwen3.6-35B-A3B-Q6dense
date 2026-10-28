@@ -1,5 +1,19 @@
 # Qwen3.8 Flash-Next experiments
 
+## Exactness at the sparse budget (October 28, 2026)
+
+Workload: greedy decoding through the engine API with controlled batch
+composition (diagnostic `exact_probe`: frontier-logit hash per step; AR,
+single-session MTP, eight-way batched AR and MTP, staggered joins, MTP
+started at a chosen position) and the eight-way IQ replay at production
+flags. Evidence: [QUALITY.md](QUALITY.md#exactness-at-the-sparse-budget-october-28-2026).
+
+| Experiment | Outcome |
+| --- | --- |
+| Dense sweep for rows before the budget in a masked decode/verification launch | Retained (`dense_extent` in `AttentionKernel`). A chain crossing 2,048 tokens used the mask walk for its pre-budget rows, whose tail block lands in its own tile; decoding alone sweeps it in the last dense tile. Fixes the replay's run-to-run divergence. Prefill and plain AR rows take the same route as before. 28-question slice at production flags (budget 0.6): 306 → 304 s, all 28 answers identical. `fnab.sh`, alternating base/fix twice: pp8192 1628/1619 → 1634/1631, pp32768 1710/1625 → 1619/1597 (the prefill pass does not reach the changed kernel; consecutive long prompts vary like this, see below), decode 60.8/58.5 → 62.7/60.2, C1 59.5/56.0 → 62.0/60.1, C4 98.7/95.9 → 100.9/92.6, C8 198.3/190.1 → 192.6/188.9 tok/s: within run-to-run noise. |
+| Bisecting with batch knobs (graphs off, sparse decided by the chain's first row) | Diagnostic only; superseded by the solo MTP-from-position repro, which is deterministic (batched draft widths follow measured cycle times). |
+| Exact sparse prefill for passes starting off a four-token boundary (one query per WMMA tile) | Not built: the union tiles are the sparse window's speed (one or three queries per tile measured slower, [October 23](#indexer-and-sparse-attention-at-depth-october-23-2026)). The serving-side alternative is to round intermediate prefill boundaries down to a multiple of four. |
+
 ## Long-prompt prefill (October 27, 2026)
 
 Workload: v3 recipe + shared-Q8_0 MTP, `gufo bench` pp2K–pp128K and cold

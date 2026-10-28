@@ -1,5 +1,70 @@
 # Qwen3.8 Flash-Next quality
 
+## Exactness at the sparse budget, October 28, 2026
+
+The run-to-run differences of the eight-way replay (below) came from
+verification chains that cross the 2,048-token sparse-attention budget. A
+crossing chain selects blocks for every row; its rows before the budget then
+took the narrow attention's mask walk, which attends the incomplete tail
+block (keys 4k..pos) in a tile of its own on split 0, where decoding the
+same row alone sweeps those keys densely in the last tile. The online
+softmax rounds differently, so positions 2041, 2042, 2044, 2045 and 2046
+(whose key count is not a multiple of four) changed with the draft widths
+and therefore with batch timing. Every
+diverging replay answer starts at an estimated position of about 2,017 to
+4,221 tokens, none before the budget. Rows that see at most 2,048 keys now
+sweep densely even with a mask (`AttentionKernel`'s `dense_extent`); AR and
+prefill arithmetic is unchanged.
+
+Evidence (`exact_probe`, an uncommitted diagnostic that records a hash of
+the frontier logits after every step, production flags: 262,144 context,
+20 GiB K/V, MTP, `decode_concurrency` 8):
+
+- `lcagg_01` alone, AR to position P then MTP cycles from P: without the
+  fix the frontier logits first differ at position 2048 for every
+  P = 2041..2046 (accepted chains of 2–6 crossing the budget); with it
+  every frontier of the 130 tokens equals plain AR, and plain AR itself is
+  unchanged by the fix. An eight-way batch had reproduced the same
+  first difference at 2048 once (chain luck, timing-based widths).
+- With the fix, eight IQ prompts (`reason_20`, `sysadm_17`, `czech_15`,
+  `lcagg_01`, `exec_11`, `code_08`, `math_05`, `sysadm_03`) decoded up to
+  3,000 tokens: eight-way batched MTP, the same batch with staggered joins
+  and single-session MTP all equal eight-way batched AR at every common
+  frontier (41–1,402 per prompt; `code_08` and `math_05` stop after 136
+  and 157 tokens) and their tokens are equal; `reason_20` and `lcagg_01`
+  end at the replay's 2,291 and 2,409 tokens. In an earlier 1,200-token run
+  batched AR equals single-session AR at all 1,201 positions.
+- `attention_ops_test` checks chains of eight rows from 2040..2047 (eight
+  splits, compact lists) bit for bit against each row launched alone, and
+  that the mask walk would differ (it does on 24 rows). The engine-level
+  `batch_graph` synthetic model did not see the difference: the Q8_1
+  quantization of the attention output absorbed it.
+- Context, K/V budget and MTP do not change logits: `lcagg_14` (11,391
+  prompt tokens) and `lcagg_19` (22,171) give identical frontier hashes for
+  300 greedy tokens at `--context` 110,000 without MTP, 40,960 with MTP
+  (AR and MTP sessions) and 262,144 with a 20 GiB K/V budget (AR and MTP),
+  and identical complete answers (1,184 and 699 tokens to EOS) for AR at
+  110,000 against MTP at 40,960 and at 262,144 with the budget.
+  The earlier probe-vs-server difference on these questions compared the
+  pre-KV8 diagnostic tree (`/opt/gufo-fn-kvdiag`, F16 K/V) with a KV8 server.
+- Sparse prefill is exact only for passes that start on a four-token
+  boundary: the WMMA tiles group four queries from the pass start and
+  gather the union of their selections (`SparseSplitChecks` tests aligned
+  splits only). `lcagg_14`/`lcagg_19` prefilled as one pass against two
+  passes ending 3, 4, 5 and 6 tokens before the prompt end: the 3-token
+  split (an aligned boundary) is identical, the others change the prompt
+  logits (`lcagg_14` changes its 40th token). Single-turn requests never
+  split there (their stable prefix is empty; grid checkpoints are multiples
+  of 2,048), but a restored multi-turn boundary can.
+- IQ replays through `gufo serve` at production flags (eight sessions,
+  262,144 context, 20 GiB K/V, KV8, MTP, `--reasoning-budget-fraction 0.6`,
+  4 GiB RAM cache): the 28-question slice is byte-identical between eight
+  workers in order and six workers in reverse order (304.2 s / 327.9 s),
+  and to `13c2897c` (306 s); two full 149-question replays, the second in a
+  shuffled order, are byte-identical on all 149 answers (135,179 tokens
+  each, 1,425 s / 1,456 s).
+- All 25 `qwen38_flash_next` ctests pass.
+
 ## Long-prompt prefill, October 27, 2026
 
 Both retained changes are host-side: how the inference thread waits for a
@@ -55,8 +120,8 @@ order, products and reduction tree. Evidence, at production flags:
   (czech_15, sysadm_17); its reason_20, sysadm_17 and lcagg_01 answers each
   equal one of the baseline runs, and it generated exactly the `9b9cbcb9`
   run's 147,686 tokens. The source of the baseline's run-to-run divergence
-  (a path whose rows depend on batch composition or timing) is not yet
-  located.
+  is located and fixed above
+  ([exactness at the sparse budget](#exactness-at-the-sparse-budget-october-28-2026)).
 
 ## 8-bit K/V cache, October 25, 2026
 
