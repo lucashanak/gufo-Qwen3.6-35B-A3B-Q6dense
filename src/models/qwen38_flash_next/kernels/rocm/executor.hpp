@@ -639,6 +639,8 @@ private:
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true,
                  std::uint32_t checkpoint_tokens = 0) const;
+  /// Orders the main stream after the work queued on side_stream_.
+  bool JoinSide(std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false) const;
@@ -723,12 +725,17 @@ private:
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
   mutable std::shared_ptr<void> checkpoint_storage_;
-  /// Every launch goes to stream_; a decode MoE swaps it for side_stream_
-  /// while it queues the shared expert (see Moe).
+  /// The stream kernels are queued on. Overlapped work swaps in side_stream_
+  /// for its launches: a decode MoE queues its shared expert there (joined
+  /// through shexp_join_), a prompt pass its shared expert and checkpoint
+  /// copies (joined through side_done_, JoinSide).
   mutable hipStream_t stream_{nullptr};
   hipStream_t side_stream_{nullptr};
   hipEvent_t shexp_fork_{nullptr};
   hipEvent_t shexp_join_{nullptr};
+  hipEvent_t side_start_{nullptr};
+  hipEvent_t side_done_{nullptr};
+  mutable bool side_pending_{false};  ///< side_done_ not yet waited on
   hipEvent_t counts_ready_{nullptr};
   hipEvent_t pass_done_{nullptr};  ///< end of a relaxed Run
   /// Relaxed expert-count waits of the current and the previous prompt pass,

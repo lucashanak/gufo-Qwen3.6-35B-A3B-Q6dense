@@ -109,72 +109,89 @@ namespace {
 
 /* qwen38: every allocation the tier makes is scoped to one entry point and
  * released in reverse order, and each arena serves one stream (qfn_pool_for_stream),
- * so stream order makes a stack over one device arena enough. It replaces
+ * so stream order makes a stack over device memory enough. It replaces
  * hipMallocAsync/hipFreeAsync, whose reuse of a just-freed block raced with
- * in-flight kernels on this ROCm and made prefill logits nondeterministic. */
+ * in-flight kernels on this ROCm and made prefill logits nondeterministic.
+ *
+ * The stack spans a list of blocks. An allocation that doesn't fit the current
+ * block goes to the next one that fits (added if needed, at least twice the
+ * last), so an arena can start small: the MTP and DFlash2 streams only quantize
+ * a few rows. Blocks live as long as the pool: captured graphs bake in their
+ * addresses and replay them after the arena has grown. */
 struct qfn_stack_pool : public ggml_hip_pool {
-    struct chunk {
+    static constexpr size_t kFirstBlockBytes = (size_t) 16 << 20;
+
+    struct block {
         char *base;
         size_t capacity;
         size_t top;
     };
 
+    struct live_alloc {
+        char *ptr;
+        size_t bytes;
+        size_t block;
+    };
+
     int device;
-    std::vector<chunk> chunks;
-    size_t cur = 0;
-    std::vector<std::pair<char *, size_t>> live;
+    std::vector<block> blocks;
+    size_t current = 0;
+    std::vector<live_alloc> live;
 
     explicit qfn_stack_pool(int device) : device(device) {}
 
     ~qfn_stack_pool() override {
-        for (const chunk &c : chunks) (void)hipFree(c.base);
+        for (const block &b : blocks) (void)hipFree(b.base);
     }
 
-    /* Captured decode graphs keep the scratch addresses they were recorded with,
-     * so no chunk is ever freed or moved. A request that does not fit continues
-     * in the next chunk, adding one when none is left; a drained pool starts
-     * again at the first chunk, at the addresses it had before. */
+    void add_block(size_t bytes) {
+        /* Drain the device first, as the single arena did. On ROCm 10.1 an
+         * allocation made while kernels are in flight leaves later kernel
+         * launches slower for seconds (+14 ms per short MTP request). Blocks
+         * are only added by eager passes, never during capture. */
+        (void)hipDeviceSynchronize();
+        char *base = nullptr;
+        HIP_CHECK(gufo::hip::AllocateDevice(&base, bytes));
+        blocks.push_back({base, bytes, 0});
+    }
+
     void * alloc(size_t size, size_t * actual_size) override {
         ggml_hip_set_device(device);
         const size_t aligned = (size + 255) & ~(size_t) 255;
-        while (chunks.empty() || chunks[cur].top + aligned > chunks[cur].capacity) {
-            if (!chunks.empty() && cur + 1 < chunks.size()) {
-                ++cur;
-                continue;
-            }
-            size_t total = 0;
-            for (const chunk &c : chunks) total += c.capacity;
-            size_t next = total ? total : (size_t) 256 << 20;
-            while (next < aligned) next *= 2;
-            char *base = nullptr;
-            HIP_CHECK(gufo::hip::AllocateDevice(&base, next));
-            chunks.push_back({base, next, 0});
-            cur = chunks.size() - 1;
-            if (cur > 0) {
-                fprintf(stderr, "qfn_stack_pool: added a %zu MiB scratch chunk (%zu MiB in total)\n", next >> 20,
-                        (total + next) >> 20);
-            }
+        if (blocks.empty()) {
+            size_t first = kFirstBlockBytes;
+            while (first < aligned) first *= 2;
+            add_block(first);
         }
-        chunk &c = chunks[cur];
-        char *ptr = c.base + c.top;
-        c.top += aligned;
-        live.emplace_back(ptr, aligned);
+        if (blocks[current].top + aligned > blocks[current].capacity) {
+            // Blocks after `current` are empty: the stack only reaches them through it.
+            size_t next = current + 1;
+            while (next < blocks.size() && blocks[next].capacity < aligned) ++next;
+            if (next == blocks.size()) {
+                size_t bytes = blocks.back().capacity * 2;
+                while (bytes < aligned) bytes *= 2;
+                add_block(bytes);
+            }
+            current = next;
+        }
+        block &b = blocks[current];
+        char *ptr = b.base + b.top;
+        b.top += aligned;
+        live.push_back({ptr, aligned, current});
         if (actual_size) *actual_size = aligned;
         return ptr;
     }
 
     void free(void * ptr, size_t /*size*/) override {
         if (!ptr) return;
-        if (live.empty() || live.back().first != ptr) {
+        if (live.empty() || live.back().ptr != ptr) {
             fprintf(stderr, "qfn_stack_pool: non-LIFO free\n");
             abort();
         }
-        char *p = static_cast<char *>(ptr);
-        size_t i = cur;
-        while (i > 0 && (p < chunks[i].base || p >= chunks[i].base + chunks[i].capacity)) --i;
-        chunks[i].top -= live.back().second;
+        const live_alloc a = live.back();
         live.pop_back();
-        while (cur > 0 && chunks[cur].top == 0) --cur;
+        blocks[a.block].top -= a.bytes;
+        while (current > 0 && blocks[current].top == 0) --current;
     }
 };
 

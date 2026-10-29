@@ -11,9 +11,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -38,6 +40,7 @@ using gufo::server::HandleEmbeddingsApiRequest;
 using gufo::server::HttpRequest;
 using gufo::server::HttpResponse;
 using gufo::server::IsEmbeddingsApiPath;
+using gufo::server::LoadSentenceTransformerPrompts;
 using gufo::server::TruncateKeepingImages;
 
 constexpr std::size_t kWidth = 768;
@@ -118,6 +121,8 @@ std::unique_ptr<EmbeddingService> MakeService(FakeRunner* runner) {
       .model_root = {},
       .validate_model = false,
       .model_id = "embeddinggemma-2",
+      .prompts = {},
+      .default_prompt_name = {},
       .runner =
           [runner](const std::vector<EmbeddingInput>& inputs,
                    const EmbeddingRequestOptions& request,
@@ -498,6 +503,8 @@ void TestLimitsAndFailures() {
       .model_root = {},
       .validate_model = false,
       .model_id = "embeddinggemma-2",
+      .prompts = {},
+      .default_prompt_name = {},
       .runner =
           [](const std::vector<EmbeddingInput>&,
              const gufo::server::EmbeddingRequestOptions&,
@@ -517,6 +524,8 @@ void TestTypedInput() {
       .model_root = {},
       .validate_model = false,
       .model_id = "embeddinggemma-2",
+      .prompts = {},
+      .default_prompt_name = {},
       .runner = [&](const std::vector<EmbeddingInput>& inputs,
                     const gufo::server::EmbeddingRequestOptions&,
                     EmbeddingBatch* batch, std::string*) {
@@ -557,7 +566,37 @@ void TestTypedInput() {
       Send(
           service,
           R"({"input":[{"content":[{"type":"input_audio","input_audio":{}}]}]})"),
-      400, "unsupported_input", "unsupported modality");
+      400, "invalid_parameter_type", "audio source is required");
+  const auto audio_response = Send(
+      service,
+      R"({"input":["plain",{"content":[{"type":"input_audio","input_audio":{"data":"AAAA","url":"ignored","format":"ignored"}},{"type":"text","text":"middle"},{"type":"input_audio","input_audio":{"url":"https://example.com/test.wav"}},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]})");
+  Check(audio_response.status == 200 && captured.size() == 2 &&
+            captured[1].content.size() == 4,
+        "audio and mixed content are accepted");
+  Check(captured[1].content[0].type == EmbeddingPart::Type::kAudio &&
+            captured[1].content[0].value == "AAAA" &&
+            captured[1].content[1].value == "middle" &&
+            captured[1].content[2].type == EmbeddingPart::Type::kAudio &&
+            captured[1].content[2].value == "https://example.com/test.wav" &&
+            captured[1].content[3].type == EmbeddingPart::Type::kImage,
+        "audio data precedence and part order match the request");
+  for (
+      const auto* body :
+      {R"({"input":[{"content":[{"type":"input_audio","input_audio":null}]}]})",
+       R"({"input":[{"content":[{"type":"input_audio","input_audio":{"data":7}}]}]})",
+       R"({"input":[{"content":[{"type":"input_audio","input_audio":{"data":"AAAA","format":7}}]}]})",
+       R"({"input":[{"content":[{"type":"input_audio","input_audio":{"data":"AAAA","other":"x"}}]}]})"})
+    ExpectError(Send(service, body), 400, "invalid_parameter_type",
+                "malformed audio part");
+  std::string audio_many = R"({"input":[{"content":[)";
+  for (unsigned i = 0; i < 33; ++i) {
+    if (i)
+      audio_many += ',';
+    audio_many += R"({"type":"input_audio","input_audio":{"data":"AAAA"}})";
+  }
+  audio_many += "]}]}";
+  ExpectError(Send(service, audio_many), 400, "too_many_audio",
+              "audio count bounded before decoding");
   std::string many = R"({"input":[{"content":[)";
   for (unsigned i = 0; i < 33; ++i) {
     if (i)
@@ -585,6 +624,8 @@ void TestNativeEmbeddings() {
       .model_root = {},
       .validate_model = false,
       .model_id = "embeddinggemma-2",
+      .prompts = {},
+      .default_prompt_name = {},
       .runner = [&](const std::vector<EmbeddingInput>& inputs,
                     const gufo::server::EmbeddingRequestOptions&,
                     EmbeddingBatch* batch, std::string*) {
@@ -645,6 +686,24 @@ void TestNativeEmbeddings() {
             captured[0].content[2].value == " mid " &&
             captured[0].content[3].value == "data:image/jpeg;base64,BBBB",
         "text around markers keeps its order and whitespace");
+
+  // Like llama.cpp's mtmd helper, files that look like WAV, MP3 or FLAC
+  // (and Ogg, which the audio decoder reads) become audio parts; WebP's RIFF
+  // container and PNG stay images.
+  const auto media = SendTo(
+      service, "/embeddings",
+      R"({"content":{"prompt_string":"<__media__><__media__><__media__><__media__><__media__><__media__><__media__>","multimodal_data":["UklGRiQAAABXQVZFZm10IA==","SUQzBAAAAAAAAAAA","//uQAAAAAAAAAAAA","ZkxhQwAAACIAAAAA","T2dnUwACAAAAAAAA","UklGRiQAAABXRUJQVlA4IA==","iVBORw0KGgoAAAANSUhEUg=="]}})");
+  Check(media.status == 200, "native audio files succeed: " + media.body);
+  using Type = EmbeddingPart::Type;
+  const std::vector<Type> media_types{Type::kAudio, Type::kAudio, Type::kAudio,
+                                      Type::kAudio, Type::kAudio, Type::kImage,
+                                      Type::kImage};
+  bool sniffed =
+      captured.size() == 1 && captured[0].content.size() == media_types.size();
+  for (std::size_t i = 0; sniffed && i < media_types.size(); ++i)
+    sniffed = captured[0].content[i].type == media_types[i];
+  Check(sniffed && captured[0].content[0].value == "UklGRiQAAABXQVZFZm10IA==",
+        "multimodal_data audio is sniffed by its bytes and kept as raw base64");
 
   // The same text embeds identically on both routes; `input` wins over
   // `content`, as in llama.cpp.
@@ -845,6 +904,167 @@ void TestTruncateKeepingImages() {
         "an encoding within the limit is unchanged");
 }
 
+// #723: checkpoint prompts selected per request or by a server default.
+std::unique_ptr<EmbeddingService> MakePromptService(FakeRunner* runner,
+                                                    std::string default_name) {
+  return std::make_unique<EmbeddingService>(EmbeddingServiceOptions{
+      .model_root = {},
+      .validate_model = false,
+      .model_id = "embeddinggemma-2",
+      .prompts = {{"query", "task: search result | query: "},
+                  {"document", "title: none | text: "}},
+      .default_prompt_name = std::move(default_name),
+      .runner =
+          [runner](const std::vector<EmbeddingInput>& inputs,
+                   const EmbeddingRequestOptions& request,
+                   EmbeddingBatch* batch, std::string* error) {
+            std::vector<std::string> texts;
+            for (const auto& input : inputs) {
+              std::string text;
+              for (const auto& part : input.content)
+                text += part.value;
+              texts.push_back(std::move(text));
+            }
+            return runner->Run(texts, request, batch, error);
+          },
+  });
+}
+
+void TestPromptNames() {
+  FakeRunner runner;
+  auto service = MakePromptService(&runner, "");
+  Check(Send(*service, R"({"input":"a"})").status == 200, "no prompt");
+  Check(runner.last_texts == std::vector<std::string>{"a"},
+        "without a default, inputs reach the encoder unchanged");
+  Check(Send(*service, R"({"input":["a","b"],"prompt_name":"query"})").status ==
+            200,
+        "a known prompt_name");
+  Check(runner.last_texts ==
+            std::vector<std::string>{"task: search result | query: a",
+                                     "task: search result | query: b"},
+        "prompt_name prefixes every input");
+  const int calls = runner.calls;
+  ExpectError(Send(*service, R"({"input":"a","prompt_name":"Query"})"), 400,
+              "invalid_prompt_name", "prompt names are case-sensitive");
+  ExpectError(Send(*service, R"({"input":"a","prompt_name":1})"), 400,
+              "invalid_parameter_type", "a non-string prompt_name");
+  Check(runner.calls == calls,
+        "a refused prompt_name never reaches the service");
+
+  auto with_default = MakePromptService(&runner, "document");
+  Check(with_default->ready(), "a known default prompt");
+  Check(Send(*with_default, R"({"input":"a"})").status == 200,
+        "default prompt");
+  Check(runner.last_texts == std::vector<std::string>{"title: none | text: a"},
+        "the default prompt applies when the request names none");
+  Check(Send(*with_default, R"({"input":"a","prompt_name":"query"})").status ==
+                200 &&
+            runner.last_texts ==
+                std::vector<std::string>{"task: search result | query: a"},
+        "a request's prompt_name overrides the default");
+  Check(
+      Send(*with_default, R"({"input":"a","prompt_name":""})").status == 200 &&
+          runner.last_texts == std::vector<std::string>{"a"},
+      "an empty prompt_name applies no prompt despite the default");
+  Check(Send(*with_default, R"({"input":"a","prompt_name":null})").status ==
+                200 &&
+            runner.last_texts ==
+                std::vector<std::string>{"title: none | text: a"},
+        "a null prompt_name keeps the default");
+  Check(SendTo(*with_default, "/embeddings",
+               R"({"content":"a","prompt_name":"query"})")
+                    .status == 200 &&
+            runner.last_texts ==
+                std::vector<std::string>{"task: search result | query: a"},
+        "llama.cpp's /embeddings applies prompt_name too");
+
+  // The model card passes images and audio without a prefix: the default
+  // skips inputs without text, but a requested prompt applies to all.
+  const std::string image =
+      R"({"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}})";
+  const std::string audio =
+      R"({"type":"input_audio","input_audio":{"data":"AAAA"}})";
+  const std::string caption = R"({"type":"text","text":"cap"})";
+  const std::string media_inputs =
+      R"({"input":[{"content":[)" + image + R"(]},{"content":[)" + audio +
+      R"(]},{"content":[)" + image + "," + caption + R"(]},"a"]})";
+  Check(Send(*with_default, media_inputs).status == 200 &&
+            runner.last_texts.size() == 4,
+        "default prompt with media inputs");
+  Check(runner.last_texts[0] == "data:image/png;base64,AAAA",
+        "the default prompt skips an image-only input");
+  Check(!runner.last_texts[1].starts_with("title: none | text: "),
+        "the default prompt skips an audio-only input");
+  Check(runner.last_texts[2] ==
+            "title: none | text: data:image/png;base64,AAAAcap",
+        "the default prompt prefixes an input with text and an image");
+  Check(runner.last_texts[3] == "title: none | text: a",
+        "the default prompt prefixes text beside media inputs");
+  Check(SendTo(*with_default, "/embeddings",
+               R"({"content":{"prompt_string":"<__media__>",)"
+               R"("multimodal_data":["AAAA"]}})")
+                    .status == 200 &&
+            !runner.last_texts[0].starts_with("title: none | text: "),
+        "the default prompt skips llama.cpp media without text");
+  Check(Send(*with_default, R"({"input":[{"content":[)" + image +
+                                R"(]}],"prompt_name":"query"})")
+                    .status == 200 &&
+            runner.last_texts ==
+                std::vector<std::string>{
+                    "task: search result | query: data:image/png;base64,AAAA"},
+        "a requested prompt_name prefixes an image-only input");
+
+  auto unknown_default = MakePromptService(&runner, "missing");
+  Check(!unknown_default->ready() &&
+            unknown_default->initialization_error().find("missing") !=
+                std::string::npos,
+        "an unknown default prompt fails startup");
+
+  const auto dir =
+      std::filesystem::temp_directory_path() /
+      ("embedding_prompts_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(dir);
+  std::map<std::string, std::string> prompts{{"stale", "x"}};
+  std::string error;
+  Check(
+      LoadSentenceTransformerPrompts(dir, &prompts, &error) && prompts.empty(),
+      "a checkpoint without the file has no prompts");
+  {
+    std::ofstream out(dir / "config_sentence_transformers.json");
+    out << R"({"default_prompt_name":null,"prompts":{"query":"q: ","document":"d: "}})";
+  }
+  Check(LoadSentenceTransformerPrompts(dir, &prompts, &error) &&
+            prompts.size() == 2 && prompts.at("query") == "q: " &&
+            prompts.at("document") == "d: ",
+        "prompts load from config_sentence_transformers.json");
+  {
+    std::ofstream out(dir / "config_sentence_transformers.json");
+    out << R"({"prompts":{"query":3}})";
+  }
+  Check(!LoadSentenceTransformerPrompts(dir, &prompts, &error) &&
+            error.find("query") != std::string::npos,
+        "a non-string prompt is refused");
+  {
+    std::ofstream out(dir / "config_sentence_transformers.json");
+    out << R"({"prompts":["q: "]})";
+  }
+  Check(!LoadSentenceTransformerPrompts(dir, &prompts, &error) &&
+            error.find("must be an object") != std::string::npos,
+        "a non-object prompts table is refused");
+  {
+    std::ofstream out(dir / "config_sentence_transformers.json");
+    out << R"({"prompts":)";
+  }
+  error.clear();
+  Check(
+      !LoadSentenceTransformerPrompts(dir, &prompts, &error) &&
+          error.find("config_sentence_transformers.json") != std::string::npos,
+      "malformed JSON is refused with the path");
+  std::filesystem::remove_all(dir);
+}
+
 void TestCancellation() {
   FakeRunner runner;
   auto service = MakeService(&runner);
@@ -858,6 +1078,8 @@ void TestCancellation() {
       .model_root = {},
       .validate_model = false,
       .model_id = "embeddinggemma-2",
+      .prompts = {},
+      .default_prompt_name = {},
       .runner =
           [&cancelled](const std::vector<EmbeddingInput>& texts,
                        const gufo::server::EmbeddingRequestOptions&,
@@ -884,6 +1106,8 @@ void TestServiceLifecycle() {
       .model_root = {},
       .validate_model = false,
       .model_id = {},
+      .prompts = {},
+      .default_prompt_name = {},
       .runner = [](const std::vector<EmbeddingInput>&,
                    const gufo::server::EmbeddingRequestOptions&,
                    EmbeddingBatch*,
@@ -896,6 +1120,8 @@ void TestServiceLifecycle() {
       .model_root = "/nonexistent/embeddinggemma",
       .validate_model = true,
       .model_id = {},
+      .prompts = {},
+      .default_prompt_name = {},
       .runner = [](const std::vector<EmbeddingInput>&,
                    const gufo::server::EmbeddingRequestOptions&,
                    EmbeddingBatch*,
@@ -914,6 +1140,8 @@ void TestServiceLifecycle() {
       EmbeddingServiceOptions{.model_root = "/nonexistent",
                               .validate_model = false,
                               .model_id = {},
+                              .prompts = {},
+                              .default_prompt_name = {},
                               .runner = {}});
   Check(!cpu_only.ready() && cpu_only.initialization_error() ==
                                  "embedding service requires the HIP backend",
@@ -927,6 +1155,8 @@ void TestServiceLifecycle() {
       .model_root = {},
       .validate_model = false,
       .model_id = {},
+      .prompts = {},
+      .default_prompt_name = {},
       .runner =
           [&](const std::vector<EmbeddingInput>& texts,
               const gufo::server::EmbeddingRequestOptions&, EmbeddingBatch* out,
@@ -968,6 +1198,7 @@ int main() {
   TestNativeReferenceFixture();
   TestTruncate();
   TestTruncateKeepingImages();
+  TestPromptNames();
   TestCancellation();
   TestServiceLifecycle();
   std::cout << "PASS embedding_gemma2_embeddings_api_test\n";

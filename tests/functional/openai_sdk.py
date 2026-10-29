@@ -28,6 +28,7 @@ from metrics import CaseComplete, Recorder
 from tool_reasoning import check_reasoning_separator, check_tool_reasoning, response_result
 from tool_streaming import check_tool_streaming
 from discovery import check_discovery
+from logprobs import check_logprobs, check_responses_logprobs
 from image_inputs import check_image_count, check_image_detail, check_image_inputs
 from tool_images import check_tool_images
 from tool_choice import check_tool_choice_cache
@@ -2094,18 +2095,19 @@ def check_auto_tools(client, model, checks, vision=False):
     assert json.loads(calls[0].arguments) == {"value": 7}, result
     record("auto_many_declared_tools", result.to_dict())
     if vision:
+        # The argument stop below requires a color name, not an RGB/hex code.
+        image_prompt = ("Call record with value equal to the image color as a lowercase "
+                        "English color name, not a hex or RGB code. Omit optional.")
         result = client.responses.create(**{
             **response_request, "temperature": 0,
             "input": [{"role": "user", "content": [
-                {"type": "input_text", "text":
-                 "Call record with value equal to the image color. Omit optional."},
+                {"type": "input_text", "text": image_prompt},
                 {"type": "input_image", "image_url":
                  image_content("blue")["image_url"]["url"]}]}]})
         response_signature(result, value="blue")
         record("auto_image_tool", result.to_dict())
         image_request = {**common, "messages": [{"role": "user", "content": [
-            image_content("blue"), {"type": "text", "text":
-            "Call record with value equal to the image color. Omit optional."}]}]}
+            image_content("blue"), {"type": "text", "text": image_prompt}]}]}
         stopped = chat_result(client, {**image_request, "stop": "blue"}, True)
         assert stopped["finish"] == "stop" and not stopped["tools"], stopped
         retry = chat_result(client, image_request, True)
@@ -2758,7 +2760,7 @@ def check_server_metrics(client, model, checks, width, context, speculative, ser
 
 SDK_SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "image-detail", "structured", "structured-limits",
               "tool-reasoning", "tool-streaming", "reasoning-separator", "reasoning-budget",
-              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
+              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "logprobs", "responses-logprobs", "batch",
               "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix",
               "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "system-injection")
 
@@ -2905,6 +2907,8 @@ def main():
             "sampling-defaults": lambda: check_sampling_defaults(
                 client, args.model, checks, args.sampling_preset, args.sampling_overrides,
                 args.vision, args.server_thinking),
+            "logprobs": lambda: check_logprobs(client, args.model, checks, CompletionStreamFrame),
+            "responses-logprobs": lambda: check_responses_logprobs(client, args.model, checks),
             "sampling-ranges": lambda: check_sampling_ranges(client, args.model, checks),
             "batch": lambda: check_batches(
                 client, args.model, checks, args.concurrency, args.vision, args.speculative),

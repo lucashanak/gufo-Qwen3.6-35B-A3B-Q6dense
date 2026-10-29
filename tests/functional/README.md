@@ -41,7 +41,7 @@ VoiceDesign model (fixed English voice instructions). Neither requires a clone.
 
 | Suite | Required checks |
 | --- | --- |
-| Embedding | Existing text and image HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image formats, invalid inputs and recovery |
+| Embedding | Text, image and audio HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image/audio formats, multiple clips, audio/text/image interleaving, invalid inputs, cancellation and recovery |
 | ASR | English transcript WER ≤ 0.15, exact greedy replay, JSON/text/verbose formats, complete SSE matching buffered output, concurrent speech/silence, rejected options, malformed WAV recovery, stream cancellation and subsequent valid inference |
 | TTS | Voice discovery, valid non-silent 24-kHz mono PCM16 audio, two fixed texts with ASR WER ≤ 0.25, exact same-seed warm replay, WAV/PCM/SSE equality, different concurrent texts/seeds, rejected inputs, stream cancellation and subsequent valid inference |
 
@@ -193,7 +193,7 @@ the same source input when comparing revisions. These are public substitutes
 for PR #613's private cases; they do not reproduce the author's exact prompts.
 Run the existing Pi `edit` and `creation` cases for real tool execution, too.
 
-`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, the error shapes, and `"truncate": true`, whose vector must equal that of the longest prefix that fits the token limit.  It is standalone and outside `--suite all`:
+`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, the error shapes, `"truncate": true`, whose vector must equal that of the longest prefix that fits the token limit, and `prompt_name`, whose vector must equal that of the same prompt written by the client.  It is standalone and outside `--suite all`:
 
 ```sh
 nix develop -c python3 tests/functional/embeddings.py \
@@ -253,7 +253,7 @@ between calls) use the deterministic HTTP fixtures in
 Qwen27 Q4/Q8 can omit the requested line or call a tool instead, so these parser
 checks must not depend on a model following a request to copy tool markup.
 
-`Devlab functional checks` runs on every push to a non-draft PR, like `CI`
+`Linux validation` runs on every push to a non-draft PR, like `Repository checks`
 (`pull_request`), with the repository's fork approval policy. A newer push cancels
 the PR's earlier run. PRs use the `pr` tier; release-please PRs and dispatches
 (unless they choose `tier: pr`) use `full`. Maintain/Admin users can dispatch a
@@ -346,9 +346,8 @@ layout for every selected model, selection reasons, known limitations and links
 to the run/artifacts. Missing selected groups, missing timing arms or mismatched
 revisions cannot pass. Correctness failures and consistently slower server phases
 set the advisory status to `failure`; incomplete, incomparable or unavailable evidence
-sets `error`. On ordinary PRs, complete but noisy timing comparisons keep a
-successful status with an explicit warning and retain every observation. The full
-release tier keeps `error` for inconclusive timing. HTTP-ready timing uses server
+sets `error`. On ordinary and release PRs, complete but noisy timing comparisons keep a
+successful status with an explicit warning and retain every observation. HTTP-ready timing uses server
 monotonic timestamps at load completion and listener readiness. Comparisons with
 older binaries that lack these timestamps retain poll-derived timings as advisory
 observations, excluded from the gate. The ordinary PR check remains advisory;
@@ -472,6 +471,8 @@ RAM, disk and restart settings once their contracts pass.
 | --- | --- |
 | `discovery` | Health, readiness, model ID/context and advertised text/image inputs; no generation |
 | `responses` | SDK buffered, streaming and async Responses |
+| `logprobs` | Generated-token probabilities on Chat and raw Completions, buffered/streamed, greedy/sampled; verifies unchanged output, usage, candidate limits, finite values and UTF-8 bytes |
+| `responses-logprobs` | Responses token probabilities with counts 0/3/20, greedy/sampled, buffered and streamed; unchanged output/usage, SDK accumulation, per-item deltas/done events, finite scores and UTF-8 bytes |
 | `stops` | Text, Unicode, reasoning and tool stops; peer isolation |
 | `conversation` | Thinking/efforts, images, cancellation and RAM reuse |
 | `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery; Messages image blocks in a user turn and a tool result |
@@ -701,6 +702,9 @@ logged a capacity refusal during the continued request.
 Component disk-spacing checks correlate drained publication logs with the
 checkpoint IDs captured by their own requests, excluding delayed writes from
 earlier suites even when their token counts match.
+`cache` also checks `cache_persist: false` across the same restart: a flagged
+prompt still reuses RAM within the first server and finds nothing on disk after
+the restart, while an unflagged control prompt restores from disk.
 `cache-rotation` visits four conversations and eight small side requests; use
 `--sessions 1` to verify retention is independent of execution slots. It also
 checks the startup RAM cap; byte/record pressure is covered by CPU tests.
@@ -895,4 +899,16 @@ outside `--suite all`:
 ```sh
 nix develop -c python3 tests/functional/embedding_images.py \
   --base-url http://127.0.0.1:8080/v1 --output /tmp/image-embeddings.json
+```
+
+`embedding_audio.py` adds pinned official audio vectors, decoder/front-end
+fixtures, multiple clips, interleaved text/images, ordering, concurrency,
+Matryoshka/base64, expanded context bounds and server-observed cancellation.
+`family_smoke.py embedding` includes a generated one-second WAV against its
+independent official vector. Neither runner downloads recordings.
+
+```sh
+nix develop -c python3 tests/functional/embedding_audio.py \
+  --base-url http://127.0.0.1:8080/v1 --server-log /path/to/server.log \
+  --output /tmp/audio-embeddings.json
 ```

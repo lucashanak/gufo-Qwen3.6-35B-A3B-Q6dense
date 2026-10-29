@@ -93,6 +93,9 @@ struct Conversion {
   void* source;
   void* destination;
   std::size_t count;
+  /// Expands Q8_0 weights to F32 instead of narrowing F32 to F16.
+  bool expand_q8{false};
+  std::size_t source_bytes{0};
 };
 
 /// The trunk and the optional MTP block as one traversal's output.
@@ -334,8 +337,10 @@ struct Uploader {
   /// unquantized projections) is narrowed to F16, which the wide-batch GEMM
   /// tier runs at speed; a BF16 router joins its F32 shared-expert gate row
   /// there, widened exactly on the host. A Q8_0 stack merges projections of
-  /// one input into a single decode GEMV.
-  DeviceTensor Stack(std::initializer_list<const TensorRef*> parts) {
+  /// one input into a single decode GEMV, unless `expand_q8` asks for the F32
+  /// stack's F16 route over its dequantized values.
+  DeviceTensor Stack(std::initializer_list<const TensorRef*> parts,
+                     bool expand_q8 = false) {
     DeviceTensor d;
     if (!ok) {
       return d;
@@ -396,7 +401,7 @@ struct Uploader {
         offset += t->SizeBytes();
       }
     }
-    if (type == core::GgmlType::kQ8_0) {
+    if (type == core::GgmlType::kQ8_0 && !expand_q8) {
       if (Measuring()) {
         return d;
       }
@@ -409,7 +414,22 @@ struct Uploader {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
       return d;
     }
-    const std::size_t count = size / sizeof(float);
+    void* f32 = ptr;
+    std::size_t f32_bytes = size;
+    if (type == core::GgmlType::kQ8_0) {
+      const std::size_t elements = rows * (*parts.begin())->cols;
+      f32_bytes = elements * sizeof(float);
+      if (Allocate(&f32, f32_bytes + kTailMargin) != hipSuccess) {
+        Fail("stacked tensor allocation failed");
+        return d;
+      }
+      if (!Measuring()) {
+        allocations.push_back(f32);
+        bytes += f32_bytes + kTailMargin;
+        conversions.push_back({ptr, f32, elements, true, size});
+      }
+    }
+    const std::size_t count = f32_bytes / sizeof(float);
     void* half = nullptr;
     if (Allocate(&half, count * sizeof(std::uint16_t) + kTailMargin) !=
         hipSuccess) {
@@ -423,7 +443,7 @@ struct Uploader {
     bytes += count * sizeof(std::uint16_t) + kTailMargin;
     // Keep the small F32 stacks until the disk pipeline drains. Converting
     // each router immediately would serialize every layer's uploads.
-    conversions.push_back({ptr, half, count});
+    conversions.push_back({f32, half, count, false, f32_bytes});
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(half) + count * 2, 0,
                          kTailMargin, nullptr);
     d.data = half;
@@ -477,10 +497,10 @@ struct Uploader {
   }
 
   DeviceMixer Mixer(const HcMixer& m) {
-    // Q8_0 and BF16 inject rows keep their projection; other formats are
-    // widened to the F32 rows the fused mixer reads.
-    const bool keep = m.inject.type == core::GgmlType::kQ8_0 ||
-                      m.inject.type == core::GgmlType::kBF16;
+    // BF16 inject rows keep their projection. Other formats, Q8_0 included,
+    // are widened to the F32 rows the fused mixer reads, so a quantized
+    // inject runs the F32 kernels on its dequantized values.
+    const bool keep = m.inject.type == core::GgmlType::kBF16;
     return {Copy(m.norm), Copy(m.down), Copy(m.up),
             keep ? Copy(m.inject) : CopyF32(m.inject)};
   }
@@ -511,7 +531,7 @@ struct Uploader {
     }
     d.ssm_conv1d = Copy(l.ssm_conv1d);
     if (l.linear) {
-      d.ssm_alpha_beta = Stack({&l.ssm_alpha, &l.ssm_beta});
+      d.ssm_alpha_beta = Stack({&l.ssm_alpha, &l.ssm_beta}, true);
     }
     d.ssm_dt = Copy(l.ssm_dt);
     d.ssm_a = Copy(l.ssm_a);
@@ -692,8 +712,13 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   m->mtp_ = uploaded.mtp;
   m->has_mtp_ = mtp != nullptr;
   for (const auto& c : conversions) {
-    NarrowActivations(static_cast<const float*>(c.source), c.destination, false,
-                      c.count, nullptr);
+    if (c.expand_q8) {
+      ExpandQ8_0(c.source, static_cast<float*>(c.destination), c.count,
+                 nullptr);
+    } else {
+      NarrowActivations(static_cast<const float*>(c.source), c.destination,
+                        false, c.count, nullptr);
+    }
   }
   const auto status = hipDeviceSynchronize();
   if (status != hipSuccess) {
@@ -706,7 +731,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   for (const auto& c : conversions) {
     std::erase(m->allocations_, c.source);
     (void)hipFree(c.source);
-    m->bytes_ -= c.count * sizeof(float) + kTailMargin;
+    m->bytes_ -= c.source_bytes + kTailMargin;
   }
   return m;
 }

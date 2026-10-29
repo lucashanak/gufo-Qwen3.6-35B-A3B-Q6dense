@@ -134,9 +134,40 @@ bool TruncateAndNormalize(std::span<const float> full, std::size_t dimensions,
   return true;
 }
 
+/// Whether a base64 `multimodal_data` file looks like audio, as llama.cpp's
+/// mtmd helper decides (`is_audio_file`): WAV, MP3 (an ID3 tag or an MPEG
+/// sync word) or FLAC. Ogg, which Gufo's audio decoder also reads, is sniffed
+/// too. Anything else, including undecodable base64, goes to the image reader.
+bool LooksLikeAudio(std::string_view base64) {
+  constexpr std::string_view kDigits =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (base64.size() < 16)
+    return false;
+  std::array<unsigned char, 12> head{};
+  for (std::size_t i = 0; i < 16; i += 4) {
+    std::uint32_t bits = 0;
+    for (std::size_t j = 0; j < 4; ++j) {
+      const auto digit = kDigits.find(base64[i + j]);
+      if (digit == std::string_view::npos)
+        return false;
+      bits = (bits << 6) | static_cast<std::uint32_t>(digit);
+    }
+    head[i / 4 * 3] = static_cast<unsigned char>(bits >> 16);
+    head[i / 4 * 3 + 1] = static_cast<unsigned char>(bits >> 8);
+    head[i / 4 * 3 + 2] = static_cast<unsigned char>(bits);
+  }
+  const auto starts = [&](std::size_t offset, std::string_view magic) {
+    return std::equal(magic.begin(), magic.end(), head.begin() + offset);
+  };
+  return (starts(0, "RIFF") && starts(8, "WAVE")) || starts(0, "ID3") ||
+         (head[0] == 0xFF && (head[1] & 0xE0) == 0xE0) || starts(0, "fLaC") ||
+         starts(0, "OggS");
+}
+
 bool IsKnownField(std::string_view name, bool native) {
   return name == "input" || name == "model" || name == "encoding_format" ||
          name == "dimensions" || name == "user" || name == "truncate" ||
+         name == "prompt_name" ||
          (native && (name == "content" || name == "embd_normalize"));
 }
 
@@ -188,6 +219,7 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
   }
   std::vector<EmbeddingInput> inputs;
   std::size_t image_count = 0;
+  std::size_t audio_count = 0;
   const auto parse_item = [&](const json::Value& item) -> HttpResponse {
     EmbeddingInput parsed;
     if (item.is_string()) {
@@ -233,13 +265,23 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
         if (!file.is_string() || file.str().empty())
           return BadRequest("'multimodal_data' items must be base64 strings",
                             "invalid_parameter_type");
-        if (++image_count > EmbeddingService::kMaxImages)
-          return BadRequest("embedding requests accept at most 32 images",
-                            "too_many_images");
-        // The image reader identifies PNG, JPEG and WebP by their bytes.
-        parsed.content.push_back(
-            {EmbeddingPart::Type::kImage,
-             "data:image/jpeg;base64," + std::string(file.str())});
+        if (LooksLikeAudio(file.str())) {
+          if (++audio_count > EmbeddingService::kMaxAudio)
+            return BadRequest(
+                "embedding requests accept at most 32 audio clips",
+                "too_many_audio");
+          // The audio reader takes raw base64; the decoder checks the bytes.
+          parsed.content.push_back(
+              {EmbeddingPart::Type::kAudio, std::string(file.str())});
+        } else {
+          if (++image_count > EmbeddingService::kMaxImages)
+            return BadRequest("embedding requests accept at most 32 images",
+                              "too_many_images");
+          // The image reader identifies PNG, JPEG and WebP by their bytes.
+          parsed.content.push_back(
+              {EmbeddingPart::Type::kImage,
+               "data:image/jpeg;base64," + std::string(file.str())});
+        }
         begin = end + kMediaMarker.size();
       }
       if (parsed.content.empty())
@@ -274,6 +316,32 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
             return BadRequest("embedding requests accept at most 32 images",
                               "too_many_images");
           parsed.content.push_back({EmbeddingPart::Type::kImage, url->str()});
+        } else if (type == "input_audio") {
+          const auto* audio = part.find("input_audio");
+          if (part.size() != 2 || !audio || !audio->is_object())
+            return BadRequest("audio parts require an 'input_audio' object",
+                              "invalid_parameter_type");
+          for (const auto& [key, value] : audio->members()) {
+            if ((key != "data" && key != "url" && key != "format") ||
+                !value.is_string())
+              return BadRequest(
+                  "input_audio accepts string data, url and format fields",
+                  "invalid_parameter_type");
+          }
+          // Match llama.cpp: data takes precedence; format is ignored and the
+          // actual container is detected from its bytes.
+          const auto* source = audio->find("data");
+          if (!source)
+            source = audio->find("url");
+          if (!source || source->str().empty())
+            return BadRequest("input_audio requires nonempty data or url",
+                              "invalid_parameter_type");
+          if (++audio_count > EmbeddingService::kMaxAudio)
+            return BadRequest(
+                "embedding requests accept at most 32 audio clips",
+                "too_many_audio");
+          parsed.content.push_back(
+              {EmbeddingPart::Type::kAudio, source->str()});
         } else {
           return BadRequest("unsupported embedding content type: " + type,
                             "unsupported_input");
@@ -352,6 +420,41 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
     return BadRequest("'user' must be a string", "invalid_parameter_type");
   }
 
+  std::string prompt_name = service.default_prompt_name();
+  bool requested_prompt = false;
+  if (const json::Value* value = Optional(root, "prompt_name");
+      value != nullptr) {
+    if (!value->is_string()) {
+      return BadRequest("'prompt_name' must be a string",
+                        "invalid_parameter_type");
+    }
+    prompt_name = value->str();
+    requested_prompt = true;
+  }
+  if (!prompt_name.empty()) {
+    const std::string* prefix = service.prompt(prompt_name);
+    if (prefix == nullptr) {
+      return BadRequest("unknown prompt_name '" + prompt_name + "'",
+                        "invalid_prompt_name");
+    }
+    // A leading text part: the service joins adjacent text before
+    // tokenizing, so this equals a client-side prefix. A requested prompt
+    // applies to every input, as in sentence-transformers. The model card
+    // passes images and audio without a prefix, so the server default skips
+    // inputs without text.
+    for (EmbeddingInput& input : inputs) {
+      const bool has_text =
+          std::ranges::any_of(input.content, [](const EmbeddingPart& part) {
+            return part.type == EmbeddingPart::Type::kText &&
+                   !part.value.empty();
+          });
+      if (requested_prompt || has_text) {
+        input.content.insert(input.content.begin(),
+                             {EmbeddingPart::Type::kText, *prefix});
+      }
+    }
+  }
+
   EmbeddingRequestOptions options;
   if (const json::Value* truncate = Optional(root, "truncate");
       truncate != nullptr) {
@@ -376,6 +479,8 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
                             std::to_string(EmbeddingService::kMaxInputTokens) +
                             "-token context window",
                         "context_length_exceeded");
+    case EmbeddingStatus::kInvalidAudioInput:
+      return BadRequest(error, "invalid_audio_input");
     case EmbeddingStatus::kInvalidInput:
       return BadRequest(
           error.empty() ? "invalid embedding input" : std::move(error),
