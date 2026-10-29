@@ -1,5 +1,20 @@
 # Qwen3.8 Flash-Next experiments
 
+## Upstream 0.27.0 merge (October 29, 2026)
+
+Merged build on Strix Halo (ROCm 7.2.4, v3 recipe + MTP) against production
+da156077: all `qwen38_flash_next` and `qwen36_35b_a3b` ctests pass; the C1 AR
+and MTP prompt sets and the 28-question eight-way slice are byte-identical.
+
+| Overlap | Kept | Why |
+| --- | --- | --- |
+| Prompt-pass side stream for the DeltaNet Z rows and the Q8_0 shared expert (#758) | Upstream's code, off (`kPrefillSideStream`) | Beside the fused DeltaNet prefill, which reads z from its first token, pp32K fell 1,733 → 1,658–1,662 tok/s; without the shared-expert overlap 1,693, without both 1,741 |
+| Decode shared-expert fork and prefill overlap | One non-blocking side stream, separate fork/join events | The two never run in one pass |
+| Q8_0 inject rows on F32 kernels (#788) | Upstream's intent, through this branch's host widening (`CopyF32`); BF16 rows keep their projection | One widening path for every inject format |
+| Selection bounded by the score row (#849) | Upstream's guard, added to the matrix-core scorer's store | The scalar scorer it patched is not used here |
+| Growable qfn_mmq arena (#740) | Upstream's | Same design as this branch's chunks, plus the drain before a block is added |
+| Grid order of the wide GEMMs (#758 `kRowsFastest`, `first_row_tile`) | Both | `kRowsFastest` launches keep their grid; the others take the grouped raster order |
+
 ## Exactness at the sparse budget (October 28, 2026)
 
 Workload: greedy decoding through the engine API with controlled batch
