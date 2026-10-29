@@ -23,6 +23,8 @@ constexpr std::size_t kWorkers = 128;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
 constexpr std::size_t kCacheBytes = 128 * 1024 * 1024;
+// Prefetched rows waiting for a reader; a decode cycle queues a few hundred.
+constexpr std::size_t kMaxPrefetch = 8192;
 
 }  // namespace
 
@@ -140,7 +142,7 @@ bool NgramTable::ReadCached(std::uint32_t row, float* dst) {
     return false;
   }
   const bool hit = entry.valid && entry.row == row;
-  if (hit) {
+  if (hit && dst != nullptr) {
     DecodeRow(cache_rows_.data() + slot * row_bytes_, dst);
   }
   entry.busy.clear(std::memory_order_release);
@@ -204,7 +206,8 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
     entry->valid = true;
     entry->busy.clear(std::memory_order_release);
   }
-  DecodeRow(base + (offset - begin), dst);
+  if (dst != nullptr)
+    DecodeRow(base + (offset - begin), dst);
   return true;
 }
 
@@ -212,10 +215,24 @@ void NgramTable::Worker() {
   std::vector<std::uint8_t> buf;
   std::unique_lock<std::mutex> lock(mutex_);
   for (;;) {
-    wake_.wait(lock,
-               [&] { return stop_ || (active_ && next_job_ < jobs_.size()); });
+    wake_.wait(lock, [&] {
+      return stop_ || (active_ && next_job_ < jobs_.size()) ||
+             next_prefetch_ < prefetch_.size();
+    });
     if (stop_) {
       return;
+    }
+    if (!(active_ && next_job_ < jobs_.size())) {
+      // No gather needs a reader: warm the cache with one prefetched row.
+      const std::uint32_t row = prefetch_[next_prefetch_++];
+      if (next_prefetch_ == prefetch_.size()) {
+        prefetch_.clear();
+        next_prefetch_ = 0;
+      }
+      lock.unlock();
+      (void)ReadOne(row, nullptr, buf, nullptr);
+      lock.lock();
+      continue;
     }
     // Large gathers amortize the queue lock. Small gathers keep one read
     // per worker, so decode does not serialize its few rows into a batch.
@@ -360,6 +377,34 @@ bool NgramTable::WaitRead() {
   copies_.clear();
   active_ = false;
   return !failed_;
+}
+
+void NgramTable::Prefetch(std::span<const std::uint32_t> rows) {
+  std::size_t queued = 0;
+  {
+    const std::lock_guard lock(mutex_);
+    for (const std::uint32_t row : rows) {
+      if (row >= rows_ || prefetch_.size() - next_prefetch_ >= kMaxPrefetch)
+        continue;
+      prefetch_.push_back(row);
+      ++queued;
+    }
+  }
+  if (queued >= workers_.size()) {
+    wake_.notify_all();
+  } else {
+    for (std::size_t i = 0; i < queued; ++i)
+      wake_.notify_one();
+  }
+}
+
+std::size_t NgramTable::CountUncached(std::span<const std::uint32_t> rows) {
+  std::vector<std::uint32_t> distinct(rows.begin(), rows.end());
+  std::ranges::sort(distinct);
+  const auto end = std::ranges::unique(distinct).begin();
+  return static_cast<std::size_t>(std::count_if(
+      distinct.begin(), end,
+      [this](std::uint32_t row) { return !ReadCached(row, nullptr); }));
 }
 
 }  // namespace gufo::models::qwen38_flash_next

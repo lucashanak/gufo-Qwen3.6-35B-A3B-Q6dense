@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next experiments
 
+## PLE rows of MTP chains (October 29, 2026)
+
+Upstream `main` 34ebb5fe against the branch, Strix Halo (ROCm 7.2.4), UD-Q4_K_XL + shared Q8_0 MTP, `gufo serve --sessions 1 --context 65536`, greedy, thinking off, five fixed prompts (CPU caches, a Python red-black tree, TCP congestion control, Czech railway history, a C++ ISO 8601 parser) of 384 generated tokens; one server process per arm, means of the five decode rates. The first process after another workload reads cold PLE rows and runs 2-4% slower, so every hold started with a discarded warm-up and main ran before and after the candidates.
+
+| Experiment | Outcome |
+| --- | --- |
+| Queue the PLE rows of each chain token on the n-gram readers as it joins the chain (C1 and batched), so the verification gather finds them cached | Retained: lossless (replies byte-identical, `ngram` checks prefetched rows land in the row cache uncounted). MTP 50.3 (main, three runs) → 50.6/50.7 tok/s: within drift here, where ZFS already caches the rows of these prompts. On a downstream recipe with cold rows: gather cache hits 20% → 75%, C1 MTP 69.7 → 71.1 tok/s; at C8 the per-cycle PLE wait fell 7.5 → 0.3 ms. |
+
 ## Chunked DeltaNet removed (October 27, 2026)
 
 The release-tier functional `tool-reasoning` suite failed in both MTP and AR

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include "src/core/platform/fs.hpp"
@@ -470,6 +472,30 @@ void TestCounters() {
     Check(p.rows == wide.size() && p.dedup_rows == wide.size() - 2048 &&
               balanced(p),
           "pooled gather balances");
+
+    Check(table->CountUncached(ids) == 0, "gathered rows are cached");
+    const std::vector<std::uint32_t> fresh{3500, 3501, 3500, 9, 3502};
+    Check(table->CountUncached(fresh) == 3,
+          "distinct uncached rows are counted once");
+    Check(table->CountUncached(fresh) == 3, "probing does not fill the cache");
+
+    // A prefetch loads rows into the cache without counting them; a later
+    // gather of the same rows reads nothing from disk.
+    table->Prefetch(fresh);
+    for (int i = 0; i < 2000 && table->CountUncached(fresh) != 0; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Check(table->CountUncached(fresh) == 0, "prefetched rows are cached");
+    q::NgramCounters warmed;
+    const std::array warmed_owner{q::NgramGatherOwner{fresh.size(), &warmed}};
+    std::vector<float> fresh_out(fresh.size() * dim, 1.0F);
+    Check(table->StartRead(fresh, fresh_out, warmed_owner) && table->WaitRead(),
+          "gather after a prefetch completes");
+    const auto w = warmed.Load();
+    Check(w.disk_reads == 0 && w.cache_hits == 4 && w.dedup_rows == 1 &&
+              balanced(w),
+          "prefetched rows hit the row cache");
+    Check(std::ranges::all_of(fresh_out, [](float v) { return v == 0.0F; }),
+          "prefetched rows decode as read");
 
     const std::array short_owner{q::NgramGatherOwner{ids.size() - 1, &first}};
     Check(!table->StartRead(ids, out, short_owner),

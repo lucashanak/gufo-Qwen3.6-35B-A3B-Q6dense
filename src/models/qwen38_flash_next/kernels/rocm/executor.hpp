@@ -435,6 +435,12 @@ public:
     return options_.max_speculative;
   }
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
+  /// Queues the PLE rows of `tokens[first..)` that a forward of `tokens`
+  /// after the session's n-gram history will gather, so the readers load
+  /// them while the step's drafts are still being proposed.
+  void PrefetchNgram(const Session& session,
+                     std::span<const std::int32_t> tokens,
+                     std::size_t first) const;
 
 private:
   Executor() = default;

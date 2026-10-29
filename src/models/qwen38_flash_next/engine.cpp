@@ -1037,6 +1037,18 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->draft_sampler = sampler.WithoutConstraint();
   pending->draft_sampler->Accept(static_cast<sampling::TokenId>(anchor));
   pending->chain = {anchor};
+  // The verification gather reads each chain token's PLE rows. Decoding
+  // alone, start their disk reads as the chain grows, so they overlap the
+  // predictor steps instead of the trunk's first layer (DecodeBatchImpl
+  // prefetches its own chains).
+  std::size_t prefetched = 0;
+  const auto prefetch = [&] {
+    if (!defer_head && pending->chain.size() > prefetched) {
+      exec.PrefetchNgram(*session_, pending->chain, prefetched);
+      prefetched = pending->chain.size();
+    }
+  };
+  prefetch();
   pending->draft = draft_token_;
   pending->width = width;
   pending->base = base;
@@ -1061,6 +1073,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // short matches retain the neural proposal: replacing it based only on
   // shared syntax previously regressed an identical Pi code write by 9%.
   if (AppendLookup(*pending, stop_at_eos, 3, sampled)) {
+    prefetch();
     return defer_head || DraftCatchUp(anchor, false, error_msg);
   }
   if (allow_subset && !SyncDraftVocab(error_msg))
@@ -1092,11 +1105,13 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   if (!defer_head) {
     while (pending->chain.size() < pending->width) {
       AppendDraft(*pending);
+      prefetch();
       if (stop_at_eos && model_->IsStopToken(pending->chain.back())) {
         pending->width = pending->chain.size();
         break;
       }
       if (AppendLookup(*pending, stop_at_eos)) {
+        prefetch();
         break;
       }
       if (pending->chain.size() < pending->width &&
@@ -1519,6 +1534,19 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       pending[i] = {};
     }
   }
+  // The verification gather reads each chain token's PLE rows; start the
+  // disk reads of the anchors (and copies) now and of each draft as it is
+  // proposed, so they overlap drafting instead of the trunk's first layer.
+  std::vector<std::size_t> prefetched(requests.size(), 0);
+  const auto prefetch = [&](std::size_t i) {
+    const auto& chain = pending[i].chain;
+    if (chain.size() > prefetched[i]) {
+      exec.PrefetchNgram(*requests[i].session->session_, chain, prefetched[i]);
+      prefetched[i] = chain.size();
+    }
+  };
+  for (std::size_t i = 0; i < requests.size(); ++i)
+    prefetch(i);
   std::vector<AdvanceRequest> catchup;
   std::vector<std::uint8_t> propose;
   for (std::size_t i = 0; i < requests.size(); ++i) {
@@ -1559,10 +1587,14 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       if (requests[i].stop_at_eos &&
           session.model_->IsStopToken(p.chain.back())) {
         p.width = p.chain.size();
+        prefetch(i);
         continue;
       }
-      if (session.AppendLookup(p, requests[i].stop_at_eos))
+      if (session.AppendLookup(p, requests[i].stop_at_eos)) {
+        prefetch(i);
         continue;
+      }
+      prefetch(i);
       if (p.chain.size() < p.width)
         bodies.push_back({requests[i].session->session_.get(),
                           std::span<const std::int32_t>(&p.draft, 1), -1});

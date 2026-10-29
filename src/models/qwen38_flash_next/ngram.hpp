@@ -105,6 +105,15 @@ public:
                                std::span<const NgramGatherOwner> owners = {});
   [[nodiscard]] bool WaitRead();
 
+  /// Queues rows for the readers to load into the row cache while no gather
+  /// needs them, so a later gather of the same rows finds them cached.
+  /// Never blocks; rows past a bounded backlog are dropped.
+  void Prefetch(std::span<const std::uint32_t> rows);
+
+  /// Distinct rows of `rows` outside the row cache: the disk reads a gather
+  /// of them would make. Safe beside an outstanding gather.
+  [[nodiscard]] std::size_t CountUncached(std::span<const std::uint32_t> rows);
+
   [[nodiscard]] std::uint32_t RowDim() const noexcept { return row_dim_; }
   [[nodiscard]] std::uint64_t Rows() const noexcept { return rows_; }
   [[nodiscard]] std::size_t RowBytes() const noexcept { return row_bytes_; }
@@ -125,7 +134,9 @@ private:
   // occurrence in the current input, so no row-cache state is retained here.
   std::vector<std::size_t> first_rows_;
   void DecodeRow(const std::uint8_t* src, float* dst) const;
+  /// A null `dst` only probes the cache.
   bool ReadCached(std::uint32_t row, float* dst);
+  /// A null `dst` only fills the row cache (a prefetch, not counted).
   bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf,
                NgramCounters* owner);
   void Worker();
@@ -157,6 +168,8 @@ private:
   std::vector<Copy> copies_;
   std::size_t next_job_{0};
   std::size_t pending_{0};
+  std::vector<std::uint32_t> prefetch_;
+  std::size_t next_prefetch_{0};
   bool active_{false};
   bool failed_{false};
   bool stop_{false};
