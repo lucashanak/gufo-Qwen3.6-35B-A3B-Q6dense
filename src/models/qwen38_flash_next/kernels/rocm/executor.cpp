@@ -1132,6 +1132,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
+  s.dense_ids = Alloc<std::int32_t>(a, kVecBatch, error_msg);
   s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
   {
     const std::size_t compact = RoutedCompactRows(slots, c.num_experts);
@@ -1409,6 +1410,7 @@ bool Executor::ClearDraftRows(Session& session, std::uint32_t first,
 DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
   DeviceTensor table = model_->output();
   table.data = session.mtp_.draft_rows;
+  table.decode = nullptr;  // the session's rows are Q8_0 copies
   table.rows = kMtpDraftExtraRows;
   return table;
 }
@@ -1565,6 +1567,25 @@ void Executor::DropReadyQ8() const {
   mixed_q8_ready_ = {};
 }
 
+void Executor::EmbedRows(const std::int32_t* tokens, float* res,
+                         std::uint32_t n, std::uint32_t streams) const {
+  // A tied block-format head keeps the file's rows as its decode rows.
+  const DeviceTensor& t = model_->token_embd();
+  const void* table = t.decode != nullptr ? t.decode : t.data;
+  const GgmlType type = t.decode != nullptr ? t.decode_type : t.type;
+  if (type == GgmlType::kF32 || type == GgmlType::kF16 ||
+      type == GgmlType::kBF16 || type == GgmlType::kQ8_0) {
+    EmbedTokens(table, SmallType(type), tokens, res, n, config().hidden_size,
+                streams, stream_);
+    return;
+  }
+  // Validated at upload: every block format has a gather.
+  (void)qfn_mmq_get_rows(static_cast<int>(type), table, tokens, res,
+                         static_cast<int>(n),
+                         static_cast<int>(config().hidden_size),
+                         static_cast<int>(streams), stream_);
+}
+
 bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
                         Q8Input* q, std::string* error_msg) const {
   q->x = x;
@@ -1593,6 +1614,20 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
 
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
+  if (w.decode != nullptr && !MatrixRows(q.n)) {
+    if (q.data == nullptr) {
+      return Dense(w, q.x, out, q.n, error_msg);
+    }
+    if (w.cols != q.k ||
+        qfn_mmq_dense_kq_vec_preq(static_cast<int>(w.decode_type), w.decode,
+                                  q.data, out, static_cast<int>(w.rows),
+                                  static_cast<int>(w.cols),
+                                  static_cast<int>(q.n), stream_) != 0) {
+      AssignError(error_msg, "block-format GEMV failed");
+      return false;
+    }
+    return true;
+  }
   if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
     if (w.cols != q.k) {
       AssignError(error_msg, "quantized input width mismatch");
@@ -1615,9 +1650,24 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           std::string* error_msg) const {
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
+  if (!MatrixRows(n_tokens) && up.decode != nullptr && gate.decode != nullptr &&
+      up.decode_type == gate.decode_type && GatedVecFormat(up.decode_type) &&
+      up.rows == gate.rows && up.cols == gate.cols) {
+    if (qfn_mmq_moe_gated_vec(static_cast<int>(up.decode_type), gate.decode,
+                              up.decode, x, s_.dense_ids, out,
+                              static_cast<int>(up.rows),
+                              static_cast<int>(up.cols),
+                              static_cast<int>(n_tokens), 1, 1, stream_) != 0) {
+      AssignError(error_msg, "gated block-format GEMV failed");
+      return false;
+    }
+    return true;
+  }
+  // Compact decode rows without a gated kernel take the separate
+  // projections below, never their Q8_0 copies (as GatedDenseBatch does).
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
-      gate.type == GgmlType::kQ8_0 && up.rows == gate.rows &&
-      up.cols == gate.cols) {
+      gate.type == GgmlType::kQ8_0 && up.decode == nullptr &&
+      gate.decode == nullptr && up.rows == gate.rows && up.cols == gate.cols) {
     Q8Input xq;
     if (!Quantize(x, n_tokens, up.cols, &xq, error_msg)) {
       return false;
@@ -1686,6 +1736,20 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
+  // Block-format projections decode from their compact rows, reading Q8_1 rows
+  // a producer already wrote when there are any.
+  if (w.decode != nullptr && !MatrixRows(n_tokens)) {
+    if (const void* ready = ReadyQ8(x, n_tokens, w.cols)) {
+      return Dense(w, Q8Input{x, ready, n_tokens, w.cols}, out, error_msg);
+    }
+    if (qfn_mmq_dense_kq_vec(static_cast<int>(w.decode_type), w.decode, x, out,
+                             static_cast<int>(w.rows), static_cast<int>(w.cols),
+                             static_cast<int>(n_tokens), stream_) != 0) {
+      AssignError(error_msg, "block-format GEMV failed");
+      return false;
+    }
+    return true;
+  }
   if (w.type == GgmlType::kQ8_0) {
     if (!MatrixRows(n_tokens)) {
       Q8Input q;
@@ -3240,8 +3304,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                "token upload", error_msg)) {
       return false;
     }
-    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
-                s_.tokens, s_.res, n, c.hidden_size, c.hc_count, stream_);
+    EmbedRows(s_.tokens, s_.res, n, c.hc_count);
     session.vision_input_.Inject(s_.res, start_pos, n, c.hidden_size,
                                  c.hc_count, stream_);
   }
@@ -4447,8 +4510,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
              "token upload", error_msg)) {
     return false;
   }
-  EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
-              s_.tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
+  EmbedRows(s_.tokens, s_.mtp_embd, n, 1);
   // MTP embeds shifted token IDs. Visual information arrives in the trunk
   // hidden stream; image embeddings belong only to the target input.
   RmsNormRows(s_.mtp_embd, l.nextn_enorm.f32(), s_.mtp_embd, n, c.hidden_size,
@@ -4520,6 +4582,12 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     const TensorRef layout{.type = kv.type, .cols = kv.cols};
     kv.data = static_cast<std::uint8_t*>(kv.data) +
               std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
+    if (kv.decode != nullptr) {
+      // Block-format rows: the K/V slice of the compact decode rows too.
+      const TensorRef compact{.type = kv.decode_type, .cols = kv.cols};
+      kv.decode = static_cast<const std::uint8_t*>(kv.decode) +
+                  std::size_t{2} * c.AttentionQDim() * compact.RowBytes();
+    }
     kv.rows = 2 * c.AttentionKvDim();
     if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
         !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,

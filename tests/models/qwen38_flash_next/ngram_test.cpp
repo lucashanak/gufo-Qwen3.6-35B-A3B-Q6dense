@@ -9,10 +9,12 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <vector>
 
 #include "src/core/platform/fs.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "tests/support/temporary_directory.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
@@ -317,6 +319,122 @@ void TestQuantizedRows() {
   std::filesystem::remove(path);
 }
 
+// A Q8_0 table (the source converter's format) decodes exactly through the
+// same cold, cached and mixed gathers.
+void TestQ8Rows() {
+  const auto path =
+      std::filesystem::temp_directory_path() / "qwen38_ngram_q8.bin";
+  constexpr std::uint32_t dim = 160;
+  constexpr std::uint32_t rows = 129;
+  constexpr std::uint64_t offset = 4096 + 90;
+  const auto quant = [](std::uint32_t row, std::uint32_t col) {
+    return static_cast<int>((row * 7 + col * 3) % 255) - 127;
+  };
+  {
+    std::ofstream file(path, std::ios::binary);
+    file.seekp(offset);
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      for (std::uint32_t block = 0; block < dim / 32; ++block) {
+        // Exactly representable half scales: 0.5 and -2.
+        const std::uint16_t scale = row % 2 == 0 ? 0x3800 : 0xC000;
+        file.write(reinterpret_cast<const char*>(&scale), sizeof(scale));
+        for (std::uint32_t col = 0; col < 32; ++col)
+          file.put(static_cast<char>(
+              static_cast<std::int8_t>(quant(row, block * 32 + col))));
+      }
+    }
+    Check(file.good(), "Q8_0 fixture written");
+  }
+  std::string error;
+  auto table =
+      OpenTable(path, offset, rows, dim, gufo::core::GgmlType::kQ8_0, &error);
+  Check(table != nullptr, error.c_str());
+  if (table) {
+    const auto gather = [&](std::span<const std::uint32_t> ids) {
+      std::vector<float> out(ids.size() * dim + 16, -123.0F);
+      Check(table->Read(ids, std::span(out).first(ids.size() * dim)),
+            "Q8_0 gather completes");
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        const float scale = ids[i] % 2 == 0 ? 0.5F : -2.0F;
+        for (std::uint32_t col = 0; col < dim; ++col)
+          Check(out[i * dim + col] == scale * quant(ids[i], col),
+                "Q8_0 exact decoded value");
+      }
+      for (std::size_t i = ids.size() * dim; i < out.size(); ++i)
+        Check(out[i] == -123.0F, "Q8_0 output guard");
+    };
+    const std::array<std::uint32_t, 6> warm{0, 7, 128, 7, 0, 32};
+    gather(warm);
+    gather(warm);
+    const std::array<std::uint32_t, 7> mixed{128, 3, 7, 64, 3, 32, 1};
+    gather(mixed);
+  }
+  table.reset();
+  std::filesystem::remove(path);
+}
+
+// The 32-element formats llama.cpp writes for the 160-wide table (Q5_0 in
+// Q4_K mixes, Q4_0 in Q2_K and Q4_0 mixes) decode as the shared CPU
+// dequantization does, through cold and cached gathers.
+void TestBlockFormatRows(gufo::core::GgmlType type) {
+  const std::string name(gufo::core::ToString(type));
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("qwen38_ngram_" + name + ".bin");
+  constexpr std::uint32_t dim = 160;
+  constexpr std::uint32_t rows = 129;
+  constexpr std::uint64_t offset = 4096 + 90;
+  const std::size_t row_bytes = gufo::quant::QuantizedRowBytes(type, dim);
+  const std::size_t block_bytes = row_bytes / (dim / 32);
+  std::vector<std::uint8_t> bytes(rows * row_bytes);
+  std::uint32_t state = 0x1234567U + static_cast<std::uint32_t>(type);
+  for (auto& b : bytes) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    b = static_cast<std::uint8_t>(state >> 24);
+  }
+  for (std::size_t b = 0; b < bytes.size(); b += block_bytes) {
+    bytes[b] = 0x00;  // F16 scale 0.5 (and minimum 0.5 for Q4_1 / Q5_1)
+    bytes[b + 1] = 0x38;
+    if (type == gufo::core::GgmlType::kQ4_1 ||
+        type == gufo::core::GgmlType::kQ5_1) {
+      bytes[b + 2] = 0x00;
+      bytes[b + 3] = 0xB8;
+    }
+  }
+  {
+    std::ofstream file(path, std::ios::binary);
+    file.seekp(offset);
+    file.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    Check(file.good(), (name + " fixture written").c_str());
+  }
+  std::string error;
+  auto table = OpenTable(path, offset, rows, dim, type, &error);
+  Check(table != nullptr, error.c_str());
+  if (table) {
+    const auto gather = [&](std::span<const std::uint32_t> ids) {
+      std::vector<float> out(ids.size() * dim);
+      Check(table->Read(ids, out), (name + " gather completes").c_str());
+      std::vector<float> expected(dim);
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        Check(
+            gufo::quant::DequantizeRow(type, bytes.data() + ids[i] * row_bytes,
+                                       expected.data(), dim),
+            "reference row");
+        for (std::uint32_t col = 0; col < dim; ++col)
+          Check(out[i * dim + col] == expected[col],
+                (name + " exact decoded value").c_str());
+      }
+    };
+    const std::array<std::uint32_t, 6> warm{0, 7, 128, 7, 0, 32};
+    gather(warm);
+    gather(warm);
+  }
+  table.reset();
+  std::filesystem::remove(path);
+}
+
 // Widely spaced rows exercise cache eviction, including simultaneous readers
 // whose compressed rows map to the same bounded-cache slot.
 void TestDistantRows() {
@@ -486,6 +604,11 @@ int main() {
   TestHash();
   TestTable();
   TestQuantizedRows();
+  TestQ8Rows();
+  for (const auto type :
+       {gufo::core::GgmlType::kQ5_0, gufo::core::GgmlType::kQ4_0,
+        gufo::core::GgmlType::kQ4_1, gufo::core::GgmlType::kQ5_1})
+    TestBlockFormatRows(type);
   TestDistantRows();
   TestCounters();
   if (failures != 0) {

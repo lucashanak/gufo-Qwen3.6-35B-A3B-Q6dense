@@ -4,11 +4,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstring>
 #include <initializer_list>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -21,6 +26,47 @@ namespace {
 /// over-read stays inside the allocation (the extra bytes meet zeroed
 /// activation padding and contribute nothing).
 constexpr std::size_t kTailMargin = 4096;
+
+/// Block formats a dense projection keeps as compact decode rows beside a
+/// Q8_0 copy: the decode GEMVs (qfn_mmq_dense_kq_vec) read them.
+bool CompactDecodeFormat(core::GgmlType type) {
+  switch (type) {
+    case core::GgmlType::kQ3_K:
+    case core::GgmlType::kQ4_K:
+    case core::GgmlType::kQ5_K:
+    case core::GgmlType::kQ6_K:
+    case core::GgmlType::kQ5_1:
+    case core::GgmlType::kIQ4_NL:
+    case core::GgmlType::kQ5_0:
+    case core::GgmlType::kQ4_1:
+    case core::GgmlType::kQ4_0:
+    case core::GgmlType::kQ2_K:
+    case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ3_S:
+    case core::GgmlType::kIQ1_S:
+    case core::GgmlType::kIQ1_M:
+    case core::GgmlType::kIQ4_XS:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/// Formats a dense projection (and the vocabulary head) can be uploaded in.
+bool ProjectionFormat(core::GgmlType type) {
+  return type == core::GgmlType::kQ8_0 || type == core::GgmlType::kF32 ||
+         type == core::GgmlType::kF16 || type == core::GgmlType::kBF16 ||
+         CompactDecodeFormat(type);
+}
+
+/// Formats the routed expert kernels project (decode and prefill).
+bool ExpertFormat(core::GgmlType type) {
+  return type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K ||
+         type == core::GgmlType::kQ5_1 || type == core::GgmlType::kQ8_0;
+}
 
 struct Conversion {
   void* source;
@@ -73,10 +119,117 @@ struct Uploader {
     return weights->Allocate(pointer, size);
   }
 
-  DeviceTensor Copy(const TensorRef& t) {
+  /// Q8_0 blocks of `n` floats, as ggml's quantize_row_q8_0_ref.
+  static void QuantizeQ8_0Row(const float* x, std::uint8_t* out,
+                              std::size_t n) {
+    for (std::size_t b = 0; b < n / 32; ++b) {
+      float amax = 0.0F;
+      for (int j = 0; j < 32; ++j)
+        amax = std::max(amax, std::fabs(x[b * 32 + j]));
+      const float d = amax / 127.0F;
+      const float id = d != 0.0F ? 1.0F / d : 0.0F;
+      const _Float16 dh = static_cast<_Float16>(d);
+      std::memcpy(out + b * 34, &dh, 2);
+      for (int j = 0; j < 32; ++j)
+        reinterpret_cast<std::int8_t*>(out + b * 34 + 2)[j] =
+            static_cast<std::int8_t>(std::round(x[b * 32 + j] * id));
+    }
+  }
+
+  /// Block-format projections (any format but Q8_0) stacked along rows: the
+  /// file's rows go to `decode` unchanged and a Q8_0 re-encoding of them to
+  /// `data`, so every Q8_0 path (prefill GEMMs, fused decode kernels) keeps
+  /// its arithmetic while decode GEMVs read the compact rows. The 32-element
+  /// formats (mixer up projections, 320 columns) need only whole blocks.
+  DeviceTensor CompactProjection(
+      std::initializer_list<const TensorRef*> parts) {
+    DeviceTensor d;
+    const TensorRef& first = **parts.begin();
+    std::size_t rows = 0;
+    std::size_t raw = 0;
+    for (const TensorRef* t : parts) {
+      if (t->empty() || t->type != first.type || t->cols != first.cols ||
+          t->experts != 1 ||
+          t->cols % gufo::quant::QuantizedBlockElements(t->type) != 0) {
+        Fail("block-format projection parts must share one type and shape");
+        return d;
+      }
+      rows += t->rows;
+      raw += t->SizeBytes();
+    }
+    const std::size_t q8_row = first.cols / 32 * 34;
+    const std::size_t q8 = rows * q8_row;
+    void* raw_ptr = nullptr;
+    void* q8_ptr = nullptr;
+    if (Allocate(&raw_ptr, raw + kTailMargin) != hipSuccess ||
+        Allocate(&q8_ptr, q8 + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(first.name));
+      return d;
+    }
+    if (Measuring()) {
+      return d;
+    }
+    allocations.push_back(raw_ptr);
+    allocations.push_back(q8_ptr);
+    bytes += raw + q8 + 2 * kTailMargin;
+    std::vector<std::uint8_t> host(q8);
+    std::size_t offset = 0;
+    std::size_t row0 = 0;
+    for (const TensorRef* t : parts) {
+      if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
+                       static_cast<std::uint8_t*>(raw_ptr) + offset, error)) {
+        Fail("upload failed for " + std::string(t->name));
+        return d;
+      }
+      offset += t->SizeBytes();
+      const auto* src = static_cast<const std::uint8_t*>(t->data);
+      const std::size_t row_bytes = t->RowBytes();
+      const unsigned workers =
+          std::max(1U, std::min(16U, std::thread::hardware_concurrency()));
+      std::vector<std::thread> threads;
+      for (unsigned w = 0; w < workers; ++w) {
+        threads.emplace_back([&, w] {
+          std::vector<float> row(t->cols);
+          for (std::size_t r = w; r < t->rows; r += workers) {
+            const auto* in = src + r * row_bytes;
+            (void)gufo::quant::DequantizeRow(t->type, in, row.data(), t->cols);
+            QuantizeQ8_0Row(row.data(), host.data() + (row0 + r) * q8_row,
+                            t->cols);
+          }
+        });
+      }
+      for (auto& th : threads)
+        th.join();
+      row0 += t->rows;
+    }
+    if (hipMemcpy(q8_ptr, host.data(), q8, hipMemcpyHostToDevice) !=
+        hipSuccess) {
+      Fail("Q8_0 copy upload failed for " + std::string(first.name));
+      return d;
+    }
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(raw_ptr) + raw, 0,
+                         kTailMargin, nullptr);
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(q8_ptr) + q8, 0,
+                         kTailMargin, nullptr);
+    d.data = q8_ptr;
+    d.type = core::GgmlType::kQ8_0;
+    d.cols = static_cast<std::uint32_t>(first.cols);
+    d.rows = static_cast<std::uint32_t>(rows);
+    d.decode = raw_ptr;
+    d.decode_type = first.type;
+    max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
+    return d;
+  }
+
+  /// `rows_only`: the file's rows as they are, without the Q8_0 copy a
+  /// block-format projection carries (a table that is only gathered from).
+  DeviceTensor Copy(const TensorRef& t, bool rows_only = false) {
     DeviceTensor d;
     if (t.empty() || !ok) {
       return d;
+    }
+    if (t.experts == 1 && !rows_only && CompactDecodeFormat(t.type)) {
+      return CompactProjection({&t});
     }
     const std::size_t size = t.SizeBytes();
     void* ptr = nullptr;
@@ -114,10 +267,16 @@ struct Uploader {
   /// Uploads a narrow projection the quantized tier does not cover (the
   /// hyper-connection inject) as F32. A Q8_0 tensor is uploaded as is and
   /// expanded once the disk pipeline drains, so it runs the F32 kernels with
-  /// its dequantized values instead of quantizing their activations.
+  /// its dequantized values instead of quantizing their activations. Other
+  /// block formats (llama.cpp mixes quantize the inject rows with the
+  /// trunk) are widened on the host; BF16 keeps its projection.
   DeviceTensor CopyF32(const TensorRef& t) {
-    if (t.empty() || !ok || t.type != core::GgmlType::kQ8_0) {
+    if (t.empty() || !ok || t.type == core::GgmlType::kF32 ||
+        t.type == core::GgmlType::kBF16) {
       return Copy(t);
+    }
+    if (t.type != core::GgmlType::kQ8_0) {
+      return WidenF32(t);
     }
     DeviceTensor d = Copy(t);
     const std::size_t count = t.cols * t.rows * t.experts;
@@ -187,9 +346,10 @@ struct Uploader {
   /// Uploads matrices of one type stacked along rows; every input shares
   /// `cols`. An F32 stack (router logits, GDN alpha/beta: the only
   /// unquantized projections) is narrowed to F16, which the wide-batch GEMM
-  /// tier runs at speed. A Q8_0 stack merges projections of one input into
-  /// a single decode GEMV, unless `expand_q8` asks for the F32 stack's F16
-  /// route over its dequantized values.
+  /// tier runs at speed; a BF16 router joins its F32 shared-expert gate row
+  /// there, widened exactly on the host. A Q8_0 stack merges projections of
+  /// one input into a single decode GEMV, unless `expand_q8` asks for the F32
+  /// stack's F16 route over its dequantized values.
   DeviceTensor Stack(std::initializer_list<const TensorRef*> parts,
                      bool expand_q8 = false) {
     DeviceTensor d;
@@ -199,14 +359,22 @@ struct Uploader {
     std::size_t rows = 0;
     std::size_t size = 0;
     const core::GgmlType type = (*parts.begin())->type;
+    if (CompactDecodeFormat(type)) {
+      return CompactProjection(parts);
+    }
+    const auto wide = [](core::GgmlType t) {
+      return t == core::GgmlType::kF32 || t == core::GgmlType::kBF16;
+    };
     for (const TensorRef* t : parts) {
-      if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
-        Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
+      if (t->empty() || t->cols != (*parts.begin())->cols ||
+          (type == core::GgmlType::kQ8_0 ? t->type != type
+                                         : !wide(type) || !wide(t->type))) {
+        Fail("stacked upload needs F32/BF16 or Q8_0 tensors of one shape");
         return d;
       }
       rows += t->rows;
-      size += t->SizeBytes();
+      size += type == core::GgmlType::kQ8_0 ? t->SizeBytes()
+                                            : t->ElementCount() * sizeof(float);
     }
     void* ptr = nullptr;
     if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
@@ -218,8 +386,24 @@ struct Uploader {
       bytes += size + kTailMargin;
       std::size_t offset = 0;
       for (const TensorRef* t : parts) {
+        auto* dst = static_cast<std::uint8_t*>(ptr) + offset;
+        if (t->type == core::GgmlType::kBF16) {
+          std::vector<float> wide_rows(t->ElementCount());
+          const auto* src = static_cast<const std::uint16_t*>(t->data);
+          for (std::size_t i = 0; i < wide_rows.size(); ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(src[i]) << 16;
+            std::memcpy(&wide_rows[i], &bits, sizeof(float));
+          }
+          if (hipMemcpy(dst, wide_rows.data(), wide_rows.size() * sizeof(float),
+                        hipMemcpyHostToDevice) != hipSuccess) {
+            Fail("upload failed for " + std::string(t->name));
+            return d;
+          }
+          offset += wide_rows.size() * sizeof(float);
+          continue;
+        }
         if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
-                         static_cast<std::uint8_t*>(ptr) + offset, error)) {
+                         dst, error)) {
           Fail("upload failed for " + std::string(t->name));
           return d;
         }
@@ -279,6 +463,48 @@ struct Uploader {
     return d;
   }
 
+  /// A tensor its kernels read as F32 (taps, inject rows), widened exactly
+  /// from any other file format on the host.
+  DeviceTensor WidenF32(const TensorRef& t) {
+    if (t.empty() || t.type == core::GgmlType::kF32 || !ok) {
+      return Copy(t);
+    }
+    DeviceTensor d;
+    const std::size_t count = t.ElementCount();
+    void* ptr = nullptr;
+    if (Allocate(&ptr, count * sizeof(float) + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(t.name));
+      return d;
+    }
+    if (Measuring()) {
+      return d;
+    }
+    allocations.push_back(ptr);
+    bytes += count * sizeof(float) + kTailMargin;
+    std::vector<float> host(count);
+    const auto* src = static_cast<const std::uint8_t*>(t.data);
+    for (std::size_t r = 0; r < t.rows * t.experts; ++r) {
+      if (!gufo::quant::DequantizeRow(t.type, src + r * t.RowBytes(),
+                                      host.data() + r * t.cols, t.cols)) {
+        Fail("cannot widen " + std::string(t.name) + " to F32");
+        return d;
+      }
+    }
+    if (hipMemcpy(ptr, host.data(), count * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemset(static_cast<std::uint8_t*>(ptr) + count * sizeof(float), 0,
+                  kTailMargin) != hipSuccess) {
+      Fail("upload failed for " + std::string(t.name));
+      return d;
+    }
+    d.data = ptr;
+    d.type = core::GgmlType::kF32;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = static_cast<std::uint32_t>(t.experts);
+    return d;
+  }
+
   DeviceMixer Mixer(const HcMixer& m) {
     return {Copy(m.norm), Copy(m.down), Copy(m.up), CopyF32(m.inject)};
   }
@@ -291,8 +517,10 @@ struct Uploader {
     // Projections of one input are stacked into one Q8_0 GEMV where the
     // quantization allows; otherwise they stay separate.
     const auto stackable = [](std::initializer_list<const TensorRef*> parts) {
+      const core::GgmlType type = (*parts.begin())->type;
       for (const TensorRef* t : parts) {
-        if (t->empty() || t->type != core::GgmlType::kQ8_0 ||
+        if (t->empty() || t->type != type ||
+            (type != core::GgmlType::kQ8_0 && !CompactDecodeFormat(type)) ||
             t->cols != (*parts.begin())->cols) {
           return false;
         }
@@ -332,7 +560,7 @@ struct Uploader {
     d.ple_norm_key = Copy(l.ple_norm_key);
     d.ple_norm_query = Copy(l.ple_norm_query);
     d.ple_norm_conv = Copy(l.ple_norm_conv);
-    d.ple_conv1d = Copy(l.ple_conv1d);
+    d.ple_conv1d = WidenF32(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
     d.ffn_gate_exps = Copy(l.ffn_gate_exps);
     d.ffn_up_exps = Copy(l.ffn_up_exps);
@@ -351,9 +579,12 @@ struct Uploader {
   Uploaded Model(const ModelWeights& w, const MtpWeights* mtp,
                  std::uint32_t trunk_shards) {
     Uploaded u;
-    u.token_embd = Copy(w.token_embd);
-    u.output =
-        w.output.data == w.token_embd.data ? u.token_embd : Copy(w.output);
+    // A tied head projects the embedding table, so it keeps the decode
+    // rows and Q8_0 copy of any projection; an untied table is only
+    // gathered from.
+    const bool tied = w.output.data == w.token_embd.data;
+    u.token_embd = Copy(w.token_embd, !tied);
+    u.output = tied ? u.token_embd : Copy(w.output);
     u.hc_head = Mixer(w.hc_head);
     u.layers.reserve(w.layers.size());
     for (const auto& l : w.layers) {
@@ -406,20 +637,24 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
-  // The CPU reference also reads Q6_K, but the production embedding, dense
-  // and routed kernels do not. Reject it before allocating device weights.
-  const auto supported = [&](const TensorRef& t) {
-    if (t.type != core::GgmlType::kQ6_K)
-      return true;
+  // The binder also accepts formats only the CPU reference reads. Reject the
+  // routed experts and heads the HIP kernels cannot project before
+  // allocating device weights.
+  const auto reject = [&](const TensorRef& t) {
     if (error_msg != nullptr)
-      *error_msg = "unsupported HIP tensor format Q6_K: " + std::string(t.name);
+      *error_msg = "unsupported HIP tensor format " +
+                   std::string(core::ToString(t.type)) + ": " +
+                   std::string(t.name);
     return false;
   };
-  const auto layer_supported = [&](const LayerWeights& l) {
-    return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
-           supported(l.ffn_down_exps);
+  const auto expert_supported = [&](const TensorRef& t) {
+    return ExpertFormat(t.type) || reject(t);
   };
-  if (!supported(w.token_embd) || !supported(w.output) ||
+  const auto layer_supported = [&](const LayerWeights& l) {
+    return expert_supported(l.ffn_gate_exps) &&
+           expert_supported(l.ffn_up_exps) && expert_supported(l.ffn_down_exps);
+  };
+  if (!(ProjectionFormat(w.output.type) || reject(w.output)) ||
       !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
       (mtp != nullptr && !layer_supported(mtp->block))) {
     return nullptr;
@@ -470,7 +705,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
-  m->output_bytes_ = w.output.SizeBytes();
+  // Row-addressed users (draft tables) read the head's Q8_0 rows when it
+  // also keeps compact decode rows.
+  m->output_bytes_ =
+      m->output_.decode != nullptr
+          ? std::size_t{m->output_.rows} * (m->output_.cols / 32 * 34)
+          : w.output.SizeBytes();
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;

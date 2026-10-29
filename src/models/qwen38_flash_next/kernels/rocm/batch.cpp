@@ -260,9 +260,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                               hipMemcpyHostToDevice, stream_),
                error))
       return false;
-    EmbedTokens(model_->token_embd().data,
-                EmbeddingType(model_->token_embd().type), base.tokens,
-                base.mtp_embd, rows, c.hidden_size, 1, stream_);
+    EmbedRows(base.tokens, base.mtp_embd, rows, 1);
     RmsNormRows(base.mtp_embd, l.nextn_enorm.f32(), base.mtp_embd, rows,
                 c.hidden_size, 1, c.rms_eps, stream_);
     for (std::size_t i = 0; i < items.size(); ++i) {
@@ -300,6 +298,12 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       const TensorRef layout{.type = kv.type, .cols = kv.cols};
       kv.data = static_cast<std::uint8_t*>(kv.data) +
                 std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
+      if (kv.decode != nullptr) {
+        // Block-format rows: the K/V slice of the compact decode rows too.
+        const TensorRef compact{.type = kv.decode_type, .cols = kv.cols};
+        kv.decode = static_cast<const std::uint8_t*>(kv.decode) +
+                    std::size_t{2} * c.AttentionQDim() * compact.RowBytes();
+      }
       kv.rows = 2 * c.AttentionKvDim();
       if (!DenseBatch(kv, base.mixed, base.qg, rows, error) ||
           !DenseBatch(l.indexer_k, base.mixed, base.ik, rows, error))
@@ -681,6 +685,24 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
+  if (w.decode != nullptr) {
+    // A block-format projection's isolated decode reads its compact rows; the
+    // Q8_0 copy in w.data holds other weights (the prefill route's). Each
+    // row's sum does not depend on how many rows a launch covers. Narrow
+    // projections read their compact rows once per sixteen rows; from 8,192
+    // rows the products dominate and eight-row launches are as fast
+    // (route_exact_bench).
+    const std::uint32_t chunk = w.rows >= 8192 ? 8 : 16;
+    for (std::uint32_t r = 0; r < rows; r += chunk) {
+      if (qfn_mmq_dense_kq_vec(
+              static_cast<int>(w.decode_type), w.decode,
+              x + std::size_t{r} * w.cols, out + std::size_t{r} * w.rows,
+              static_cast<int>(w.rows), static_cast<int>(w.cols),
+              static_cast<int>(std::min(chunk, rows - r)), stream_) != 0)
+        return Fail(error, "batched block-format projection failed");
+    }
+    return true;
+  }
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
               stream_);
@@ -723,8 +745,11 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
                                const float* x, float* out, std::uint32_t rows,
                                std::string* error) const {
   const Scratch base = s_;
+  // Block-format weights (a Q8_0 copy plus compact decode rows) take
+  // GatedDense's decode route, as an isolated request does.
   const bool q8 = up.type == core::GgmlType::kQ8_0 &&
-                  gate.type == core::GgmlType::kQ8_0 && up.rows == gate.rows &&
+                  gate.type == core::GgmlType::kQ8_0 && up.decode == nullptr &&
+                  gate.decode == nullptr && up.rows == gate.rows &&
                   up.cols == gate.cols;
   if (q8 && !QuantizeBatch(x, rows, up.cols, error))
     return false;
@@ -944,9 +969,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                error)) {
       return false;
     }
-    EmbedTokens(model_->token_embd().data,
-                EmbeddingType(model_->token_embd().type), base.tokens, base.res,
-                rows, c.hidden_size, c.hc_count, stream_);
+    EmbedRows(base.tokens, base.res, rows, c.hc_count);
     for (std::size_t i = 0; i < items.size(); ++i) {
       items[i].session->vision_input_.Inject(
           base.res + std::size_t{offsets[i]} * c.HcDim(),

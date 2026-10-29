@@ -29,6 +29,13 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
+/// Compact decode-row formats with a fused gate/up decode GEMV
+/// (qfn_mmq_moe_gated_vec); the others project gate and up separately.
+inline bool GatedVecFormat(core::GgmlType type) {
+  return type == core::GgmlType::kQ3_K || type == core::GgmlType::kQ4_K ||
+         type == core::GgmlType::kQ5_K;
+}
+
 class Executor;
 class SnapshotAllocator;
 struct ArgmaxCandidate;
@@ -446,6 +453,10 @@ private:
   static std::uint64_t WalkSnapshot(const SnapshotHeader& h,
                                     const Session* session, Visit&& visit);
 
+  /// res[t][s] = the embedding row of tokens[t] for each of `streams`
+  /// copies, decoded from the table's file rows (any block format).
+  void EmbedRows(const std::int32_t* tokens, float* res, std::uint32_t n,
+                 std::uint32_t streams) const;
   /// An activation batch quantized once for the decode GEMVs; `data` is
   /// null when the batch is wide enough for the tiled path.
   struct Q8Input {
@@ -667,6 +678,9 @@ private:
     // moe
     float* router;
     std::int32_t* ids;
+    /// Zero expert ids: a block-format projection's decode GEMV is a
+    /// one-expert routed vector product.
+    std::int32_t* dense_ids;
     std::uint32_t* expert_counts;
     // Routed WMMA route: 16-row padded bucket bounds, scatter cursors, the
     // compact row -> (token, slot) maps and the tiled Q8 gathered rows.

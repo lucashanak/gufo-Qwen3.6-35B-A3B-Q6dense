@@ -1,5 +1,20 @@
 # Qwen3.8 Flash-Next quality
 
+## GGUF formats, October 29, 2026
+
+Tensors in formats main already accepted take the same kernels as before.
+Operator checks for the new formats:
+
+- `ggml_dequant_test`: `DequantizeRow` of random blocks of all 18 block
+  formats hashes to gguf-py's NumPy dequantization bit for bit.
+- `projection_ops`: the embedding gather equals the CPU dequantization for
+  19 formats; every dense decode format's GEMV is within 2e-3 of an F64
+  reference (relative to Σ|w·x|) at 1–8 tokens, and each of 1–16 rows is bit
+  for bit the row projected alone (trunk shape, and 320/640-wide rows for
+  the 32-element formats).
+- `ngram`: Q8_0, Q5_0, Q4_0, Q4_1 and Q5_1 PLE tables decode as the CPU
+  dequantization through cold and cached gathers.
+
 ## Sampled draft-head costs, October 23, 2026
 
 Based on main `41d93463`, including the expanded greedy-head eligibility.

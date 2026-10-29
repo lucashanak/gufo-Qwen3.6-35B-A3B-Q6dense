@@ -39,6 +39,18 @@ int qfn_mmq_moe_vec(int weight_type, const void* W, const float* X_f32,
                     int n_experts, int n_expert_used, hipStream_t stream,
                     const void* W_b = nullptr, float* out_b = nullptr);
 
+// Dense projection of any block format but Q8_0 for 1–16 tokens, out
+// [n_tokens][M]: each row is read once for every token, and a token's sum
+// does not depend on n_tokens.
+// qfn_mmq_dense_kq_vec over activations already quantized as
+// qfn_mmq_quantize_q8_1 writes them.
+int qfn_mmq_dense_kq_vec_preq(int weight_type, const void* W, const void* X_q8,
+                              float* out_f32, int M, int K, int n_tokens,
+                              hipStream_t stream);
+int qfn_mmq_dense_kq_vec(int weight_type, const void* W, const float* X_f32,
+                         float* out_f32, int M, int K, int n_tokens,
+                         hipStream_t stream);
+
 // Q4_K/Q5_K/Q8_0 gate/up for 1–8 tokens, with the SwiGLU result in out.
 // Q4_K also accepts up to 64 independent rows, grouped by expert.
 int qfn_mmq_moe_gated_vec(int weight_type, const void* gate, const void* up,
@@ -89,5 +101,12 @@ int qfn_mmq_q5_K_moe_raw(
     const void * W, const float * X_f32, const int32_t * ids, float * out,
     int M, int K, int n_tokens, int n_experts, int n_expert_used,
     hipStream_t stream);
+
+// res[t][s][k] = table row tokens[t] for each of `streams` copies, F32 and
+// bit for bit gufo::quant::DequantizeRow, for every GGML block format
+// (rows of k elements, k a whole number of blocks).
+int qfn_mmq_get_rows(int weight_type, const void* table, const int32_t* tokens,
+                     float* res, int n_tokens, int k, int streams,
+                     hipStream_t stream);
 
 }

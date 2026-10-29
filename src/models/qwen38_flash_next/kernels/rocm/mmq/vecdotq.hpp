@@ -329,18 +329,21 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
 
         const int vi = (v >> (2*i)) & 0x03030303;
 
-        sumf_d += d8[i] * (ggml_hip_dp4a(vi, u[i], 0) * (sc & 0xF)); // SIMD dot product
+        // Gufo: explicit roundings, so the sum does not depend on how a
+        // caller's unrolled loop lets fast-math contract it (a decode row
+        // must equal itself in every batch width).
+        sumf_d = __fmaf_rn(d8[i], float(ggml_hip_dp4a(vi, u[i], 0) * (sc & 0xF)), sumf_d); // SIMD dot product
 
         // fill int with 4x m
         int m = sc >> 4;
         m |= m <<  8;
         m |= m << 16;
-        sumf_m += d8[i] * ggml_hip_dp4a(m, u[i], 0); // multiply constant q2_K part with sum of q8_1 values
+        sumf_m = __fmaf_rn(d8[i], float(ggml_hip_dp4a(m, u[i], 0)), sumf_m); // multiply constant q2_K part with sum of q8_1 values
     }
 
     const float2 dm2f = __half22float2(dm2);
 
-    return dm2f.x*sumf_d - dm2f.y*sumf_m;
+    return __fmaf_rn(dm2f.x, sumf_d, -__fmul_rn(dm2f.y, sumf_m));
 }
 
 // contiguous v/x + u/y values

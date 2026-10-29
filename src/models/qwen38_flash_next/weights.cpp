@@ -4,6 +4,8 @@
 #include <string>
 #include <utility>
 
+#include "src/core/quant/ggml_dequant.hpp"
+
 namespace gufo::models::qwen38_flash_next {
 namespace {
 
@@ -14,7 +16,7 @@ struct Format {
   std::uint32_t bytes;
 };
 
-/// Storage geometry of the formats this runtime decodes. Unknown types get a
+/// Storage geometry of a dense or GGML block format. Unknown types get a
 /// zero block, which every validation below rejects.
 [[nodiscard]] Format FormatOf(GgmlType type) noexcept {
   switch (type) {
@@ -23,21 +25,13 @@ struct Format {
     case GgmlType::kF16:
     case GgmlType::kBF16:
       return {1, 2};
-    case GgmlType::kQ8_0:
-      return {32, 34};
-    case GgmlType::kQ5_1:
-      return {32, 24};
-    case GgmlType::kIQ4_NL:
-      return {32, 18};
-    case GgmlType::kQ4_K:
-      return {256, 144};
-    case GgmlType::kQ5_K:
-      return {256, 176};
-    case GgmlType::kQ6_K:
-      return {256, 210};
     default:
-      return {0, 0};
+      break;
   }
+  const auto block =
+      static_cast<std::uint32_t>(gufo::quant::QuantizedBlockElements(type));
+  return {block, static_cast<std::uint32_t>(
+                     gufo::quant::QuantizedRowBytes(type, block))};
 }
 
 struct Binder {
@@ -118,15 +112,33 @@ struct Binder {
     HcMixer m;
     const std::uint64_t hc_dim = c.HcDim();
     m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, {GgmlType::kF32});
+    // Block-format mixers decode from their compact rows (see
+    // CompactProjection). The up projection's 320 columns rule out the
+    // 256-element formats.
     m.down =
         Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
-    m.up =
-        Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
+            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32,
+             GgmlType::kIQ4_NL, GgmlType::kQ5_1, GgmlType::kQ3_K,
+             GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
+             GgmlType::kIQ4_XS, GgmlType::kQ2_K, GgmlType::kIQ2_XXS,
+             GgmlType::kIQ2_XS, GgmlType::kIQ2_S, GgmlType::kIQ3_XXS,
+             GgmlType::kIQ3_S, GgmlType::kIQ1_S, GgmlType::kIQ1_M});
+    m.up = Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
+               {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                GgmlType::kF32, GgmlType::kIQ4_NL, GgmlType::kQ5_1,
+                GgmlType::kQ5_0, GgmlType::kQ4_1, GgmlType::kQ4_0});
     if (with_inject) {
+      // llama.cpp mixes quantize the four inject rows with the trunk; the
+      // device widens any format but Q8_0 and BF16 to F32.
       m.inject = Get(prefix + "_inject.weight", hc_dim, c.hc_count, 1,
-                     {GgmlType::kF32, GgmlType::kQ8_0, GgmlType::kBF16});
+                     {GgmlType::kF32,   GgmlType::kQ8_0,    GgmlType::kBF16,
+                      GgmlType::kF16,   GgmlType::kQ4_0,    GgmlType::kQ4_1,
+                      GgmlType::kQ5_0,  GgmlType::kQ5_1,    GgmlType::kQ2_K,
+                      GgmlType::kQ3_K,  GgmlType::kQ4_K,    GgmlType::kQ5_K,
+                      GgmlType::kQ6_K,  GgmlType::kIQ2_XXS, GgmlType::kIQ2_XS,
+                      GgmlType::kIQ2_S, GgmlType::kIQ3_XXS, GgmlType::kIQ3_S,
+                      GgmlType::kIQ1_S, GgmlType::kIQ1_M,   GgmlType::kIQ4_NL,
+                      GgmlType::kIQ4_XS});
     }
     return m;
   }
@@ -140,6 +152,19 @@ struct Binder {
     const std::uint64_t hc_dim = c.HcDim();
     const auto dense = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
                         GgmlType::kF32};
+    // Trunk, shared-expert, PLE and alpha/beta projections may be any block
+    // format: the device keeps a Q8_0 copy for prefill and the compact rows
+    // for decode. llama.cpp falls back to Q5_0 / Q5_1 / IQ4_NL / Q4_0 on the
+    // 640-wide rows that 256-element formats cannot cover.
+    const auto projection = {
+        GgmlType::kQ8_0,    GgmlType::kBF16,   GgmlType::kF16,
+        GgmlType::kF32,     GgmlType::kQ3_K,   GgmlType::kQ4_K,
+        GgmlType::kQ5_K,    GgmlType::kQ6_K,   GgmlType::kQ5_1,
+        GgmlType::kIQ4_NL,  GgmlType::kQ5_0,   GgmlType::kQ4_1,
+        GgmlType::kQ4_0,    GgmlType::kIQ4_XS, GgmlType::kQ2_K,
+        GgmlType::kIQ2_XXS, GgmlType::kIQ2_XS, GgmlType::kIQ2_S,
+        GgmlType::kIQ3_XXS, GgmlType::kIQ3_S,  GgmlType::kIQ1_S,
+        GgmlType::kIQ1_M};
     const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
                           GgmlType::kQ5_1, GgmlType::kQ8_0};
 
@@ -147,29 +172,33 @@ struct Binder {
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
 
     if (linear) {
-      l.ssm_qkv =
-          Get(p + "attn_qkv.weight", hidden, c.SsmConvChannels(), 1, dense);
+      l.ssm_qkv = Get(p + "attn_qkv.weight", hidden, c.SsmConvChannels(), 1,
+                      projection);
       l.ssm_gate =
-          Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, dense);
+          Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, projection);
       l.ssm_conv1d = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
                          c.SsmConvChannels(), 1, {GgmlType::kF32});
-      l.ssm_alpha = Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1,
-                        {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0});
-      l.ssm_beta = Get(p + "ssm_beta.weight", hidden, c.ssm_num_v_heads, 1,
-                       {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0});
+      // Quantized alpha/beta stack into one projection of a shared format.
+      l.ssm_alpha =
+          Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1, projection);
+      l.ssm_beta =
+          Get(p + "ssm_beta.weight", hidden, c.ssm_num_v_heads, 1, projection);
       l.ssm_dt =
           Get(p + "ssm_dt.bias", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
       l.ssm_a = Get(p + "ssm_a", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
       l.ssm_norm =
           Get(p + "ssm_norm.weight", c.ssm_head_dim, 1, 1, {GgmlType::kF32});
-      l.ssm_out = Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, dense);
+      l.ssm_out =
+          Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, projection);
     } else {
-      l.attn_q =
-          Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1, dense);
-      l.attn_k = Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1, dense);
-      l.attn_v = Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, dense);
-      l.attn_out =
-          Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1, dense);
+      l.attn_q = Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1,
+                     projection);
+      l.attn_k =
+          Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1, projection);
+      l.attn_v =
+          Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, projection);
+      l.attn_out = Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1,
+                       projection);
       l.attn_q_norm =
           Get(p + "attn_q_norm.weight", c.head_dim, 1, 1, {GgmlType::kF32});
       l.attn_k_norm =
@@ -186,20 +215,22 @@ struct Binder {
 
     if (ple) {
       const std::uint64_t ple_dim = c.PleEmbeddingDim();
-      l.ple_key = Get(p + "ple_key.weight", ple_dim, hc_dim, 1, dense);
-      l.ple_value = Get(p + "ple_value.weight", ple_dim, hidden, 1, dense);
+      l.ple_key = Get(p + "ple_key.weight", ple_dim, hc_dim, 1, projection);
+      l.ple_value = Get(p + "ple_value.weight", ple_dim, hidden, 1, projection);
       l.ple_norm_key =
           Get(p + "ple_norm_key.weight", hc_dim, 1, 1, {GgmlType::kF32});
       l.ple_norm_query =
           Get(p + "ple_norm_query.weight", hc_dim, 1, 1, {GgmlType::kF32});
       l.ple_norm_conv =
           Get(p + "ple_norm_conv.weight", hc_dim, 1, 1, {GgmlType::kF32});
+      // llama.cpp writes the 4-wide taps as F16; the device widens them.
       l.ple_conv1d = Get(p + "ple_conv1d.weight", c.ple_conv_kernel, hc_dim, 1,
-                         {GgmlType::kF32});
+                         {GgmlType::kF32, GgmlType::kF16, GgmlType::kBF16});
     }
 
+    // A BF16 router is widened and narrowed to F16 like the F32 one.
     l.router = Get(p + "ffn_gate_inp.weight", hidden, c.num_experts, 1,
-                   {GgmlType::kF32});
+                   {GgmlType::kF32, GgmlType::kBF16});
     l.ffn_gate_exps = Get(p + "ffn_gate_exps.weight", hidden, c.expert_ff,
                           c.num_experts, experts);
     l.ffn_up_exps = Get(p + "ffn_up_exps.weight", hidden, c.expert_ff,
@@ -208,12 +239,12 @@ struct Binder {
                           c.num_experts, experts);
     l.shexp_gate_inp =
         Get(p + "ffn_gate_inp_shexp.weight", hidden, 1, 1, {GgmlType::kF32});
-    l.shexp_gate =
-        Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
-    l.shexp_up =
-        Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
-    l.shexp_down =
-        Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden, 1, dense);
+    l.shexp_gate = Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff,
+                       1, projection);
+    l.shexp_up = Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1,
+                     projection);
+    l.shexp_down = Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden,
+                       1, projection);
 
     if (nextn) {
       l.nextn_enorm =
@@ -248,8 +279,17 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   ModelWeights w;
   w.config = *config;
   const Config& c = w.config;
-  const auto dense = {GgmlType::kQ8_0, GgmlType::kQ6_K, GgmlType::kBF16,
-                      GgmlType::kF16, GgmlType::kF32};
+  // The embedding table may be any block format: rows are gathered and
+  // dequantized exactly, never multiplied.
+  const auto embedding = {
+      GgmlType::kF32,   GgmlType::kF16,     GgmlType::kBF16,
+      GgmlType::kQ4_0,  GgmlType::kQ4_1,    GgmlType::kQ5_0,
+      GgmlType::kQ5_1,  GgmlType::kQ8_0,    GgmlType::kQ2_K,
+      GgmlType::kQ3_K,  GgmlType::kQ4_K,    GgmlType::kQ5_K,
+      GgmlType::kQ6_K,  GgmlType::kIQ2_XXS, GgmlType::kIQ2_XS,
+      GgmlType::kIQ2_S, GgmlType::kIQ3_XXS, GgmlType::kIQ3_S,
+      GgmlType::kIQ1_S, GgmlType::kIQ1_M,   GgmlType::kIQ4_NL,
+      GgmlType::kIQ4_XS};
 
   {
     // The vocabulary is the embedding row count; no metadata key carries it.
@@ -261,9 +301,14 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
     w.config.vocab_size = static_cast<std::uint32_t>(info->dimensions[1]);
   }
   w.token_embd =
-      b.Get("token_embd.weight", c.hidden_size, c.vocab_size, 1, dense);
+      b.Get("token_embd.weight", c.hidden_size, c.vocab_size, 1, embedding);
+  // The vocabulary head may be Q4_K, Q5_K or Q6_K (decode rows plus a Q8_0
+  // copy).
   w.output =
-      b.Get("output.weight", c.hidden_size, c.vocab_size, 1, dense, false);
+      b.Get("output.weight", c.hidden_size, c.vocab_size, 1,
+            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32,
+             GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K},
+            false);
   if (w.output.empty()) {
     w.output = w.token_embd;
   }
@@ -278,8 +323,10 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
     if (rows < c.ple_rows) {
       b.Fail("per_layer_token_embd.weight is missing or too short");
     } else {
-      w.ple_table = b.Get("per_layer_token_embd.weight", c.ple_head_dim, rows,
-                          1, {GgmlType::kIQ4_NL, GgmlType::kBF16});
+      w.ple_table = b.Get(
+          "per_layer_token_embd.weight", c.ple_head_dim, rows, 1,
+          {GgmlType::kIQ4_NL, GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kQ5_0,
+           GgmlType::kQ5_1, GgmlType::kQ4_0, GgmlType::kQ4_1});
     }
   }
   w.layers.reserve(c.num_layers);

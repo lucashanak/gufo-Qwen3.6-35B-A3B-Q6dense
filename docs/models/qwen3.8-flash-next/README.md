@@ -107,6 +107,29 @@ context and selected rollback depth (about 27.5 KiB per context token with
 MTP, measured on gfx1151); admission reserves the configured capacity before
 creating sessions.
 
+## GGUF formats
+
+Besides the supported target, the tensors below load in every GGML block
+format `llama-quantize` writes for them (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
+Q2_K–Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL,
+IQ4_XS, as well as F32/F16/BF16 where noted).
+
+| Tensors | Formats | Decode | Prefill |
+| --- | --- | --- | --- |
+| `token_embd` | any | exact row gather (`qfn_mmq_get_rows`) | same |
+| `output` | Q8_0, F16/BF16/F32, Q4_K, Q5_K, Q6_K | the file's rows | Q8_0 re-encoding |
+| trunk, shared expert, PLE projections, `ssm_alpha`/`ssm_beta` | Q8_0, F16/BF16/F32, or any block format | the file's rows (`qfn_mmq_dense_kq_vec`) | their Q8_0 re-encoding (W8A8 / F16 GEMMs) |
+| HC mixers | as above (the 320-wide `up`: 32-element formats); `inject` any format, widened to F32 on the host unless Q8_0 (#788) or BF16 | separate GEMVs | Q8_0 re-encoding |
+| `ffn_gate_inp` | F32, BF16 (widened on the host) | | |
+| `per_layer_token_embd` (160 wide) | IQ4_NL, BF16, Q8_0, Q5_0, Q5_1, Q4_0, Q4_1 | CPU decode of disk rows | same |
+| `ple_conv1d` | F32, F16, BF16 (widened to F32) | | |
+
+A block-format projection keeps the file's rows for decode and a Q8_0
+re-encoding of them (more device memory: about 1.06 bytes per weight) for
+the prefill GEMMs, so its decode and prefill weights differ by Q8_0
+rounding. A decode row is bit for bit the same alone, in a batched step and
+as an MTP verification row (`projection_ops`).
+
 ## Images
 
 Use this model's `mmproj-BF16.gguf`, discovered beside the target or selected
