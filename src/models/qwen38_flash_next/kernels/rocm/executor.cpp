@@ -1925,22 +1925,8 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
     rc = qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
                          E, U, stream_);
   } else {
-    switch (w.type) {
-      case GgmlType::kQ4_K:
-        rc = qfn_mmq_q4_K_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kQ5_K:
-        rc = qfn_mmq_q5_K_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kQ5_1:
-        rc = qfn_mmq_q5_1_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kQ8_0:
-        rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      default:
-        break;
-    }
+    rc = qfn_mmq_moe_raw(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
+                         E, U, stream_);
   }
   if (rc != 0) {
     AssignError(error_msg, "expert GEMM failed");
@@ -1956,8 +1942,8 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   const bool same_shape = a.type == b.type && a.rows == b.rows &&
                           a.cols == b.cols && a.experts == b.experts;
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
-      (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
-       a.type == GgmlType::kQ8_0)) {
+      (a.type == GgmlType::kQ3_K || a.type == GgmlType::kQ4_K ||
+       a.type == GgmlType::kQ5_K || a.type == GgmlType::kQ8_0)) {
     // The shared expert quantized the same rows (or their producer did).
     const void* ready = ReadyQ8(x, n_tokens, a.cols);
     if ((ready != nullptr
@@ -2862,10 +2848,14 @@ bool Executor::JoinSide(std::string* error_msg) const {
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
   const Config& c = config();
   return ExpertMatrixRows(n_tokens) &&
-         (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
+         (l.ffn_gate_exps.type == GgmlType::kQ3_K ||
+          l.ffn_gate_exps.type == GgmlType::kQ4_K ||
           l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
          l.ffn_up_exps.type == l.ffn_gate_exps.type &&
          (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
+          l.ffn_down_exps.type == GgmlType::kQ5_0 ||
+          l.ffn_down_exps.type == GgmlType::kQ4_0 ||
+          l.ffn_down_exps.type == GgmlType::kIQ4_NL ||
           l.ffn_down_exps.type == GgmlType::kQ8_0) &&
          c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
 }
@@ -2903,9 +2893,10 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // Prefill pairs the gate/up projections and applies SwiGLU without
     // materializing the gate; decode-time batches keep separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
-    const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
-                                     ? WeightType::kQ5_K
-                                     : WeightType::kQ4_K;
+    const WeightType gate_type =
+        l.ffn_gate_exps.type == GgmlType::kQ5_K   ? WeightType::kQ5_K
+        : l.ffn_gate_exps.type == GgmlType::kQ3_K ? WeightType::kQ3_K
+                                                  : WeightType::kQ4_K;
     const bool gated_ok =
         routed_64_tiles_ != 0
             ? RoutedGatedF16Gemm(
@@ -2927,9 +2918,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }
-    const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
-                                     ? WeightType::kQ8_0
-                                     : WeightType::kQ5_1;
+    // WmmaExperts admits only the down formats the F16 route decodes; the
+    // GGUF ids are the WeightType values.
+    const auto down_type = static_cast<WeightType>(l.ffn_down_exps.type);
     // Prefill takes the 64-token down tiles: they decode each expert's
     // weights over more rows, also where narrower tiles would be fewer.
     const bool wide_down = routed_64_tiles_ != 0;

@@ -789,7 +789,8 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
     return false;
-  if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
+  const auto gate_type = l.ffn_gate_exps.type;
+  if (gate_type == core::GgmlType::kQ4_K &&
       l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
     // Share expert weights across request boundaries while retaining the
     // scalar Q8 activation quantization and dot-product reduction.
@@ -799,6 +800,35 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                               rows, c.num_experts, c.num_experts_used,
                               stream_) != 0 ||
         qfn_mmq_moe_vec(
+            static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
+            base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
+            rows * c.num_experts_used, c.num_experts, 1, stream_) != 0)
+      return Fail(error, "batched routed vector projection failed");
+    MoeEpilogue(base.down_e, base.weights, base.shexp_out,
+                base.router + c.num_experts, c.num_experts + 1, out, rows,
+                c.num_experts_used, c.hidden_size, stream_);
+    return true;
+  }
+  // GatedExperts' gated kernel formats keep their per-chunk decode route.
+  const bool gated_format = gate_type == core::GgmlType::kQ3_K ||
+                            gate_type == core::GgmlType::kQ4_K ||
+                            gate_type == core::GgmlType::kQ5_K ||
+                            gate_type == core::GgmlType::kQ8_0;
+  if (!gated_format && l.ffn_up_exps.type == gate_type &&
+      l.ffn_up_exps.rows == l.ffn_gate_exps.rows &&
+      l.ffn_up_exps.cols == l.ffn_gate_exps.cols &&
+      l.ffn_up_exps.experts == l.ffn_gate_exps.experts) {
+    // Formats without the gated kernel: MoeExperts' decode route (paired
+    // vector projections, SwiGLU, then the down projection's slot rows) over
+    // every row at once. Each row's sums do not depend on the launch width.
+    if (qfn_mmq_moe_vec(static_cast<int>(gate_type), l.ffn_gate_exps.data, x,
+                        base.ids, base.gate_e, c.expert_ff, c.hidden_size, rows,
+                        c.num_experts, c.num_experts_used, stream_,
+                        l.ffn_up_exps.data, base.up_e) != 0)
+      return Fail(error, "batched routed pair projection failed");
+    Swiglu(base.gate_e, base.up_e,
+           std::size_t{rows} * c.num_experts_used * c.expert_ff, stream_);
+    if (qfn_mmq_moe_vec(
             static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
             base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
             rows * c.num_experts_used, c.num_experts, 1, stream_) != 0)

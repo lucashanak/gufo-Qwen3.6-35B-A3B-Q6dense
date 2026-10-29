@@ -358,10 +358,7 @@ static int moe_vector_projection(int weight_type, const void* W,
                                  const void* X_q8 = nullptr) {
   constexpr const char* tag = "qfn_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
-  // Q3_K is only projected gated (a Q3_K shared expert's decode rows).
-  if ((type != GGML_TYPE_Q3_K || !gated) && type != GGML_TYPE_Q4_K &&
-      type != GGML_TYPE_Q5_K && type != GGML_TYPE_Q5_1 &&
-      type != GGML_TYPE_Q8_0) {
+  if (!mmvq_dense_kq_format(type) && type != GGML_TYPE_Q8_0) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
     return -1;
   }
@@ -412,7 +409,7 @@ static int moe_vector_projection(int weight_type, const void* W,
   // slots that share an expert read its weights in the same block.
   const bool by_expert =
       !gated && !W_b && !X_q8 &&
-      (type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0) && K == 640 &&
+      mmvq_moe_down_by_expert(type) && K == 640 &&
       n_expert_used == 1 && n_tokens > 1;
   const size_t group_bytes =
       by_expert ? 2 * size_t(n_tokens) * sizeof(int32_t)
@@ -627,6 +624,41 @@ extern "C" int qfn_mmq_q5_K_moe_raw(
                                             nullptr, nullptr);
 }
 
+extern "C" int qfn_mmq_moe_raw(int weight_type, const void* W, const float* X,
+                               const int32_t* ids, float* out, int M, int K,
+                               int n_tokens, int n_experts, int n_expert_used,
+                               hipStream_t stream) {
+  switch (static_cast<ggml_type>(weight_type)) {
+#define QFN_MOE_RAW(t)                                                    \
+  case t:                                                                 \
+    return qfn_mmq_moe_impl<t>("qfn_mmq_moe_raw", W, X, ids, out, M, K,   \
+                               n_tokens, n_experts, n_expert_used, stream);
+    QFN_MOE_RAW(GGML_TYPE_Q4_0)
+    QFN_MOE_RAW(GGML_TYPE_Q4_1)
+    QFN_MOE_RAW(GGML_TYPE_Q5_0)
+    QFN_MOE_RAW(GGML_TYPE_Q5_1)
+    QFN_MOE_RAW(GGML_TYPE_Q8_0)
+    QFN_MOE_RAW(GGML_TYPE_Q2_K)
+    QFN_MOE_RAW(GGML_TYPE_Q3_K)
+    QFN_MOE_RAW(GGML_TYPE_Q4_K)
+    QFN_MOE_RAW(GGML_TYPE_Q5_K)
+    QFN_MOE_RAW(GGML_TYPE_Q6_K)
+    QFN_MOE_RAW(GGML_TYPE_IQ2_XXS)
+    QFN_MOE_RAW(GGML_TYPE_IQ2_XS)
+    QFN_MOE_RAW(GGML_TYPE_IQ2_S)
+    QFN_MOE_RAW(GGML_TYPE_IQ3_XXS)
+    QFN_MOE_RAW(GGML_TYPE_IQ3_S)
+    QFN_MOE_RAW(GGML_TYPE_IQ1_S)
+    QFN_MOE_RAW(GGML_TYPE_IQ4_NL)
+    QFN_MOE_RAW(GGML_TYPE_IQ4_XS)
+#undef QFN_MOE_RAW
+    default:
+      fprintf(stderr, "qfn_mmq_moe_raw: unsupported weight type %d\n",
+              weight_type);
+      return -1;
+  }
+}
+
 extern "C" int qfn_mmq_q4_K_moe_pair_unique(
     const void * W_a, const void * W_b, const float * X, const int32_t * ids,
     float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
@@ -786,9 +818,13 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
 }
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_Q3_K>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q5_1>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ4_NL>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q5_K>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);

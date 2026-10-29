@@ -909,32 +909,36 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              int input_stride, hipStream_t stream,
                              const int32_t* dst_slots) {
     // dst_slots (expert-ordered slot rows) is only used by the down view.
-    GGML_ASSERT(!dst_slots || (k == 640 && experts_used == 1 && tokens > 1 &&
-                               (type == GGML_TYPE_Q5_1 ||
-                                type == GGML_TYPE_Q8_0)));
+    const bool down_view = k == 640 && experts_used == 1 && tokens > 1;
+    GGML_ASSERT(!dst_slots || (down_view && mmvq_moe_down_by_expert(type)));
     switch (type) {
-        case GGML_TYPE_Q5_1:
-          // Down projection slots have independent inputs. Wider row tiles
-          // reuse each short input without changing its dot-product sum.
-          if (k == 640 && experts_used == 1 && tokens > 1) {
-            if (tokens > 20) {
-              launch_moe<GGML_TYPE_Q5_1, 8>(
-                  weights, input, ids, output, k, rows, tokens, experts_used,
-                  input_stride, stream, dst_slots);
-            } else {
-              launch_moe<GGML_TYPE_Q5_1, 4>(
-                  weights, input, ids, output, k, rows, tokens, experts_used,
-                  input_stride, stream, dst_slots);
-            }
-            break;
-          }
-            launch_moe<GGML_TYPE_Q5_1>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
+#define QFN_MOE_SMALL_BLOCKS(t)                                                \
+        case t:                                                                \
+          /* Down projection slots have independent inputs. Wider row tiles */ \
+          /* reuse each short input without changing its dot-product sum. */  \
+          if (down_view) {                                                     \
+            if (tokens > 20) {                                                 \
+              launch_moe<t, 8>(weights, input, ids, output, k, rows, tokens,   \
+                               experts_used, input_stride, stream, dst_slots); \
+            } else {                                                           \
+              launch_moe<t, 4>(weights, input, ids, output, k, rows, tokens,   \
+                               experts_used, input_stride, stream, dst_slots); \
+            }                                                                  \
+            break;                                                             \
+          }                                                                    \
+          launch_moe<t>(weights, input, ids, output, k, rows, tokens,          \
+                        experts_used, input_stride, stream);                   \
+          break;
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_Q4_0)
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_Q4_1)
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_Q5_0)
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_Q5_1)
+        QFN_MOE_SMALL_BLOCKS(GGML_TYPE_IQ4_NL)
+#undef QFN_MOE_SMALL_BLOCKS
         case GGML_TYPE_Q8_0:
           // Down projection slots have independent inputs. Four rows reuse
           // each short input across more weights without changing its sum.
-          if (k == 640 && experts_used == 1 && tokens > 1) {
+          if (down_view) {
             launch_moe<GGML_TYPE_Q8_0, 4>(weights, input, ids, output, k, rows,
                                           tokens, experts_used, input_stride,
                                           stream, dst_slots);
@@ -943,14 +947,25 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
             launch_moe<GGML_TYPE_Q8_0>(weights, input, ids, output, k, rows, tokens,
                                           experts_used, input_stride, stream);
             break;
-        case GGML_TYPE_Q4_K:
-            launch_moe<GGML_TYPE_Q4_K>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
-        case GGML_TYPE_Q5_K:
-            launch_moe<GGML_TYPE_Q5_K>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
+#define QFN_MOE_SUPER_BLOCKS(t)                                                \
+        case t:                                                                \
+          launch_moe<t>(weights, input, ids, output, k, rows, tokens,          \
+                        experts_used, input_stride, stream);                   \
+          break;
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q2_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q3_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q4_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q5_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_Q6_K)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ2_XXS)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ2_XS)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ2_S)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ3_XXS)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ3_S)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ1_S)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ1_M)
+        QFN_MOE_SUPER_BLOCKS(GGML_TYPE_IQ4_XS)
+#undef QFN_MOE_SUPER_BLOCKS
         default: GGML_ABORT("unsupported vector weight format");
     }
 }

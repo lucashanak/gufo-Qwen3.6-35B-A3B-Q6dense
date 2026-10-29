@@ -8,9 +8,12 @@ sources with HIP for AMD Strix Halo (`gfx1151`).
 `qfn_mmq.h` is the public adapter. It supplies Q8_0 dense projections, dense
 decode GEMVs for every other block format (`qfn_mmq_dense_kq_vec`),
 embedding row gathers for every block format (`getrows.hip.cpp`, built
-without fast-math) and Q4_K, Q5_K, Q5_1 and Q8_0 routed expert projections,
-including the paired Q4_K gate/up path. `vec_dot_q2_K_q8_1_impl_mmvq` uses
-explicit roundings so a row's sum does not depend on the caller's unroll. `qfn_ggml_stubs.*` supplies the minimal context and scratch
+without fast-math) and routed expert projections for every block format but
+IQ1_M (`qfn_mmq_moe_vec`, `qfn_mmq_moe_raw`; tiled instantiations in
+`mmq_formats_{a,b,c}.hip.cpp`), including the paired Q4_K gate/up path.
+`vec_dot_q2_K_q8_1_impl_mmvq` and the Q8_1, Q3_K-layout and Q2_K MMA dot
+products use explicit roundings so a row's sum does not depend on the
+caller's unroll or a column's position in the tile. `qfn_ggml_stubs.*` supplies the minimal context and scratch
 pool without the ggml graph runtime. Gufo owns scheduling and HIP graphs.
 
 The kernels use native HIP runtime, hipBLAS and HIP numeric types. The

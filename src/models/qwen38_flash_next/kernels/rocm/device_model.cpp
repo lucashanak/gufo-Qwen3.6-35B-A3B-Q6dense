@@ -64,8 +64,29 @@ bool ProjectionFormat(core::GgmlType type) {
 
 /// Formats the routed expert kernels project (decode and prefill).
 bool ExpertFormat(core::GgmlType type) {
-  return type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K ||
-         type == core::GgmlType::kQ5_1 || type == core::GgmlType::kQ8_0;
+  switch (type) {
+    case core::GgmlType::kQ3_K:
+    case core::GgmlType::kQ4_K:
+    case core::GgmlType::kQ5_K:
+    case core::GgmlType::kQ5_1:
+    case core::GgmlType::kIQ4_NL:
+    case core::GgmlType::kQ8_0:
+    case core::GgmlType::kQ5_0:
+    case core::GgmlType::kQ4_1:
+    case core::GgmlType::kQ4_0:
+    case core::GgmlType::kQ2_K:
+    case core::GgmlType::kQ6_K:
+    case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ3_S:
+    case core::GgmlType::kIQ1_S:
+    case core::GgmlType::kIQ4_XS:
+      return true;
+    default:
+      return false;
+  }
 }
 
 struct Conversion {

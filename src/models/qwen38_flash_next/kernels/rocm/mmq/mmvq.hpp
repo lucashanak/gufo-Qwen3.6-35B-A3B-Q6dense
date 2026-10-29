@@ -35,6 +35,14 @@ struct MoeBatchGroup {
   uint32_t slots[MMVQ_MAX_BATCH_SIZE];
 };
 
+// 32-element formats whose 640-wide down projection quantizes its slot rows
+// in expert order (see moe_vector_projection's by_expert route).
+constexpr __host__ __device__ bool mmvq_moe_down_by_expert(ggml_type type) {
+  return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
+         type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1 ||
+         type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0;
+}
+
 // Tuned routed-vector batch limits for gfx1151.
 constexpr __host__ __device__ int mmvq_moe_max_batch(ggml_type type) {
     return type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||

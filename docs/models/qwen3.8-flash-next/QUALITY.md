@@ -14,6 +14,17 @@ Operator checks for the new formats:
   the 32-element formats).
 - `ngram`: Q8_0, Q5_0, Q4_0, Q4_1 and Q5_1 PLE tables decode as the CPU
   dequantization through cold and cached gathers.
+- `routed_wmma_ops`: for 14 gate/up and 6 down formats the routed vector
+  kernel matches F64, its rows are the same at every width and paired; the
+  tiled MMQ route matches F64 and its rows are bit for bit the same in every
+  prompt pass (1, 7, 9, 33 tokens, half the prompt); Q3_K gate/up and
+  IQ4_NL, Q5_0, Q4_0 down WMMA agree with MMQ and F64 at 16/48/64-row tiles.
+
+Greedy replies (five fixed prompts, 384 tokens, thinking off, one session):
+UD-Q4_K_XL is byte-identical to main `34ebb5fe` in AR and MTP (5/5 each).
+A Q4_K-trunk mix (Q3_K gate/up, IQ4_NL/Q8_0 down, Q4_K trunk, shared expert
+and head, Q6_K/Q5_1 mixers, BF16 router, 92 GB), which main refuses, answers
+coherently with AR == MTP (5/5).
 
 ## Sampled draft-head costs, October 23, 2026
 

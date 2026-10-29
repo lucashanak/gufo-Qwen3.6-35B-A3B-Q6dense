@@ -1293,8 +1293,11 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_A::I + tile_C::get_i(l);
                     float2 dmA = __half22float2(x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + k0/QI8_1]);
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.y*dsB.y;
+                    // As in vec_dot_q8_0_q8_1_mma: explicit roundings keep a
+                    // column's position in the tile from changing contraction.
+                    float& acc = sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(__fmul_rn(dmA.x, dsB.x), float(C.x[l]), acc);
+                    acc = __fmaf_rn(dmA.y, dsB.y, acc);
                 }
             }
         }
@@ -1466,7 +1469,9 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += C.x[l] * x_df[i*MMQ_MMA_TILE_X_K_Q3_K + k0/4] * dB;
+                    // Explicit roundings, as in vec_dot_q8_0_q8_1_mma.
+                    float& acc = sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(__fmul_rn(float(C.x[l]), x_df[i*MMQ_MMA_TILE_X_K_Q3_K + k0/4]), dB, acc);
                 }
             }
         }
@@ -1767,12 +1772,14 @@ static __device__ __forceinline__ void vec_dot_q2_K_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
                     const float2 dm = __half22float2(x_dm[i*MMQ_MMA_TILE_X_K_Q2_K + k0/4]);
-                    float tmp = Cd.x[l]*dm.x;
+                    // Explicit roundings, as in vec_dot_q8_0_q8_1_mma.
+                    float tmp = __fmul_rn(float(Cd.x[l]), dm.x);
                     if (k01 >= MMQ_TILE_NE_K * 3/4) {
-                        tmp -= Cm.x[l]*dm.y;
+                        tmp = __fmaf_rn(-float(Cm.x[l]), dm.y, tmp);
                     }
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += tmp*dB;
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] -= dm.y*sB;
+                    float& acc = sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(tmp, dB, acc);
+                    acc = __fmaf_rn(-dm.y, sB, acc);
                 }
             }
         }

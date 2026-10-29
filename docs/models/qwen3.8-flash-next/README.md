@@ -1,7 +1,8 @@
 # Qwen3.8 Flash-Next
 
 Hybrid recurrent/QSA mixture-of-experts text/image model on gfx1151.
-Supported target: `unsloth/Qwen3.8-Flash-Next-GGUF`, **UD-Q4_K_XL** (four shards).
+Supported target: `unsloth/Qwen3.8-Flash-Next-GGUF`, **UD-Q4_K_XL** (four shards);
+llama.cpp mixes of other formats load too (see [GGUF formats](#gguf-formats)).
 Optional shared-Q8 MTP predictor; optional BF16 vision projector.
 Original unquantized-model and GGUF-conversion parity remain unqualified.
 
@@ -121,6 +122,8 @@ IQ4_XS, as well as F32/F16/BF16 where noted).
 | trunk, shared expert, PLE projections, `ssm_alpha`/`ssm_beta` | Q8_0, F16/BF16/F32, or any block format | the file's rows (`qfn_mmq_dense_kq_vec`) | their Q8_0 re-encoding (W8A8 / F16 GEMMs) |
 | HC mixers | as above (the 320-wide `up`: 32-element formats); `inject` any format, widened to F32 on the host (Q8_0 on the device, #788) | separate GEMVs | Q8_0 re-encoding |
 | `ffn_gate_inp` | F32, BF16 (widened on the host) | | |
+| Routed gate/up | all but IQ1_M | Q3_K/Q4_K/Q5_K/Q8_0 gated kernel; others paired vector kernel + SwiGLU (batched steps too) | Q3_K/Q4_K/Q5_K: WMMA; others tiled MMQ |
+| Routed down (640 wide) | 32-element formats (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL) | vector kernel | Q5_1, Q5_0, Q4_0, IQ4_NL, Q8_0: WMMA (with a WMMA gate/up); others tiled MMQ |
 | `per_layer_token_embd` (160 wide) | IQ4_NL, BF16, Q8_0, Q5_0, Q5_1, Q4_0, Q4_1 | CPU decode of disk rows | same |
 | `ple_conv1d` | F32, F16, BF16 (widened to F32) | | |
 
@@ -128,7 +131,9 @@ A block-format projection keeps the file's rows for decode and a Q8_0
 re-encoding of them (more device memory: about 1.06 bytes per weight) for
 the prefill GEMMs, so its decode and prefill weights differ by Q8_0
 rounding. A decode row is bit for bit the same alone, in a batched step and
-as an MTP verification row (`projection_ops`).
+as an MTP verification row (`projection_ops`), and a routed prompt row does
+not depend on the pass that computes it (`routed_wmma_ops`). Formats outside
+the WMMA routes cost prefill speed, not exactness.
 
 ## Images
 
