@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <stdexcept>
@@ -15,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 
 namespace gufo::hip {
@@ -22,8 +24,11 @@ namespace {
 
 constexpr std::array<std::uint8_t, 8> kMtpDraftPersistentMagic = {
     'G', 'M', 'T', 'D', 'R', 'F', '0', '1'};
-constexpr std::uint32_t kMtpDraftPersistentVersion = 1;
-constexpr std::size_t kMtpDraftPersistentHeaderBytes = 64;
+// Version 2 appends the prompt-lookup state to version 1's 64-byte header.
+constexpr std::uint32_t kMtpDraftPersistentVersion = 2;
+constexpr std::size_t kMtpDraftPersistentHeaderBytes = 72;
+constexpr std::size_t kMtpDraftPersistentV1HeaderBytes = 64;
+using Lookup = speculative::PromptLookup<tokenization::TokenId>;
 constexpr std::uint32_t kMtpDraftPrimedFlag = 1U << 0U;
 
 template<typename T>
@@ -74,15 +79,18 @@ class QwenMtpDraftSnapshot final : public speculative::IDraftBackendSnapshot {
 public:
   QwenMtpDraftSnapshot(std::unique_ptr<QwenMtpGpuSnapshot> gpu_snapshot,
                        std::vector<float> target_hidden,
-                       QwenMtpGpuDraftConfig config, bool primed)
+                       QwenMtpGpuDraftConfig config, bool primed,
+                       Lookup::State lookup)
       : gpu_snapshot(std::move(gpu_snapshot)),
         target_hidden(std::move(target_hidden)),
         config(config),
-        primed(primed) {}
+        primed(primed),
+        lookup(lookup) {}
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
     return (gpu_snapshot != nullptr ? gpu_snapshot->PayloadBytes() : 0) +
-           target_hidden.size() * sizeof(float) + sizeof(std::uint32_t);
+           target_hidden.size() * sizeof(float) + sizeof(std::uint32_t) +
+           sizeof(lookup);
   }
 
   [[nodiscard]] std::size_t PersistentPayloadBytes() const override {
@@ -131,6 +139,8 @@ public:
                                    static_cast<std::uint64_t>(expected_bytes));
     PutLittleEndian<std::uint64_t>(
         destination, 56, static_cast<std::uint64_t>(target_hidden.size()));
+    PutLittleEndian<std::uint32_t>(destination, 64, lookup.resume);
+    PutLittleEndian<std::uint32_t>(destination, 68, lookup.request_start);
 
     const std::size_t gpu_offset = kMtpDraftPersistentHeaderBytes;
     const std::size_t hidden_offset =
@@ -158,7 +168,18 @@ public:
   std::vector<float> target_hidden;
   QwenMtpGpuDraftConfig config;
   bool primed{false};
+  Lookup::State lookup;
 };
+
+void ValidateSampledRequest(float temperature, const std::uint64_t* rng_state) {
+  if (!std::isfinite(temperature) || temperature <= 0.0F) {
+    throw std::invalid_argument(
+        "MTP sampled proposal temperature must be finite and positive");
+  }
+  if (rng_state == nullptr) {
+    throw std::invalid_argument("MTP sampled proposal requires RNG state");
+  }
+}
 
 }  // namespace
 
@@ -173,6 +194,12 @@ QwenMtpGpuDraftBackend::QwenMtpGpuDraftBackend(
     draft_table_.emplace(
         std::vector<std::int32_t>(specials.begin(), specials.end()));
   }
+  const auto& tokenizer = model.GetTokenizer();
+  const std::array names{tokenization::kImStart, tokenization::kImEnd,
+                         tokenization::kEndOfText};
+  for (std::size_t i = 0; i < names.size(); ++i)
+    lookup_boundaries_[i] = tokenizer.FindSpecialToken(names[i]).value_or(
+        tokenization::kInvalidTokenId);
 }
 
 bool QwenMtpGpuDraftBackend::SyncDraftVocab(
@@ -346,9 +373,9 @@ bool QwenMtpGpuDraftBackend::AppendTargetContext(
   return true;
 }
 
-speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
+void QwenMtpGpuDraftBackend::CheckProposalStart(
     std::span<const tokenization::TokenId> prompt_tokens,
-    std::uint32_t current_pos, std::uint32_t max_tokens) {
+    std::uint32_t current_pos) const {
   if (!primed_ || prompt_tokens.empty() || current_pos == 0) {
     throw std::logic_error("MTP GPU draft backend is not primed");
   }
@@ -358,6 +385,120 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
   if (executor_->GetNextPosition() + 1 != current_pos) {
     throw std::logic_error("MTP GPU draft position is inconsistent");
   }
+}
+
+std::optional<speculative::DraftProposal> QwenMtpGpuDraftBackend::TryLookup(
+    std::span<const tokenization::TokenId> tokens, std::uint32_t position,
+    std::uint32_t limit, bool sampled) {
+  lookup_proposal_ = false;
+  // Feedback writes a draft row for the anchor and each accepted token.
+  const auto room = executor_->GetMaxContext() - executor_->GetNextPosition();
+  limit = std::min({limit, kMtpMaxCopyTokens, room > 0 ? room - 1 : 0U});
+  // Some native callers supply only the anchor, not an indexed history.
+  if (limit == 0 || tokens.size() != std::size_t{position} + 1 ||
+      !lookup_.Step(position))
+    return std::nullopt;
+  const auto minimum = sampled ? Lookup::kSampledMinMatch : Lookup::kMinMatch;
+  const auto state = lookup_.Save();
+  if (state.resume == Lookup::kNoState &&
+      tokens.size() - state.request_start < minimum)
+    return std::nullopt;
+  const auto committed = tokens.first(position);
+  lookup_.Extend(committed, sampled);
+  const auto is_boundary = [&](tokenization::TokenId token) {
+    return std::ranges::find(lookup_boundaries_, token) !=
+           lookup_boundaries_.end();
+  };
+  // Copying a repeated passage's closing tag or header wastes verification;
+  // an earlier occurrence can supply the same text without crossing it.
+  const auto match =
+      lookup_.Find(committed, tokens.last(1), minimum, [&](std::size_t start) {
+        const auto count =
+            std::min(std::size_t{limit}, lookup_.IndexedTokens() - start);
+        return std::ranges::none_of(committed.subspan(start, count),
+                                    is_boundary);
+      });
+  if (match.length == 0)
+    return std::nullopt;
+  // Past the committed tokens the source continues into the anchor and the
+  // copy itself, so a short-period repetition fills the whole copy.
+  speculative::DraftProposal proposal;
+  proposal.start_pos = position;
+  proposal.tokens.reserve(limit);
+  const auto vocab_size = executor_->GetModel().GetConfig().vocab_size;
+  for (std::size_t source = match.start; proposal.tokens.size() < limit;
+       ++source) {
+    const auto token = source <= position
+                           ? tokens[source]
+                           : proposal.tokens[source - position - 1];
+    if (std::size_t(token) >= vocab_size || is_boundary(token))
+      break;
+    proposal.tokens.push_back(token);
+  }
+  if (proposal.tokens.empty())
+    return std::nullopt;
+  proposal.from_lookup = true;
+  if (sampled) {
+    // A deterministic copy is q(token)=1, conditional only on prior history.
+    proposal.candidates_per_token = 1;
+    proposal.candidate_ids = proposal.tokens;
+    proposal.candidate_probabilities.assign(proposal.tokens.size(), 1.0F);
+  }
+  // Feedback rebuilds the draft rows from the checkpoint as for a chain; a
+  // copy wrote none.
+  proposal_checkpoint_ = executor_->GetNextPosition();
+  proposal_input_ = tokens.back();
+  proposal_target_hidden_ = target_hidden_;
+  committed_target_hidden_.clear();
+  proposed_tokens_ = proposal.tokens;
+  lookup_start_ = match.start;
+  lookup_proposal_ = true;
+  proposal_active_ = true;
+  return proposal;
+}
+
+speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
+    std::span<const tokenization::TokenId> prompt_tokens,
+    std::uint32_t current_pos, std::uint32_t max_tokens) {
+  CheckProposalStart(prompt_tokens, current_pos);
+  if (auto copied = TryLookup(prompt_tokens, current_pos, max_tokens, false))
+    return std::move(*copied);
+  return ProposeChain(prompt_tokens, current_pos, max_tokens);
+}
+
+speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeSampled(
+    std::span<const tokenization::TokenId> prompt_tokens,
+    std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
+    std::uint64_t* rng_state) {
+  ValidateSampledRequest(temperature, rng_state);
+  CheckProposalStart(prompt_tokens, current_pos);
+  if (auto copied = TryLookup(prompt_tokens, current_pos, max_tokens, true))
+    return std::move(*copied);
+  return ProposeSampledChain(prompt_tokens, current_pos, max_tokens,
+                             temperature, rng_state);
+}
+
+speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeForRequest(
+    const speculative::DraftProposalRequest& request) {
+  const bool sampled = request.temperature > 0.0F;
+  if (sampled)
+    ValidateSampledRequest(request.temperature, request.rng_state);
+  CheckProposalStart(request.tokens, request.position);
+  if (auto copied = TryLookup(
+          request.tokens, request.position,
+          std::max(request.max_tokens, request.max_copy_tokens), sampled))
+    return std::move(*copied);
+  return sampled ? ProposeSampledChain(request.tokens, request.position,
+                                       request.max_tokens, request.temperature,
+                                       request.rng_state)
+                 : ProposeChain(request.tokens, request.position,
+                                request.max_tokens);
+}
+
+speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeChain(
+    std::span<const tokenization::TokenId> prompt_tokens,
+    std::uint32_t current_pos, std::uint32_t max_tokens) {
+  CheckProposalStart(prompt_tokens, current_pos);
 
   speculative::DraftProposal proposal;
   proposal.start_pos = current_pos;
@@ -387,27 +528,13 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
   return proposal;
 }
 
-speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeSampled(
+speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeSampledChain(
     std::span<const tokenization::TokenId> prompt_tokens,
     std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
     std::uint64_t* rng_state) {
   namespace qfn = models::qwen38_flash_next;
-  if (!std::isfinite(temperature) || temperature <= 0.0F) {
-    throw std::invalid_argument(
-        "MTP sampled proposal temperature must be finite and positive");
-  }
-  if (rng_state == nullptr) {
-    throw std::invalid_argument("MTP sampled proposal requires RNG state");
-  }
-  if (!primed_ || prompt_tokens.empty() || current_pos == 0) {
-    throw std::logic_error("MTP GPU draft backend is not primed");
-  }
-  if (proposal_active_) {
-    throw std::logic_error("MTP GPU proposal feedback is pending");
-  }
-  if (executor_->GetNextPosition() + 1 != current_pos) {
-    throw std::logic_error("MTP GPU draft position is inconsistent");
-  }
+  ValidateSampledRequest(temperature, rng_state);
+  CheckProposalStart(prompt_tokens, current_pos);
 
   speculative::DraftProposal proposal;
   proposal.start_pos = current_pos;
@@ -510,6 +637,7 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
     std::uint32_t checkpoint{0};
     std::uint32_t count{0};
     bool small_head{false};
+    bool copied{false};
   };
   std::vector<SessionState> sessions(requests.size());
   for (std::size_t index = 0; index < requests.size(); ++index) {
@@ -527,10 +655,23 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
     sessions[index].checkpoint = backend.executor_->GetNextPosition();
     sessions[index].count = count;
   }
+  // A session whose context repeats copies instead of drafting, as serial
+  // ProposeForRequest would.
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    const auto& request = requests[index];
+    if (sessions[index].count == 0)
+      continue;
+    if (auto copied = backends[index]->TryLookup(
+            request.tokens, request.position,
+            std::max(request.max_tokens, request.max_copy_tokens), false)) {
+      sessions[index].proposal = std::move(*copied);
+      sessions[index].copied = true;
+    }
+  }
   // Choose every head, as serial Propose would from the same history, before
   // any chain starts: an error here leaves no chain in flight.
   for (std::size_t index = 0; index < requests.size(); ++index) {
-    if (sessions[index].count != 0) {
+    if (sessions[index].count != 0 && !sessions[index].copied) {
       sessions[index].small_head =
           backends[index]->SyncDraftVocab(requests[index].tokens);
     }
@@ -541,6 +682,8 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
     for (std::size_t index = 0; index < requests.size(); ++index) {
       auto& backend = *backends[index];
       auto& session = sessions[index];
+      if (session.copied)
+        continue;
       backend.proposal_checkpoint_ = session.checkpoint;
       backend.proposal_input_ = session.input;
       backend.proposal_target_hidden_ = backend.target_hidden_;
@@ -555,7 +698,7 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
     for (std::size_t index = 0; index < requests.size(); ++index) {
       auto& backend = *backends[index];
       auto& session = sessions[index];
-      if (session.count == 0) {
+      if (session.count == 0 || session.copied) {
         continue;
       }
       backend.proposed_tokens_ = backend.executor_->CollectChainTokens();
@@ -587,6 +730,7 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
       backend.proposal_target_hidden_.clear();
       backend.proposed_tokens_.clear();
       backend.proposal_active_ = false;
+      backend.lookup_proposal_ = false;
     }
     throw;
   }
@@ -624,6 +768,9 @@ void QwenMtpGpuDraftBackend::AcceptFeedback(
             .subspan(index * target_hidden_.size(), target_hidden_.size()),
         proposal_checkpoint_ + static_cast<std::uint32_t>(index) + 1, false);
   }
+  if (lookup_proposal_)
+    lookup_.Observe(lookup_start_, proposed_tokens_.size(), accepted.size());
+  lookup_proposal_ = false;
   proposal_active_ = false;
   proposed_tokens_.clear();
   proposal_target_hidden_.clear();
@@ -652,6 +799,7 @@ void QwenMtpGpuDraftBackend::DiscardPendingTargetContext(
     }
     executor_->Rewind(proposal_checkpoint_);
     proposal_active_ = false;
+    lookup_proposal_ = false;
     proposed_tokens_.clear();
     proposal_target_hidden_.clear();
     committed_target_hidden_.clear();
@@ -668,7 +816,7 @@ std::size_t QwenMtpGpuDraftBackend::SnapshotPayloadBytes() const {
   return CheckedPersistentAdd(
       CheckedPersistentAdd(executor_->SnapshotPayloadBytes(),
                            target_hidden_.size() * sizeof(float)),
-      sizeof(std::uint32_t));
+      sizeof(std::uint32_t) + sizeof(Lookup::State));
 }
 
 std::unique_ptr<speculative::IDraftBackendSnapshot>
@@ -677,8 +825,9 @@ QwenMtpGpuDraftBackend::Snapshot() const {
     throw std::logic_error(
         "MTP snapshot requires a committed proposal boundary");
   }
-  return std::make_unique<QwenMtpDraftSnapshot>(
-      executor_->SaveSnapshot(), target_hidden_, config_, primed_);
+  return std::make_unique<QwenMtpDraftSnapshot>(executor_->SaveSnapshot(),
+                                                target_hidden_, config_,
+                                                primed_, lookup_.Save());
 }
 
 void QwenMtpGpuDraftBackend::RestoreSnapshot(
@@ -698,6 +847,8 @@ void QwenMtpGpuDraftBackend::RestoreSnapshot(
   }
   executor_->RestoreSnapshot(*mtp_snapshot->gpu_snapshot);
   target_hidden_ = mtp_snapshot->target_hidden;
+  lookup_.Restore(mtp_snapshot->lookup);
+  lookup_proposal_ = false;
   // The draft table is not saved; it rebuilds from the next proposal's
   // sequence.
   if (draft_table_) {
@@ -714,13 +865,18 @@ void QwenMtpGpuDraftBackend::RestoreSnapshot(
 
 void QwenMtpGpuDraftBackend::RestorePersistentSnapshot(
     std::span<const std::uint8_t> payload) {
-  if (payload.size() < kMtpDraftPersistentHeaderBytes ||
+  const std::uint32_t version =
+      payload.size() >= kMtpDraftPersistentV1HeaderBytes
+          ? GetLittleEndian<std::uint32_t>(payload, 8)
+          : 0;
+  const std::size_t header_bytes = version == 1
+                                       ? kMtpDraftPersistentV1HeaderBytes
+                                       : kMtpDraftPersistentHeaderBytes;
+  if ((version != 1 && version != kMtpDraftPersistentVersion) ||
+      payload.size() < header_bytes ||
       !std::equal(kMtpDraftPersistentMagic.begin(),
                   kMtpDraftPersistentMagic.end(), payload.begin()) ||
-      GetLittleEndian<std::uint32_t>(payload, 8) !=
-          kMtpDraftPersistentVersion ||
-      GetLittleEndian<std::uint32_t>(payload, 12) !=
-          kMtpDraftPersistentHeaderBytes ||
+      GetLittleEndian<std::uint32_t>(payload, 12) != header_bytes ||
       GetLittleEndian<std::uint32_t>(payload, 36) != 0) {
     throw std::invalid_argument("MTP draft persistent header is invalid");
   }
@@ -752,7 +908,16 @@ void QwenMtpGpuDraftBackend::RestorePersistentSnapshot(
     throw std::invalid_argument(
         "MTP draft persistent metadata is incompatible");
   }
-  const std::size_t gpu_offset = kMtpDraftPersistentHeaderBytes;
+  // Lookup positions count committed tokens: one more than the draft rows.
+  Lookup::State lookup;
+  if (version >= 2)
+    lookup = {GetLittleEndian<std::uint32_t>(payload, 64),
+              GetLittleEndian<std::uint32_t>(payload, 68)};
+  if (!Lookup::Valid(lookup, std::size_t{valid_context} + (primed ? 1 : 0))) {
+    throw std::invalid_argument(
+        "MTP draft persistent lookup positions are invalid");
+  }
+  const std::size_t gpu_offset = header_bytes;
   const std::size_t hidden_offset =
       CheckedPersistentAdd(gpu_offset, gpu_payload_bytes);
   const std::size_t hidden_bytes = hidden_count * sizeof(std::uint32_t);
@@ -778,6 +943,8 @@ void QwenMtpGpuDraftBackend::RestorePersistentSnapshot(
   } else {
     std::ranges::fill(target_hidden_, 0.0F);
   }
+  lookup_.Restore(lookup);
+  lookup_proposal_ = false;
   if (draft_table_) {
     draft_table_->Forget();
   }
@@ -800,6 +967,8 @@ void QwenMtpGpuDraftBackend::Reset() noexcept {
   proposal_checkpoint_ = 0;
   primed_ = false;
   proposal_active_ = false;
+  lookup_.Clear();
+  lookup_proposal_ = false;
   last_error_.clear();
   if (draft_table_) {
     draft_table_->Forget();
@@ -811,6 +980,7 @@ void QwenMtpGpuDraftBackend::BeginRequest() noexcept {
   if (draft_table_) {
     draft_table_->Forget();
   }
+  lookup_.BeginRequest();
 }
 
 }  // namespace gufo::hip

@@ -48,6 +48,10 @@ struct DraftProposalRequest {
   float temperature{0.0F};
   std::uint64_t* rng_state{nullptr};
   const sampling::SamplerState* sampler{nullptr};
+  /// Bound for a proposal copied from the context (DraftProposal::from_lookup):
+  /// `0` or at least max_tokens. A copy costs no draft forward, only
+  /// verification rows, so a backend may copy further than it drafts.
+  std::uint32_t max_copy_tokens{0};
 };
 
 class IDraftBackendSnapshot {
@@ -107,6 +111,13 @@ public:
     (void)rng_state;
     throw std::logic_error(
         "draft backend does not support lossless sampled proposals");
+  }
+
+  /// Tokens a copied proposal may hold beyond the neural draft cap; `0` keeps
+  /// copies within it. The verifier passes the resulting bound as
+  /// DraftProposalRequest::max_copy_tokens.
+  [[nodiscard]] virtual std::uint32_t MaxCopyTokens() const noexcept {
+    return 0;
   }
 
   /// Returns true when ProposeSampled returns the exact proposal

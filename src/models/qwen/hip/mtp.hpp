@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN_HIP_MTP_HPP_
 #define GUFO_MODELS_QWEN_HIP_MTP_HPP_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "src/core/speculative/draft_backend.hpp"
+#include "src/core/speculative/prompt_lookup.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/mtp_draft_vocab.hpp"
 #include "src/models/qwen/mtp_reference.hpp"
@@ -32,6 +34,12 @@ inline constexpr std::uint32_t kMtpDefaultPrimeChunk = 1024;
 /// step's argmax without a host round trip; either `8` covers every supported
 /// per-request cap today.
 inline constexpr std::uint32_t kMtpMaxChainTokens = 8;
+
+/// Longest proposal copied from the session's own tokens (prompt lookup). A
+/// copy runs no draft forward, so it may exceed `--draft-tokens`; it is
+/// bounded by the eight-row verification chunk the 35B qualifies bit for bit
+/// against single-token decode.
+inline constexpr std::uint32_t kMtpMaxCopyTokens = 7;
 
 /// Immutable GPU-visible MTP layer weights. Current GGUF K-quant matrices are
 /// expanded once to BF16; the tied embedding and LM head remain shared with
@@ -71,6 +79,10 @@ public:
       const noexcept {
     return draft_specials_ ? std::span<const std::int32_t>(*draft_specials_)
                            : std::span<const std::int32_t>();
+  }
+  [[nodiscard]] const tokenization::QwenTokenizer& GetTokenizer()
+      const noexcept {
+    return target_model_->GetTokenizer();
   }
   /// Bytes of one output-head row; nonzero when HasDraftVocab().
   [[nodiscard]] std::size_t GetOutputRowBytes() const noexcept {
@@ -412,6 +424,16 @@ public:
     return true;
   }
 
+  [[nodiscard]] std::uint32_t MaxCopyTokens() const noexcept override {
+    return kMtpMaxCopyTokens;
+  }
+
+  /// Copies a continuation from the session's own tokens when its context
+  /// repeats one (prompt lookup), up to `max_copy_tokens`; otherwise drafts
+  /// with the MTP head as Propose or ProposeSampled do.
+  [[nodiscard]] speculative::DraftProposal ProposeForRequest(
+      const speculative::DraftProposalRequest& request) override;
+
   /// Batched greedy proposal across sessions, mirroring the DFlash2 backend
   /// contract: two to eight primed backends on one shared model, validated
   /// before any state changes, with per-session launch-free device chaining
@@ -459,6 +481,22 @@ private:
   [[nodiscard]] bool SyncDraftVocab(
       std::span<const tokenization::TokenId> tokens);
 
+  /// Prompt lookup as in the DFlash2 backend: a copy of at most `limit`
+  /// tokens, staged as the pending proposal, or nothing. Called once per
+  /// proposal, before any draft forward.
+  [[nodiscard]] std::optional<speculative::DraftProposal> TryLookup(
+      std::span<const tokenization::TokenId> tokens, std::uint32_t position,
+      std::uint32_t limit, bool sampled);
+  [[nodiscard]] speculative::DraftProposal ProposeChain(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t current_pos, std::uint32_t max_tokens);
+  [[nodiscard]] speculative::DraftProposal ProposeSampledChain(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
+      std::uint64_t* rng_state);
+  void CheckProposalStart(std::span<const tokenization::TokenId> prompt_tokens,
+                          std::uint32_t current_pos) const;
+
   std::unique_ptr<QwenMtpGpuExecutor> executor_;
   QwenMtpGpuDraftConfig config_;
   std::vector<float> target_hidden_;
@@ -469,6 +507,10 @@ private:
   tokenization::TokenId proposal_input_{0};
   std::uint32_t proposal_checkpoint_{0};
   std::optional<speculative::QwenMtpDraftTable> draft_table_;
+  std::array<tokenization::TokenId, 3> lookup_boundaries_{};
+  speculative::PromptLookup<tokenization::TokenId> lookup_;
+  std::size_t lookup_start_{0};
+  bool lookup_proposal_{false};
   bool primed_{false};
   bool proposal_active_{false};
   std::string last_error_;

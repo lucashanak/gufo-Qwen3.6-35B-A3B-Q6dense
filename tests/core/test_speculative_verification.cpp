@@ -1537,6 +1537,91 @@ void TestConcurrentDraftCapBoundsProposals() {
   }
 }
 
+void TestCopiedProposalsUseTheCopyBudget() {
+  using namespace gufo::speculative;
+  // Copies (from_lookup) may exceed the neural cap by the backend's copy
+  // budget; without one the verifier still rejects them as malformed.
+  class CopyDraft final : public IDraftBackend {
+  public:
+    explicit CopyDraft(std::uint32_t budget) : budget_(budget) {}
+    std::string_view Name() const noexcept override { return "copy fixture"; }
+    std::uint32_t MaxCopyTokens() const noexcept override { return budget_; }
+    DraftProposal Propose(std::span<const TokenId>, std::uint32_t,
+                          std::uint32_t) override {
+      throw std::logic_error("the fixture only copies");
+    }
+    DraftProposal ProposeForRequest(
+        const DraftProposalRequest& request) override {
+      limits.push_back({request.max_tokens, request.max_copy_tokens});
+      DraftProposal result;
+      result.start_pos = request.position;
+      result.from_lookup = true;
+      result.tokens.assign(5, 1U);
+      return result;
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> limits;
+
+  private:
+    std::uint32_t budget_;
+  };
+  for (const std::size_t sessions : {std::size_t{1}, std::size_t{2}}) {
+    for (const std::uint32_t budget : {0U, 5U}) {
+      SpeculativeOptions options;
+      options.max_draft_tokens = options.initial_draft_tokens = 2;
+      options.enable_adaptive_draft_length = false;
+      options.use_batched_verification = true;
+      std::vector<std::unique_ptr<SampledTargetExecutor>> targets;
+      std::vector<std::unique_ptr<SpeculativeVerifier>> verifiers;
+      std::vector<const CopyDraft*> drafts;
+      std::vector<gufo::sampling::SamplerState> samplers;
+      samplers.reserve(sessions);
+      std::vector<TokenId> sequence{0};
+      TokenId first = 0;
+      for (std::size_t index = 0; index < sessions; ++index) {
+        targets.push_back(std::make_unique<SampledTargetExecutor>(
+            std::vector<float>{-INFINITY, 0.0F, -INFINITY}, true));
+        auto draft = std::make_unique<CopyDraft>(budget);
+        drafts.push_back(draft.get());
+        verifiers.push_back(std::make_unique<SpeculativeVerifier>(
+            *targets.back(), std::move(draft), options));
+        first = verifiers.back()->Prime(std::span(sequence).first(1));
+      }
+      sequence.push_back(first);
+      for (std::size_t index = 0; index < sessions; ++index)
+        samplers.emplace_back(gufo::sampling::SamplingConfig{}, sequence);
+      const auto position = static_cast<std::uint32_t>(sequence.size() - 1);
+      std::vector<SpeculativeVerifier::StepRequest> requests;
+      for (std::size_t index = 0; index < sessions; ++index)
+        requests.push_back({*verifiers[index], sequence, position,
+                            sequence.back(), 99U, 64U, samplers[index]});
+      bool rejected = false;
+      std::vector<SpeculativeVerifier::StepResult> results;
+      try {
+        results = SpeculativeVerifier::VerifyBatch(requests);
+      } catch (const std::runtime_error&) {
+        rejected = true;
+      }
+      if (budget == 0) {
+        Expect(rejected, "a copy past the draft cap needs a copy budget");
+        continue;
+      }
+      Expect(!rejected, "a copy within the copy budget is verified");
+      for (std::size_t index = 0; index < sessions; ++index) {
+        Expect(
+            drafts[index]->limits ==
+                std::vector<std::pair<std::uint32_t, std::uint32_t>>{{2U, 5U}},
+            "the request carries both the draft cap and the copy budget");
+        Expect(results[index].draft_count == 5 &&
+                   results[index].accepted_count == 5 &&
+                   results[index].lookup_tokens == 5,
+               "a copy is verified at its full length");
+        Expect(verifiers[index]->GetCurrentDraftLength() == 2,
+               "a copy past the cap leaves the neural length alone");
+      }
+    }
+  }
+}
+
 int main() {
   TestSpeculativeDraftBackendInterface();
   TestSpeculativeStats();
@@ -1560,6 +1645,7 @@ int main() {
   TestConstrainedGreedyVerification();
   TestConcurrentVerificationChunks();
   TestConcurrentDraftCapBoundsProposals();
+  TestCopiedProposalsUseTheCopyBudget();
   TestPersistentVerifierSnapshotRoundTrip();
   std::cout << "All speculative verification tests passed.\n";
   return 0;

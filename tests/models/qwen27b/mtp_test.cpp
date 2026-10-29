@@ -699,6 +699,126 @@ int main(int argc, const char* const* argv) {
       }
     }
 
+    {
+      // Prompt lookup: once a request has repeated 12 tokens of a passage in
+      // its prompt, MTP copies the passage's continuation, longer than its
+      // two-token draft. Batched proposals copy as serial ones do, accepted
+      // copies feed the draft back, and snapshots keep the copy state.
+      using Token = gufo::tokenization::TokenId;
+      using Backend = gufo::hip::QwenMtpGpuDraftBackend;
+      constexpr std::size_t kPassage = 32;
+      std::vector<Token> passage(kPassage);
+      for (std::size_t index = 0; index < kPassage; ++index)
+        passage[index] = static_cast<Token>(1000 + 7 * index);
+      std::vector<Token> prompt{5};
+      prompt.insert(prompt.end(), passage.begin(), passage.end());
+      const gufo::hip::QwenMtpGpuDraftConfig lookup_config{
+          .max_context = 128,
+          .max_draft_tokens = 2,
+      };
+      std::vector<float> lookup_hidden;
+      for (std::size_t row = 0; row < prompt.size(); ++row)
+        lookup_hidden.insert(lookup_hidden.end(), target_hidden.begin(),
+                             target_hidden.end());
+      const gufo::speculative::DraftTargetContext lookup_context{
+          .prompt_tokens = prompt,
+          .prompt_hidden_states = lookup_hidden,
+          .hidden_size = target_hidden.size(),
+          .first_token = passage[0],
+      };
+      const auto create = [&] {
+        auto backend = Backend::Create(mtp_model, lookup_config, &error);
+        Expect(backend != nullptr, error);
+        Expect(backend->PrimeTargetContext(lookup_context),
+               backend->GetLastError());
+        backend->BeginRequest();
+        return backend;
+      };
+      std::array<std::unique_ptr<Backend>, 2> serial{create(), create()};
+      std::array<std::unique_ptr<Backend>, 2> batched{create(), create()};
+      const auto request_for = [](Backend& backend,
+                                  std::span<const Token> tokens) {
+        return gufo::speculative::DraftProposalRequest{
+            .backend = &backend,
+            .tokens = tokens,
+            .position = static_cast<std::uint32_t>(tokens.size() - 1),
+            .max_tokens = 2,
+            .max_copy_tokens = gufo::hip::kMtpMaxCopyTokens,
+        };
+      };
+      // Commits `accepted` proposed tokens and the next passage token.
+      const auto commit = [&](Backend& backend, std::size_t accepted,
+                              std::span<const Token> proposal,
+                              Token correction) {
+        for (std::size_t row = 0; row <= accepted; ++row)
+          backend.UpdateTargetHidden(target_hidden);
+        backend.AcceptFeedback(proposal.first(accepted), correction);
+      };
+      std::vector<Token> sequence = prompt;
+      sequence.push_back(passage[0]);
+      std::size_t next = 1;
+      bool copied = false;
+      while (!copied && next + gufo::hip::kMtpMaxCopyTokens < kPassage) {
+        const std::array requests{request_for(*batched[0], sequence),
+                                  request_for(*batched[1], sequence)};
+        const auto proposals = batched[0]->ProposeBatch(requests);
+        Expect(proposals.size() == 2, "MTP lookup batch size");
+        for (std::size_t index = 0; index < 2; ++index) {
+          const auto expected = serial[index]->ProposeForRequest(
+              request_for(*serial[index], sequence));
+          Expect(proposals[index].tokens == expected.tokens &&
+                     proposals[index].from_lookup == expected.from_lookup,
+                 "MTP batched copies must match the serial path");
+        }
+        copied = proposals[0].from_lookup;
+        // Accept a copy whole; reject neural drafts so the request keeps
+        // repeating the passage.
+        const std::size_t accepted =
+            copied ? proposals[0].tokens.size() : std::size_t{0};
+        if (copied) {
+          Expect(proposals[0].tokens.size() == gufo::hip::kMtpMaxCopyTokens,
+                 "MTP copies past its draft cap");
+          Expect(std::ranges::equal(proposals[0].tokens,
+                                    std::span(passage).subspan(next, accepted)),
+                 "MTP copies the passage's continuation");
+          Expect(sequence.size() - prompt.size() >=
+                     gufo::speculative::PromptLookup<Token>::kMinMatch,
+                 "MTP copies only after a full greedy match");
+        }
+        const auto correction = passage[next + accepted];
+        for (std::size_t index = 0; index < 2; ++index) {
+          commit(*serial[index], accepted, proposals[index].tokens, correction);
+          commit(*batched[index], accepted, proposals[index].tokens,
+                 correction);
+        }
+        sequence.insert(sequence.end(), proposals[0].tokens.begin(),
+                        proposals[0].tokens.begin() +
+                            static_cast<std::ptrdiff_t>(accepted));
+        sequence.push_back(correction);
+        next += accepted + 1;
+      }
+      Expect(copied, "MTP must copy a repeated passage");
+
+      // A restored draft copies exactly as the original does next.
+      const auto snapshot = serial[0]->Snapshot();
+      auto restored = create();
+      restored->RestoreSnapshot(*snapshot);
+      std::vector<std::uint8_t> persistent(snapshot->PersistentPayloadBytes());
+      Expect(snapshot->SerializePersistent(persistent) == persistent.size(),
+             "MTP lookup persistent payload size");
+      auto reloaded = create();
+      reloaded->RestorePersistentSnapshot(persistent);
+      const auto expected =
+          serial[0]->ProposeForRequest(request_for(*serial[0], sequence));
+      for (auto* backend : {restored.get(), reloaded.get()}) {
+        const auto actual =
+            backend->ProposeForRequest(request_for(*backend, sequence));
+        Expect(actual.tokens == expected.tokens &&
+                   actual.from_lookup == expected.from_lookup,
+               "MTP snapshots must keep the copy state");
+      }
+    }
+
     draft_backend->Reset();
 
     std::cout << "qwen_mtp_gpu_test: token=" << token

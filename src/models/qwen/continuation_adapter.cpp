@@ -46,7 +46,8 @@ static_assert(sizeof(DraftMetadata) <= kContinuationMetadataBytes);
 // MTP's cache holds a row for every committed token but the last, so its rows
 // trail the target position by one once primed; an unprimed draft has none.
 struct MtpMetadata {
-  std::uint32_t version{1}, primed{}, rows{};
+  std::uint32_t version{2}, primed{}, rows{};
+  speculative::PromptLookup<tokenization::TokenId>::State lookup;
 };
 static_assert(sizeof(MtpMetadata) <= kContinuationMetadataBytes);
 bool IsMtpRows(ContinuationPart part) {
@@ -726,6 +727,7 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     MtpMetadata metadata{};
     metadata.primed = state.mtp->primed_;
     metadata.rows = state.mtp->executor_->GetNextPosition();
+    metadata.lookup = state.mtp->lookup_.Save();
     std::memcpy(host.data(), &metadata, sizeof(metadata));
     source = host.data();
     is_host = true;
@@ -1115,15 +1117,22 @@ bool ContinuationAdapter::Validate(
             state.expected[i].valid_rows != mtp_metadata.rows)
           return refuse();
       auto& mtp = *state.mtp;
-      if (mtp_metadata.version != 1 || mtp_metadata.primed > 1 ||
-          mtp_metadata.rows > metadata.position ||
+      if ((mtp_metadata.version != 1 && mtp_metadata.version != 2) ||
+          mtp_metadata.primed > 1 || mtp_metadata.rows > metadata.position ||
           (!mtp_metadata.primed && mtp_metadata.rows) ||
           state.mtp_hidden.size() != mtp.target_hidden_.size() * sizeof(float))
+        return refuse();
+      if (mtp_metadata.version == 1)
+        mtp_metadata.lookup = {};
+      if (!speculative::PromptLookup<tokenization::TokenId>::Valid(
+              mtp_metadata.lookup, metadata.position))
         return refuse();
       std::memcpy(mtp.target_hidden_.data(), state.mtp_hidden.data(),
                   state.mtp_hidden.size());
       mtp.executor_->next_position_ = mtp_metadata.rows;
       mtp.primed_ = mtp_metadata.primed;
+      mtp.lookup_.Restore(mtp_metadata.lookup);
+      mtp.lookup_proposal_ = false;
       mtp.proposal_active_ = false;
       mtp.proposed_tokens_.clear();
       mtp.proposal_target_hidden_.clear();

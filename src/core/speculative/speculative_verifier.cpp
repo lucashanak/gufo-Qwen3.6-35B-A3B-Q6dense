@@ -411,6 +411,7 @@ struct SpeculativeVerifier::PreparedStep {
   bool capture_logits{false};
   bool target_only{false};
   std::uint32_t max_draft_tokens{0};
+  std::uint32_t max_copy_tokens{0};
   std::size_t chunk_limit{std::numeric_limits<std::size_t>::max()};
   std::size_t verified_rows{0};
   std::size_t accepted_count{0};
@@ -472,6 +473,9 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
     PrepareTargetOnlyStep(prepared, request, defer_target_only);
     return prepared;
   }
+  prepared.max_copy_tokens = std::max(prepared.max_draft_tokens,
+                                      std::min(draft_backend_->MaxCopyTokens(),
+                                               request.max_emitted_tokens - 1));
   if (defer_proposal)
     return prepared;
   auto& working_sampler =
@@ -481,7 +485,7 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
        prepared.max_draft_tokens,
        prepared.random_sampling ? request.sampler.config().temperature : 0.0F,
        prepared.random_sampling ? working_sampler.mutable_rng_state() : nullptr,
-       &working_sampler});
+       &working_sampler, prepared.max_copy_tokens});
   PrepareProposalVerification(prepared, request, defer_target_only);
   return prepared;
 }
@@ -529,7 +533,8 @@ void SpeculativeVerifier::PrepareProposalVerification(
     return;
   }
   const std::size_t num_draft = proposal.tokens.size();
-  if (num_draft > prepared.max_draft_tokens ||
+  if (num_draft > (proposal.from_lookup ? prepared.max_copy_tokens
+                                        : prepared.max_draft_tokens) ||
       proposal.start_pos != request.position) {
     throw std::runtime_error("draft backend returned a malformed proposal");
   }
@@ -817,7 +822,9 @@ SpeculativeVerifier::ProcessVerificationChunk(
   stats_.total_accepted_tokens += accepted_count;
   ++stats_.total_verification_steps;
   stats_.total_emitted_tokens += result.emitted_tokens.size();
-  UpdateAdaptiveDraftLength(accepted_count, num_draft);
+  // A copy longer than the neural cap says nothing about the neural length.
+  if (num_draft <= prepared.max_draft_tokens)
+    UpdateAdaptiveDraftLength(accepted_count, num_draft);
   if (prepared.sampled)
     sampler.SetRngState(working_sampler.rng_state());
   draft_backend_->AcceptFeedback(std::span<const tokenization::TokenId>(
@@ -877,7 +884,7 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
            step.max_draft_tokens,
            step.random_sampling ? request.sampler.config().temperature : 0.0F,
            step.random_sampling ? sampler.mutable_rng_state() : nullptr,
-           &sampler});
+           &sampler, step.max_copy_tokens});
     }
   }
   if (!draft_requests.empty()) {

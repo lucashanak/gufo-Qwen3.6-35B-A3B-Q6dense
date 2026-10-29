@@ -79,6 +79,14 @@ own rarer tokens. A request that keeps bringing new rare tokens drafts over the
 full head. Only proposals change; the target still verifies over the full
 vocabulary.
 
+When the context repeats a passage, MTP copies its continuation instead of
+drafting (prompt lookup, as DFlash2 and Flash-Next do): code rewrites, quoted
+tool output, repeated identifiers. A copy runs no draft forward, so it may
+hold up to 7 tokens whatever `--draft-tokens` is; the target verifies every
+copied token, so greedy output stays bit-exact against AR. The match rules
+are the shared `PromptLookup` ones: 12 matching tokens for greedy requests,
+24 for sampled ones, which copy only from their prompt.
+
 ### Speculative decoding (DFlash2)
 
 A Q8_0 conversion of
