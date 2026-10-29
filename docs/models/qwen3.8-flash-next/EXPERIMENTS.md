@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next experiments
 
+## Decode shared expert on the side stream (October 29, 2026)
+
+Upstream `main` 34ebb5fe against the branch, Strix Halo (ROCm 7.2.4), UD-Q4_K_XL + shared Q8_0 MTP, `gufo serve --sessions 1 --context 65536`, greedy, thinking off, five fixed prompts (CPU caches, a Python red-black tree, TCP congestion control, Czech railway history, a C++ ISO 8601 parser) of 384 generated tokens; one server process per arm, means of the five decode rates. The first process after another workload reads cold PLE rows and runs 2-4% slower, so every hold started with a discarded warm-up and main ran before and after the candidates.
+
+| Experiment | Outcome |
+| --- | --- |
+| Fork a single decode row's Q8_0 shared expert onto #758's side stream before the router; `MoeExperts` joins it before the epilogue | Inconclusive: replies byte-identical; AR 28.81/29.38 (main before/after) against 29.64 and 29.18 tok/s, MTP 49.4/50.2 against 50.3. On a downstream recipe CLI AR tg256 rose 40.32 → 41.1 (+1.9%). Forking 2-8 verification rows too: −0.8% MTP there. |
+
 ## Chunked DeltaNet removed (October 27, 2026)
 
 The release-tier functional `tool-reasoning` suite failed in both MTP and AR

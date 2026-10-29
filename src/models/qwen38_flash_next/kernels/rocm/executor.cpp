@@ -918,8 +918,10 @@ Executor::~Executor() {
     if (event != nullptr)
       (void)hipEventDestroy(event);
   }
-  if (side_stream_ != nullptr)
+  if (side_stream_ != nullptr) {
+    qfn_mmq_release_stream(side_stream_);
     (void)hipStreamDestroy(side_stream_);
+  }
   if (stream_ != nullptr) {
     qfn_mmq_release_stream(stream_);
     (void)hipStreamDestroy(stream_);
@@ -2681,6 +2683,67 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                    bool last_only) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
+  const auto shared_expert = [&] {
+    shexp_half_ready_ = false;
+    if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                    &l.shexp_down, error_msg)) {
+      return false;
+    }
+    if (shexp_half_ready_) {
+      shexp_half_ready_ = false;
+      if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
+                        n_tokens, l.shexp_down.rows, l.shexp_down.cols,
+                        stream_)) {
+        AssignError(error_msg, "shared expert F16 GEMM failed");
+        return false;
+      }
+      return true;
+    }
+    return Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg);
+  };
+  // Only the Q8_0 shared expert overlaps: its kernels take stream_, while
+  // the BF16, F16 and F32 routes go through BLAS handles bound to the main
+  // stream.
+  const bool q8_shexp = l.shexp_gate.type == GgmlType::kQ8_0 &&
+                        l.shexp_up.type == GgmlType::kQ8_0 &&
+                        l.shexp_down.type == GgmlType::kQ8_0;
+  const hipStream_t main = stream_;
+  // Forks the shared expert onto the side stream; MoeExperts joins it before
+  // the epilogue reads shexp_out (JoinSide).
+  const auto fork_shared_expert = [&] {
+    if (!Check(hipEventRecord(side_start_, main), "side stream fork",
+               error_msg) ||
+        !Check(hipStreamWaitEvent(side_stream_, side_start_, 0),
+               "side stream wait", error_msg)) {
+      return false;
+    }
+    stream_ = side_stream_;
+    const bool ok = shared_expert();
+    stream_ = main;
+    if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
+               error_msg)) {
+      // Nothing to join: wait for the whole side stream instead.
+      (void)hipStreamSynchronize(side_stream_);
+      return false;
+    }
+    side_pending_ = true;
+    return ok;
+  };
+  // Every exit, including errors, orders the main stream after the shared
+  // expert: its side-stream writes must not race the next pass.
+  struct JoinGuard {
+    const Executor* executor;
+    ~JoinGuard() { (void)executor->JoinSide(nullptr); }
+  } join_guard{this};
+  // A single decode row's shared expert needs only x. Its three
+  // latency-bound launches (gated GEMV, quantization, down GEMV) run on the
+  // side stream beside the router, top-k and routed experts. Verification
+  // rows keep one stream: forking their grouped launches slowed MTP decode.
+  const bool fork =
+      n_tokens == 1 && !last_only && out == s_.block_out && q8_shexp;
+  if (fork && !fork_shared_expert()) {
+    return false;
+  }
   // Router logits and the shared-expert gate come out of one GEMM.
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
@@ -2706,60 +2769,11 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // which leave compute idle while they stream expert weights. The shared
   // expert writes its own scratch and may quantize x into s_.x_q8t, so no
   // main-stream work may use s_.x_q8t before JoinSide.
-  // Only the Q8_0 shared expert overlaps: its kernels take stream_, while
-  // the BF16, F16 and F32 routes go through BLAS handles bound to the main
-  // stream.
-  const bool overlap = ExpertMatrixRows(n_tokens) && !last_only &&
-                       l.shexp_gate.type == GgmlType::kQ8_0 &&
-                       l.shexp_up.type == GgmlType::kQ8_0 &&
-                       l.shexp_down.type == GgmlType::kQ8_0;
-  const hipStream_t main = stream_;
-  if (overlap) {
-    if (!Check(hipEventRecord(side_start_, main), "side stream fork",
-               error_msg) ||
-        !Check(hipStreamWaitEvent(side_stream_, side_start_, 0),
-               "side stream wait", error_msg)) {
+  if (!fork) {
+    const bool overlap = ExpertMatrixRows(n_tokens) && !last_only && q8_shexp;
+    if (!(overlap ? fork_shared_expert() : shared_expert())) {
       return false;
     }
-    stream_ = side_stream_;
-  }
-  const auto shared_expert = [&] {
-    shexp_half_ready_ = false;
-    if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
-                    &l.shexp_down, error_msg)) {
-      return false;
-    }
-    if (shexp_half_ready_) {
-      shexp_half_ready_ = false;
-      if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
-                        n_tokens, l.shexp_down.rows, l.shexp_down.cols,
-                        stream_)) {
-        AssignError(error_msg, "shared expert F16 GEMM failed");
-        return false;
-      }
-      return true;
-    }
-    return Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg);
-  };
-  const bool shared_ok = shared_expert();
-  stream_ = main;
-  if (overlap) {
-    if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
-               error_msg)) {
-      // Nothing to join: wait for the whole side stream instead.
-      (void)hipStreamSynchronize(side_stream_);
-      return false;
-    }
-    side_pending_ = true;
-  }
-  // Every exit, including errors, orders the main stream after the shared
-  // expert: its side-stream writes must not race the next pass.
-  struct JoinGuard {
-    const Executor* executor;
-    ~JoinGuard() { (void)executor->JoinSide(nullptr); }
-  } join_guard{this};
-  if (!shared_ok) {
-    return false;
   }
   if (last_only && l.ffn_gate_exps.type == GgmlType::kQ8_0 &&
       l.ffn_up_exps.type == GgmlType::kQ8_0 &&
