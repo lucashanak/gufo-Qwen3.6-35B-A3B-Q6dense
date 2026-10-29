@@ -76,7 +76,8 @@ enum class TiedBlocks { kPrefix, kSuffix };
 bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
          bool zero_queries = false, std::uint32_t tied_high_blocks = 0,
          bool sample_scores = false, ScoreLayout layout = ScoreLayout::kTight,
-         TiedBlocks tied_blocks = TiedBlocks::kPrefix) {
+         TiedBlocks tied_blocks = TiedBlocks::kPrefix,
+         float query_scale = 1.0F) {
   const std::uint32_t max_context = start_pos + n_tokens + 64;
   const std::uint32_t blocks_needed = (max_context + kRatio - 1) / kRatio;
   const std::uint32_t mask_words = (blocks_needed + 31) / 32;
@@ -87,7 +88,7 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
   // Zero queries make every score tie at zero: the budget must then fill
   // in index order.
   auto qv = zero_queries ? std::vector<float>(q_count, 0.0F)
-                         : MakeValues(q_count, seed, 1.0F);
+                         : MakeValues(q_count, seed, query_scale);
   auto blocks = MakeValues(static_cast<std::size_t>(max_blocks) * kDim,
                            seed ^ 0x9999U, 1.0F);
   if (tied_high_blocks != 0) {
@@ -125,6 +126,8 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
   }
   // Reusing bounded score scratch must retain absolute query positions and
   // causal masks, including a ragged chunk and a different padded stride.
+  // A 31-row chunk also moves every query within its four-query score tile:
+  // each score must keep its bits.
   constexpr std::uint32_t chunk = 31;
   const auto compact_stride = ((start_pos + n_tokens) / kRatio + 31) / 32 * 32;
   float* d_chunk_scores = nullptr;
@@ -138,6 +141,17 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
                     count, d_pos, first, kHeads, kDim, kRatio, kBudget,
                     mask_words, compact_stride, nullptr,
                     (start_pos + first + count) / kRatio);
+    const auto part =
+        Download(d_chunk_scores, std::size_t{count} * compact_stride);
+    for (std::uint32_t r = 0; r < count; ++r) {
+      const std::uint32_t complete = (start_pos + first + r + 1) / kRatio;
+      if (complete <= kBudget)
+        continue;
+      if (std::memcmp(part.data() + std::size_t{r} * compact_stride,
+                      scores.data() + std::size_t{first + r} * max_blocks,
+                      complete * sizeof(float)) != 0)
+        throw std::runtime_error("a score depends on its place in the launch");
+    }
   }
   if (Download(d_mask, mask.size()) != mask) {
     throw std::runtime_error("chunked selection changed the mask");
@@ -165,31 +179,21 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
       if (sample_scores && b % 1024 != 0 && b + 1 != complete)
         continue;
       double total = 0.0;
-      float rounded_total = 0.0F;
       for (std::uint32_t h = 0; h < kHeads; ++h) {
         double dot = 0.0;
-        std::array<float, 32> partial{};
         for (std::uint32_t i = 0; i < kDim; ++i) {
           const auto query =
               qv[(static_cast<std::size_t>(t) * kHeads + h) * kDim + i];
           const auto key =
               __half2float(blocks_half[static_cast<std::size_t>(b) * kDim + i]);
           dot += static_cast<double>(query) * key;
-          partial[i % 32] = std::fma(query, key, partial[i % 32]);
         }
         total += std::max(dot, 0.0);
-        for (unsigned delta = 16; delta; delta >>= 1)
-          for (unsigned lane = 0; lane < delta; ++lane)
-            partial[lane] += partial[lane + delta];
-        rounded_total += std::max(partial[0], 0.0F);
       }
       const float got = scores[static_cast<std::size_t>(t) * max_blocks + b];
-      // A loose numerical tolerance cannot detect exchanges at the top-k
-      // boundary. Keep the established F32 reduction as well as the FP64
-      // formula check below when changing kernel layout.
-      if (got != rounded_total)
-        throw std::runtime_error("selector changed the F32 reduction");
-      const double err = std::abs(total - got) / std::max(1.0, total);
+      // Relative to the score, or to the query scale for scores near zero.
+      const double err =
+          std::abs(total - got) / std::max<double>(query_scale, total);
       worst_score = std::max(worst_score, err);
     }
     // Selection contract on the GPU's own scores: the budget highest,
@@ -218,15 +222,17 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
     }
   }
   std::cout << "block selection n=" << n_tokens << " start=" << start_pos
-            << ": worst score error " << worst_score << ", mask mismatches "
-            << mismatches << '\n';
+            << " query scale " << query_scale << ": worst score error "
+            << worst_score << ", mask mismatches " << mismatches << '\n';
   (void)hipFree(d_q);
   (void)hipFree(d_blocks);
   (void)hipFree(d_pos);
   (void)hipFree(d_mask);
   (void)hipFree(d_scores);
   // F32 queries against the stored F16 keys, independently scored in F64.
-  return worst_score < 1e-5 && mismatches == 0;
+  // The bound matches the former per-lane F32 FMA scorer (1.2e-6 worst);
+  // one WMMA chain over all eight steps measured 1e-5.
+  return worst_score < 3e-6 && mismatches == 0;
 }
 
 void CheckQueryPrecisionBoundary() {
@@ -310,6 +316,33 @@ void CheckPositionPastRows() {
   CheckHip(hipFree(dk), "free position keys");
   std::cout << "block selection past " << max_blocks
             << " score slots: rows and guards kept\n";
+}
+
+/// Query elements past F16's range must keep their head's score finite:
+/// an infinite F16 head and remainder would sum to NaN, which ReLU turns
+/// into zero, silently dropping the head.
+void CheckQueryOverflow() {
+  constexpr unsigned blocks = kBudget + 1, words = (blocks + 31) / 32;
+  std::vector<float> queries(kHeads * kDim, 0);
+  queries[0] = 1e5F;          // head 0: an F16 head of 65504 plus 34496
+  queries[kDim + 1] = 3e38F;  // head 1: far past both F16 parts
+  std::vector<__half> keys(blocks * kDim, __float2half(0));
+  keys[0] = __float2half(1);
+  keys[kDim + 1] = __float2half(1);
+  auto* dq = Upload(queries);
+  auto* dk = Upload(keys);
+  auto* dp = Upload(std::vector<unsigned>{blocks * kRatio - 1});
+  auto* dm = Upload(std::vector<unsigned>(words, 0));
+  auto* ds = Upload(std::vector<float>(blocks, 0));
+  q::SelectBlocks(dq, dk, dm, ds, 1, dp, 0, kHeads, kDim, kRatio, kBudget,
+                  words, blocks, nullptr);
+  const auto scores = Download(ds, 2);
+  if (scores[0] != 1e5F || !std::isfinite(scores[1]) || scores[1] < 65504.0F)
+    throw std::runtime_error("a query past the F16 range lost its head");
+  for (void* p :
+       {static_cast<void*>(dq), static_cast<void*>(dk), static_cast<void*>(dp),
+        static_cast<void*>(dm), static_cast<void*>(ds)})
+    CheckHip(hipFree(p), "free overflow probe");
 }
 
 void CheckPooling(unsigned start, unsigned capacity, float factor = 1.0F) {
@@ -413,12 +446,18 @@ int main() {
   try {
     CheckQueryPrecisionBoundary();
     CheckPositionPastRows();
+    CheckQueryOverflow();
     CheckPooling(29, 64);
     CheckPooling(29, 16);     // batch wraps the raw-key ring
     CheckPooling(65533, 16);  // many wraps; absolute rotary position retained
     CheckPooling(65533, 16, 2.5F);
     bool ok = true;
     ok = Run(100, 20000, 0x1234ABCDU) && ok;  // deep, ragged group
+    // Small queries: the split's F16 remainder must not lose the F32
+    // precision the scores keep at unit scale.
+    ok = Run(100, 20000, 0x1234ABCDU, false, 0, false, ScoreLayout::kTight,
+             TiedBlocks::kPrefix, 1e-3F) &&
+         ok;
     ok = Run(7, 131069, 0x2468ACE0U) && ok;
     ok = Run(257, 131069, 0xC0FFEE01U, false, 0, true, ScoreLayout::kAligned) &&
          ok;

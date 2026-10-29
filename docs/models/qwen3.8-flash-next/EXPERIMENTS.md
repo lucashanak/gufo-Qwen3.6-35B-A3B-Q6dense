@@ -1,5 +1,12 @@
 # Qwen3.8 Flash-Next experiments
 
+## Indexer scores on the matrix cores (October 23, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| Indexer block scores on the matrix cores | Retained; scores past the 2,048-token budget change in their last bits. Each F32 query element splits into an F16 head and its F16 remainder; four queries × four heads fill a 16-row tile, 16 queries per block share each key tile through LDS, and each 16-dim step keeps its own partial, summed pairwise (one chain over the eight steps measured 1e-5 FP64 error, the per-lane F32 FMA scorer 1.2e-6, this one 1.7e-6). Scores are bit-identical across launch widths and positions (`select_ops`, 31-row chunks). The VALU scorer ran at about 88% of single-issue VALU peak: hoisting key widening, eight queries per thread or opaque F32 keys for dual-issue FMAs all moved query loads to VMEM and were 2–3× slower. Per layer and 4,096-token pass: 4.42 → 3.36 ms at d28K, 9.13 → 6.64 ms at d61K. |
+| Scorer range and order guards | Retained. `reassociate(off) contract(off)` in the scorer (`select_ops` scores bit-identical with and without). The head/remainder split lost bits below 1/2 (queries ×1e-3: 6e-4 FP64 error, ×1e-4: 7e-3) and turned heads past 65504 into NaN, then a ReLU zero; a head whose largest element lies outside [1/2, 65504) now scales by a power of two to [1, 2) and back exactly (×1e-6..1e30 all 1.5–2.1e-6; in-range scores bit-identical; RMS-normed queries never scale). Decode keeps the same scorer: AR tg128, two alternating runs, d16K 37.8 → 37.4 (noise), d32K 38.6 → 38.6 tok/s. |
+
 ## Chunked DeltaNet removed (October 27, 2026)
 
 The release-tier functional `tool-reasoning` suite failed in both MTP and AR

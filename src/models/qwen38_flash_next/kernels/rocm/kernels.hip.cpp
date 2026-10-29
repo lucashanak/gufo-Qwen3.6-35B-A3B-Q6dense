@@ -2563,10 +2563,8 @@ __device__ __forceinline__ v8f WmmaBf16(v16h a, v16h b, v8f c) {
       __builtin_bit_cast(v16bf, a), __builtin_bit_cast(v16bf, b), c);
 }
 
-// Keep indexer queries in F32: narrowing them before ranking can swap blocks
-// at the selection boundary. A thread scores one key, reusing it across all
-// four heads. Preserve the original wave32 F32 accumulation and reduction
-// tree: even tiny changes can exchange blocks at the top-k boundary.
+// Keep indexer queries at F32 precision: narrowing them before ranking can
+// swap blocks at the selection boundary (see SelectScoreWmmaKernel).
 constexpr std::uint32_t kSelectHeads = 4;
 constexpr std::uint32_t kSelectDim = 128;
 
@@ -2581,65 +2579,186 @@ __device__ __forceinline__ v16h LoadFrag(const __half* p) {
   return cvt.f;
 }
 
-__global__ void SelectScoreKernel(const float* q, const __half* blocks,
-                                  float* scores, std::uint32_t n_tokens,
-                                  const std::uint32_t* start_pos,
-                                  std::uint32_t first_token,
-                                  std::uint32_t ratio, std::uint32_t budget,
-                                  std::uint32_t max_blocks) {
-#pragma clang fp reassociate(off)
-  const auto t0 = blockIdx.x;
-  const auto complete = (*start_pos + first_token + t0 + 1) / ratio;
-  const auto b = blockIdx.y * blockDim.x + threadIdx.x;
-  // The position comes from the device, the row size from the host: a block
-  // past max_blocks has no score slot in this row.
-  if (t0 >= n_tokens || complete <= budget || b >= complete || b >= max_blocks)
+/// Indexer scores on the matrix cores. A 16-row A tile holds four queries x
+/// four heads; each F32 query element is split into an F16 head and the F16
+/// rounding of its remainder, so the products keep about 22 significant bits
+/// against the stored F16 keys. Every (query, block) score is accumulated in
+/// one fixed order (per 16-dim step: remainder, then head part; the eight
+/// step partials summed pairwise; heads summed 0..3 after ReLU), independent
+/// of the query's place in the launch, the launch width and the block's
+/// tile. The split keeps those bits only well inside F16's range: a head
+/// whose largest element lies outside [1/2, 65504) is scaled by a power of
+/// two to [1, 2) and its dot product scaled back exactly (heads inside the
+/// range keep every bit). A block scores kSelectGroups tiles of queries
+/// (staged in LDS) against each key tile it loads; each wave takes 16
+/// blocks per step, `steps` steps.
+constexpr std::uint32_t kSelectGroups = 4;
+__launch_bounds__(256) __global__ void SelectScoreWmmaKernel(
+    const float* __restrict__ q, const __half* __restrict__ blocks,
+    float* __restrict__ scores, std::uint32_t n_tokens,
+    const std::uint32_t* start_pos, std::uint32_t first_token,
+    std::uint32_t ratio, std::uint32_t budget, std::uint32_t max_blocks,
+    std::uint32_t steps) {
+  // The pairwise step and head sums below are unrolled per query slot;
+  // under fast-math a slot (the query's offset from the pass start) must
+  // not be able to change their association or contraction.
+#pragma clang fp reassociate(off) contract(off)
+  constexpr std::uint32_t kGroup = 16 / kSelectHeads;  // queries per tile
+  constexpr std::uint32_t kKSteps = kSelectDim / 16;
+  constexpr std::uint32_t kQueries = kGroup * kSelectGroups;
+  // [tile][k step][head part, remainder][row]: one fragment per row.
+  __shared__ v16h q_lds[kSelectGroups][kKSteps][2][16];
+  // [tile][row % 2][row / 2]: the power of two undoing a row's scale.
+  __shared__ float q_unscale[kSelectGroups][2][8];
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t wave = threadIdx.x >> 5;
+  const std::uint32_t sub = lane & 15u;
+  const std::uint32_t first = blockIdx.x * kQueries;
+  const std::uint32_t last = min(n_tokens, first + kQueries) - 1;
+  const std::uint32_t base = *start_pos + first_token;
+  // The block's last query sees the most complete blocks.
+  const std::uint32_t widest = (base + last + 1) / ratio;
+  if (widest <= budget)
     return;
-  // Load both stored halves together. Unpacking preserves their exact F32
-  // values while avoiding a separate narrow memory load for each component.
-  std::uint32_t key[kSelectDim / 2];
+  const std::uint32_t block0 = blockIdx.y * steps * 8 * 16;
+  if (block0 >= widest)
+    return;
+  const std::uint32_t live_groups = (last - first) / kGroup + 1;
+  // Thread i stages one fragment: tile i / 64, row (i / 8) % 8 and + 8,
+  // k step i % 8; rows past the batch stay zero.
+  bool scaled_row = false;
+  {
+    const std::uint32_t g = threadIdx.x / 64;
+    const std::uint32_t ks = threadIdx.x % kKSteps;
 #pragma unroll
-  for (unsigned i = 0; i < kSelectDim / 2; ++i)
-    key[i] = reinterpret_cast<const std::uint32_t*>(
-        blocks)[std::size_t{b} * kSelectDim / 2 + i];
-  float total = 0.0F;
-#if __clang_major__ >= 23
-  // Newer LLVM versions hoist queries from all four unrolled heads,
-  // overflowing the scalar register file. LLVM 23 also spills into private
-  // memory. Keep one head live without changing the FMA or reduction order.
-#pragma unroll 1
-#else
+    for (std::uint32_t pass = 0; pass < 2; ++pass) {
+      const std::uint32_t row = (threadIdx.x / kKSteps) % 8 + pass * 8;
+      const std::uint32_t query = first + g * kGroup + row / kSelectHeads;
+      const bool live = query < n_tokens;
+      const float* src = q +
+                         (std::size_t{live ? query : first} * kSelectHeads +
+                          row % kSelectHeads) *
+                             kSelectDim +
+                         ks * 16;
+      float x[16];
 #pragma unroll
-#endif
-  for (unsigned h = 0; h < kSelectHeads; ++h) {
-    __builtin_amdgcn_sched_barrier(0);
-    const auto* query = q + (std::size_t{t0} * kSelectHeads + h) * kSelectDim;
-    float partial[32];
-#pragma unroll
-    for (unsigned lane = 0; lane < 32; ++lane) {
-      float dot = 0.0F;
-#pragma unroll
-      for (unsigned i = 0; i < 4; ++i) {
-        const auto bits = static_cast<unsigned short>(
-            key[(lane + i * 32) / 2] >> ((lane & 1) * 16));
-        dot = fmaf(query[lane + i * 32], __half2float(__ushort_as_half(bits)),
-                   dot);
+      for (std::uint32_t v = 0; v < 4; ++v) {
+        const float4 f = live ? reinterpret_cast<const float4*>(src)[v]
+                              : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        x[v * 4] = f.x;
+        x[v * 4 + 1] = f.y;
+        x[v * 4 + 2] = f.z;
+        x[v * 4 + 3] = f.w;
       }
-      partial[lane] = dot;
-      // Bound query-load hoisting: keeping all 128 scalar values live spills
-      // registers on gfx1151. Scheduling groups retain every FMA and sum.
-      if ((lane + 1) % 16 == 0)
-        __builtin_amdgcn_sched_barrier(0);
-    }
+      // The row's largest magnitude over its eight k-step lanes. Past
+      // 65504 both F16 parts would overflow (their infinities sum to NaN,
+      // which ReLU turns into a zero head); below 1/2 the remainder loses
+      // bits as a subnormal.
+      float peak = 0.0F;
 #pragma unroll
-    for (unsigned delta = 16; delta; delta >>= 1) {
+      for (std::uint32_t i = 0; i < 16; ++i)
+        peak = fmaxf(peak, fabsf(x[i]));
 #pragma unroll
-      for (unsigned lane = 0; lane < delta; ++lane)
-        partial[lane] += partial[lane + delta];
+      for (int d = 1; d < static_cast<int>(kKSteps); d *= 2)
+        peak = fmaxf(peak, XorLane(peak, d));
+      const bool outside = (peak > 0.0F && peak < 0.5F) ||
+                           (peak >= 65504.0F && peak != INFINITY);
+      const int peak_exponent =
+          static_cast<int>(__builtin_bit_cast(std::uint32_t, peak) >> 23) - 127;
+      const int exponent = outside ? min(max(peak_exponent, -126), 126) : 0;
+      scaled_row = scaled_row || exponent != 0;
+      const float scale = __builtin_bit_cast(float, (127 - exponent) << 23);
+      v16h hi_frag;
+      v16h lo_frag;
+#pragma unroll
+      for (std::uint32_t i = 0; i < 16; ++i) {
+        const float value = x[i] * scale;
+        const _Float16 hi = static_cast<_Float16>(value);
+        hi_frag[i] = hi;
+        lo_frag[i] = static_cast<_Float16>(value - static_cast<float>(hi));
+      }
+      q_lds[g][ks][0][row] = hi_frag;
+      q_lds[g][ks][1][row] = lo_frag;
+      if (ks == 0)
+        q_unscale[g][row % 2][row / 2] =
+            __builtin_bit_cast(float, (127 + exponent) << 23);
     }
-    total += fmaxf(partial[0], 0.0F);
   }
-  scores[std::size_t{t0} * max_blocks + b] = total;
+  // Realistic (normalized) queries scale no row: their blocks skip the
+  // unscaling multiplies.
+  const bool scaled = __syncthreads_or(scaled_row) != 0;
+  // Lanes L and L ^ 16 hold heads {0, 2} and {1, 3} of the same block.
+  const std::uint32_t half = lane >> 4;
+  for (std::uint32_t step = 0; step < steps; ++step) {
+    const std::uint32_t tile = block0 + (step * 8 + wave) * 16;
+    if (tile >= widest)
+      break;
+    const std::uint32_t b = tile + sub;
+    const bool key_live = b < widest;
+    const __half* key = blocks + std::size_t{key_live ? b : tile} * kSelectDim;
+    v16h k[kKSteps];
+#pragma unroll
+    for (std::uint32_t ks = 0; ks < kKSteps; ++ks) {
+      if (key_live) {
+        const auto* src = reinterpret_cast<const uint4*>(key + ks * 16);
+        uint4 parts[2] = {src[0], src[1]};
+        __builtin_memcpy(&k[ks], parts, sizeof(k[ks]));
+      } else {
+        k[ks] = v16h{};
+      }
+    }
+    for (std::uint32_t g = 0; g < live_groups; ++g) {
+      // One partial per 16-dim step (remainder, then head part), summed
+      // pairwise: a single chain through eight steps loses about 2 bits.
+      v8f part[kKSteps];
+#pragma unroll
+      for (std::uint32_t ks = 0; ks < kKSteps; ++ks) {
+        part[ks] = Wmma(q_lds[g][ks][1][sub], k[ks], v8f{});
+        part[ks] = Wmma(q_lds[g][ks][0][sub], k[ks], part[ks]);
+      }
+#pragma unroll
+      for (std::uint32_t d = kKSteps / 2; d; d /= 2)
+#pragma unroll
+        for (std::uint32_t ks = 0; ks < d; ++ks)
+          part[ks] += part[ks + d];
+      v8f acc = part[0];
+      // acc[i] is row 2i + half: query i / 2, head 2 * (i % 2) + half.
+      if (scaled) {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i)
+          acc[i] *= q_unscale[g][half][i];
+      }
+      float head[kGroup][kSelectHeads];
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        const float own = fmaxf(acc[i], 0.0F);
+        const float peer = __builtin_bit_cast(
+            float, XorLane(__builtin_bit_cast(int, own), 16));
+        head[i / 2][2 * (i % 2)] = half != 0 ? peer : own;
+        head[i / 2][2 * (i % 2) + 1] = half != 0 ? own : peer;
+      }
+      float total[kGroup];
+#pragma unroll
+      for (std::uint32_t j = 0; j < kGroup; ++j) {
+        total[j] = 0.0F;
+#pragma unroll
+        for (std::uint32_t h = 0; h < kSelectHeads; ++h)
+          total[j] += head[j][h];
+      }
+      // Half 0 stores queries 0 and 1, half 1 queries 2 and 3.
+#pragma unroll
+      for (std::uint32_t jj = 0; jj < 2; ++jj) {
+        const std::uint32_t t0 = first + g * kGroup + half * 2 + jj;
+        const std::uint32_t complete = (base + t0 + 1) / ratio;
+        // The position comes from the device, the row size from the host: a
+        // block past max_blocks has no score slot in this row.
+        if (t0 > last || complete <= budget || b >= complete || b >= max_blocks)
+          continue;
+        scores[std::size_t{t0} * max_blocks + b] =
+            half != 0 ? total[2 + jj] : total[jj];
+      }
+    }
+  }
 }
 
 /// Locate a descending histogram rank cooperatively over kBins bins with a
@@ -2712,7 +2831,7 @@ __launch_bounds__(kBlock) __global__
   __shared__ std::uint32_t state[3];  // threshold, remaining, bin count
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t pos = *start_pos + first_token + t;
-  // Only max_blocks scores exist per row (see SelectScoreKernel).
+  // Only max_blocks scores exist per row (see SelectScoreWmmaKernel).
   const std::uint32_t complete = min((pos + 1) / ratio, max_blocks);
   std::uint32_t* words = mask + static_cast<std::size_t>(t) * mask_words;
   for (std::uint32_t w = threadIdx.x; w < mask_words; w += blockDim.x) {
@@ -7798,10 +7917,16 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
   // launch passes its live range, sparing the empty workgroups.
   const std::uint32_t grid_blocks =
       live_blocks != 0 ? std::min(live_blocks, max_blocks) : max_blocks;
-  const dim3 grid(n_tokens, (grid_blocks + kThreads - 1) / kThreads);
-  hipLaunchKernelGGL(SelectScoreKernel, grid, dim3(kThreads), 0, stream, q,
+  // Wide batches give each block of waves more key tiles to share its
+  // query fragments; a decode row spreads its keys over more blocks.
+  const std::uint32_t steps = n_tokens > 8 ? 4 : 1;
+  const std::uint32_t per_block = steps * 8 * 16;
+  constexpr std::uint32_t kBlockQueries = 4 * kSelectGroups;
+  const dim3 grid((n_tokens + kBlockQueries - 1) / kBlockQueries,
+                  (grid_blocks + per_block - 1) / per_block);
+  hipLaunchKernelGGL(SelectScoreWmmaKernel, grid, dim3(kThreads), 0, stream, q,
                      blocks, scores, n_tokens, start_pos, first_token, ratio,
-                     budget, max_blocks);
+                     budget, max_blocks, steps);
   constexpr std::uint32_t kNarrowMarkThreads = 1024;
   const auto mark = n_tokens <= 4 ? SelectMarkKernel<kNarrowMarkThreads>
                                   : SelectMarkKernel<kThreads>;
