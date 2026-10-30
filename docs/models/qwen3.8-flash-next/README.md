@@ -119,7 +119,7 @@ IQ4_XS, as well as F32/F16/BF16 where noted).
 | `token_embd` | any | exact row gather (`qfn_mmq_get_rows`) | same |
 | `output` | Q8_0, F16/BF16/F32, Q4_K, Q5_K, Q6_K | the file's rows | Q8_0 re-encoding |
 | trunk, shared expert, PLE projections, `ssm_alpha`/`ssm_beta` | Q8_0, F16/BF16/F32, or any block format | the file's rows (`qfn_mmq_dense_kq_vec`) | their Q8_0 re-encoding (W8A8 / F16 GEMMs) |
-| HC mixers | as above (the 320-wide `up`: 32-element formats); `inject` any format, widened to F32 on the host unless Q8_0 (#788) or BF16 | separate GEMVs | Q8_0 re-encoding |
+| HC mixers | as above (the 320-wide `up`: 32-element formats); `inject` any format, widened to F32 on the host (Q8_0 on the device, #788) | separate GEMVs | Q8_0 re-encoding |
 | `ffn_gate_inp` | F32, BF16 (widened on the host) | | |
 | `per_layer_token_embd` (160 wide) | IQ4_NL, BF16, Q8_0, Q5_0, Q5_1, Q4_0, Q4_1 | CPU decode of disk rows | same |
 | `ple_conv1d` | F32, F16, BF16 (widened to F32) | | |

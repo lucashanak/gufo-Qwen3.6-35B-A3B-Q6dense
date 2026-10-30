@@ -267,12 +267,12 @@ struct Uploader {
   /// Uploads a narrow projection the quantized tier does not cover (the
   /// hyper-connection inject) as F32. A Q8_0 tensor is uploaded as is and
   /// expanded once the disk pipeline drains, so it runs the F32 kernels with
-  /// its dequantized values instead of quantizing their activations. Other
-  /// block formats (llama.cpp mixes quantize the inject rows with the
-  /// trunk) are widened on the host; BF16 keeps its projection.
+  /// its dequantized values instead of quantizing their activations. BF16
+  /// and the other block formats (llama.cpp mixes quantize the inject rows
+  /// with the trunk) are widened on the host: a separate BF16 projection
+  /// would take the library GEMM, whose sums depend on the pass width.
   DeviceTensor CopyF32(const TensorRef& t) {
-    if (t.empty() || !ok || t.type == core::GgmlType::kF32 ||
-        t.type == core::GgmlType::kBF16) {
+    if (t.empty() || !ok || t.type == core::GgmlType::kF32) {
       return Copy(t);
     }
     if (t.type != core::GgmlType::kQ8_0) {
