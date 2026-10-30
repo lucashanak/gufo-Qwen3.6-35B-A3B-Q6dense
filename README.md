@@ -1,3 +1,45 @@
+# Gufo Plus
+
+A fork of [Gufo](https://github.com/gufo-org/gufo) for AMD Strix Halo (`gfx1151`, 128 GiB). It tracks upstream and carries work that has not been merged there yet; finished pieces are sent upstream as pull requests.
+
+## What this fork adds
+
+- **Exact outputs.** Qwen3.8 Flash-Next gives the same tokens regardless of batch size, how a prompt is split into prefill passes, position, context length or timing. A full 149-question suite produces the identical 133,578 tokens on every build since the exactness fixes.
+- **GGUF formats.** Every GGML block format opens and dequantizes; Flash-Next loads llama.cpp and Unsloth mixes (IQ1–IQ4, Q2_K–Q6_K, Q4_0/Q4_1/Q5_0/Q5_1, IQ4_NL, Q8_0) in decode, with WMMA prefill for the common expert formats.
+- **Flash-Next speed.** Faster prefill (routed experts, fused DeltaNet, 16,384-row passes, WMMA indexer), faster single-user and 8-session decode, confidence-gated MTP chains, and waits that do not spin a CPU core (on Strix Halo a busy core takes package power from the GPU).
+- **8-bit K/V that grows.** K/V rows in 8 bits with an F16 scale per 16 values, mapped in 2 MiB chunks as a session grows and capped by `--kv-cache-bytes`: 8 sessions × 262,144 tokens in a 20 GiB budget.
+- **Serving.** `--reasoning-budget-fraction` (thinking budget as a share of `max_tokens`, with Qwen's wrap-up), model-chosen prefill budget beside active decoders, cache checkpoints that do not split long passes.
+- **Qwen3.6-35B-A3B / Ornith 1.5** (35B and 122B) with native MTP, history drafting and DFlash2 next to MTP.
+
+## Results
+
+Qwen3.8 Flash-Next (v3 recipe + MTP, 8 sessions) on a 149-question quality suite: **IQ 95.3 in 1,420 s**, against 95.3 in 1,789 s for Halogen on the same machine.
+
+## Upstream status
+
+| PR | Change | State |
+| --- | --- | --- |
+| [#882](https://github.com/gufo-org/gufo/pull/882) | Confidence-gated MTP chains | merged |
+| [#875](https://github.com/gufo-org/gufo/pull/875) | Prefill rows independent of the pass route | open |
+| [#876](https://github.com/gufo-org/gufo/pull/876) | Dense sweep of pre-budget rows in budget-crossing chains | open |
+| [#877](https://github.com/gufo-org/gufo/pull/877) | Four-token prefill alignment | open |
+| [#878](https://github.com/gufo-org/gufo/pull/878) | `--reasoning-budget-fraction` | open |
+| [#879](https://github.com/gufo-org/gufo/pull/879) | Model-chosen prefill budget | open |
+| [#880](https://github.com/gufo-org/gufo/pull/880) | Grid checkpoints keep long passes whole | open |
+| [#881](https://github.com/gufo-org/gufo/pull/881) | Idle-spill polling backoff | open |
+| [#883](https://github.com/gufo-org/gufo/pull/883) | Every GGML block format in core | open |
+| [#884](https://github.com/gufo-org/gufo/pull/884) | Q8_0 PLE n-gram tables | open |
+| [#890](https://github.com/gufo-org/gufo/pull/890) | Register-resident routed prefill experts | open |
+| [#891](https://github.com/gufo-org/gufo/pull/891) | 16,384-row prefill passes | open |
+| [#892](https://github.com/gufo-org/gufo/pull/892) | Prefill waits without busy-polling | open |
+| [#893](https://github.com/gufo-org/gufo/pull/893) | 8-bit growing K/V | open |
+| [#894](https://github.com/gufo-org/gufo/pull/894) | One-launch decode HC mixer | open |
+| [#895](https://github.com/gufo-org/gufo/pull/895) | Fused prefill DeltaNet | open |
+
+Building, running and model documentation are the same as upstream; the original README follows.
+
+---
+
 # Gufo: The ***Open Source*** Strix Halo AI engine 
 
 <p align="center">
