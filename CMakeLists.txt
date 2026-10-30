@@ -89,6 +89,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
 pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile)
 pkg_check_modules(SOXR REQUIRED IMPORTED_TARGET soxr)
+pkg_check_modules(AV REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
   "FFmpeg executable used for generated media")
@@ -116,6 +117,16 @@ if (ENGINE_ENABLE_HIP)
     set(CMAKE_DEPFILE_FLAGS_HIP "/showIncludes")
     set(CMAKE_HIP_DEPFILE_FORMAT msvc)
     message(STATUS "gufo: compiling HIP through ${GUFO_CCACHE_PROGRAM}")
+  endif()
+  # clang-cl maps the MSVC RelWithDebInfo /Ob1 to -finline-hint-functions for
+  # the device compile too, which marks every __device__ helper without
+  # inline/__forceinline__ noinline: the kernels then call them. Linux builds
+  # inline them; /Ob2 restores the normal inliner for HIP sources.
+  if (WIN32)
+    string(REPLACE "/Ob1" "/Ob2" CMAKE_HIP_FLAGS_RELWITHDEBINFO
+      "${CMAKE_HIP_FLAGS_RELWITHDEBINFO}")
+    string(REPLACE "/Ob1" "/Ob2" CMAKE_HIP_FLAGS_MINSIZEREL
+      "${CMAKE_HIP_FLAGS_MINSIZEREL}")
   endif()
   find_package(hip REQUIRED)
   find_package(hipblas REQUIRED)
@@ -1094,6 +1105,25 @@ if (BUILD_TESTING)
   add_test(NAME kernel_bench_test COMMAND kernel_bench_test)
   set_tests_properties(kernel_bench_test PROPERTIES
     LABELS "cpu;benchmarks;statistics;json")
+
+  add_library(platform_library_fixture SHARED tests/core/platform_library_fixture.cpp)
+  set_target_properties(platform_library_fixture PROPERTIES
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/core/fixtures"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/core")
+  add_executable(platform_library_test tests/core/platform_library_test.cpp)
+  target_link_libraries(platform_library_test PRIVATE gufo_platform)
+  add_dependencies(platform_library_test platform_library_fixture)
+  add_test(NAME platform_library_test COMMAND platform_library_test
+    "$<TARGET_FILE:platform_library_fixture>")
+  set_tests_properties(platform_library_test PROPERTIES LABELS "cpu;platform")
+  if(NOT WIN32)
+    add_test(NAME platform_library_relocated_test COMMAND platform_library_test
+      "/gufo-missing-build-path/$<TARGET_FILE_NAME:platform_library_fixture>")
+    set_tests_properties(platform_library_relocated_test PROPERTIES
+      LABELS "cpu;platform"
+      ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:platform_library_fixture>")
+  endif()
 
   # the publish suite drives descriptors through dup2
   if (NOT WIN32)

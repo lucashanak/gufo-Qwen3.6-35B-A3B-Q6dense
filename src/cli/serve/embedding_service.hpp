@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "src/models/embedding_gemma2/hip/encoder_runtime.hpp"
+#include "src/models/embedding_gemma2/image_processor.hpp"
+#include "src/models/embedding_gemma2/video_processor.hpp"
 
 namespace gufo::server {
 
@@ -28,7 +30,7 @@ struct EmbeddingBatch {
 };
 
 struct EmbeddingPart {
-  enum class Type { kText, kImage, kAudio };
+  enum class Type { kText, kImage, kAudio, kVideo };
   Type type{Type::kText};
   std::string value;
 };
@@ -42,6 +44,7 @@ enum class EmbeddingStatus {
   kInputTooLong,
   kInvalidInput,
   kInvalidAudioInput,
+  kInvalidVideoInput,
   kFailed,
   /// The device failed a probe after an error. The service stays lost.
   kDeviceLost,
@@ -53,6 +56,10 @@ struct EmbeddingRequestOptions {
   /// first tokens, keeping the end marker, instead of refusing it. An input
   /// whose images would not fit whole is still refused.
   bool truncate{false};
+  /// Gemma4ImageProcessor `max_soft_tokens` for every image of the request.
+  std::uint32_t image_soft_tokens{
+      models::embedding_gemma2::kDefaultImageSoftTokens};
+  models::embedding_gemma2::VideoOptions video;
 };
 
 struct EmbeddingServiceOptions {
@@ -97,6 +104,8 @@ public:
 
   static constexpr std::size_t kMaxImages = 32;
   static constexpr std::size_t kMaxAudio = 32;
+  static constexpr std::size_t kMaxVideos = 32;
+  static constexpr std::size_t kMaxVideoFrames = 64;
 
   explicit EmbeddingService(EmbeddingServiceOptions options);
   ~EmbeddingService();

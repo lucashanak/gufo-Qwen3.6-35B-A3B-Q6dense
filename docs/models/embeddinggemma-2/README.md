@@ -1,6 +1,6 @@
 # EmbeddingGemma 2
 
-Native safetensors text, image and audio embeddings on gfx1151. Gufo runs [google/embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2), a 768-dimensional embedding model for 100+ languages and code, through `POST /v1/embeddings`. Text, images and audio share one vector space. Video inputs remain unsupported. Python runs only in offline reference checks.
+Native safetensors text, image, video and audio embeddings on gfx1151. Gufo runs [google/embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2), a 768-dimensional embedding model for 100+ languages and code, through `POST /v1/embeddings`. Text, images, video and audio share one vector space. Python runs only in offline reference checks.
 
 [Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm 10.1](ROCM.md)
 
@@ -54,8 +54,23 @@ applies to base64. Private destinations and local files are refused.
 Preprocessing follows the pinned checkpoint's `Gemma4ImageProcessor`: RGB,
 antialiased uint8 bicubic resize preserving aspect ratio, no crop, rescale by
 1/255, and 16×16 patches. The 3×3 spatial pool yields at most 280 soft tokens
-per image; the actual count depends on aspect ratio. These tokens and their
+per image by default; the actual count depends on aspect ratio. A request can
+pick the processor's other budgets with
+`"mm_processor_kwargs": {"max_soft_tokens": N}`, where N is 70, 140, 280, 560
+or 1120, as in vLLM; one budget applies to every image of the request, including
+mixed batches. Video frames retain their separate 140-token budget. At 1120
+the 8,192-token limit fits at most seven images that use the whole budget. These tokens and their
 boundary markers count toward the 8,192-token input limit and reported usage.
+The 32-image request cap is a deliberate server resource limit, not a model
+limit: it bounds retained decoded patch memory across all inputs in a request.
+At budget 70, 32 square images fit in one input (2,114 tokens including
+boundaries); a 33rd image is still refused with `too_many_images`. The cap is
+shared across inputs, even when each input separately fits the context. Patches
+use 27,648 bytes per soft token, so 32 full-budget 1120-token images across
+multiple inputs can retain about 945 MiB of patch data, plus decoding and
+framing overhead. The shared media byte/read-time and per-image pixel limits
+still apply. Smaller budgets reduce vision work and memory at the cost of
+spatial detail; [benchmarks](BENCHMARKS.md#image-budgets) record measured costs.
 Text parts containing literal `<|image|>` placeholders are refused when images
 are present. Unsupported processor or vision configurations are refused.
 
@@ -110,6 +125,69 @@ BF16 weights widened once; the shared text backbone retains its existing BF16
 matrix inputs. An audio request runs in its own device batch. Cancellation is
 checked during preprocessing and between audio layers; failures drain queued
 work and use the existing device-loss probe before the next request.
+
+## Video
+
+Typed `input_video` parts accept the llama.cpp `data`/`url` contract:
+
+```json
+{
+  "input": [{"content": [
+    {"type": "text", "text": "a camera clip: "},
+    {"type": "input_video", "input_video": {"data": "<base64 MP4>"}},
+    {"type": "text", "text": " near the entrance"}
+  ]}],
+  "video_options": {"fps": 1, "max_frames": 32,
+                    "overflow_strategy": "uniform", "add_timestamps": false}
+}
+```
+
+`data` takes precedence over `url`. Either accepts raw base64, a base64 video
+data URL, or a public HTTPS URL. Local paths and private destinations are
+refused. Supported containers are MP4/MOV and WebM/Matroska, with codecs supplied
+by the linked FFmpeg build (including H.264 and VP9 in the qualified build).
+Data URL media types are `video/mp4`, `video/quicktime`, `video/webm` and
+`video/x-matroska`. All media share a 20 MiB byte budget and 15-second read
+deadline; the server's HTTP body limit also applies before base64 decoding.
+
+Defaults match the pinned processor: 1 FPS, at most 32 frames, uniform overflow,
+140 soft-token budget per frame, and timestamps disabled. `video_options` applies
+to every video in the request. `fps` is a finite number in `(0, 120]`,
+`max_frames` an integer in `[1, 32]`, `overflow_strategy` is `uniform` or
+`truncate`, and `add_timestamps` is boolean. Other processor controls, including
+vision budgets, remain tracked in #763.
+
+Sampling uses the decoded frame count and average source FPS: select
+`max(1, floor(duration * requested_fps))` indices by flooring source-frame
+positions, then apply the cap using uniform linspace/floor indices or take the
+first indices for `truncate`. Upsampling repeats selected frames. Timestamps
+use the selected source indices divided by source FPS, formatted as `mm:ss`.
+The decoded frame count is used even when a container omits its frame count.
+FFmpeg decodes RGB pixels without applying display rotation, as the pinned PyAV
+reference does. Frame size changes within a clip are refused.
+
+Each frame uses image boundaries around **video** placeholders, preserving its
+position among text, images, other videos and separate audio parts. All features
+pass through the shared text backbone and produce one normalized vector per
+input. Expanded placeholders count toward usage and the 8,192-token context;
+`truncate` never drops part of a clip. Vision weights load lazily and remain
+shared with image requests. FFmpeg runtime libraries load on the first video
+request, preserving startup latency for other services. Missing decoder runtime
+libraries are a server error (500), not malformed media.
+
+The video path takes the first video stream and ignores embedded audio tracks,
+matching the official visual decoder. To embed sound jointly, provide a separate
+`input_audio` part in the desired reference order; Gufo does not automatically
+extract or interleave the container's audio. The fixtures cover both an embedded
+soundtrack and explicit text/video/image/audio interleaving.
+
+Limits per clip are 300 seconds, 4,096 decoded frames, 4 megapixels per frame,
+512 megapixels of decoded work across two passes, eight container streams and a
+15-second decode/processing deadline. A request accepts at most 32 clips and
+64 selected frames. Decoding first counts frames, then retains only the selected
+frames' unpadded patches; it never stores the entire decoded clip. Cancellation
+is checked during decoding, preprocessing and between GPU frame passes.
+Malformed or over-budget clips return 400 `invalid_video_input`.
 
 ## Dimensions
 

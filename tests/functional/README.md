@@ -30,6 +30,15 @@ nix develop -c python3 tests/functional/model_services.py tts \
   --output artifacts/model-services/tts-base-1
 ```
 
+Embedding uses `--embedding-suite smoke` by default, including Devlab's PR tier.
+It retains independent reference-vector checks for all four modalities in one
+small batch, then checks an invalid clip and successful text recovery. This is
+a smoke check, not full model qualification. Select `--embedding-suite full`
+for the existing numerical/API suites plus video goldens, sampling/timestamps,
+dimensions, concurrent requests, context overflow, cancellation and recovery.
+Devlab's full tier selects that suite. Both retain individual request timings;
+manual invocations do not qualify performance against main.
+
 The default audio root is the packaged `fixtures/audio/` English WAV and reviewed
 transcript, authorized by the maintainer for publication. Override `--audio-root`
 only with a folder containing that English pair. ASR generates silence in memory
@@ -41,7 +50,7 @@ VoiceDesign model (fixed English voice instructions). Neither requires a clone.
 
 | Suite | Required checks |
 | --- | --- |
-| Embedding | Text, image and audio HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image/audio formats, multiple clips, audio/text/image interleaving, invalid inputs, cancellation and recovery |
+| Embedding | The default three-request smoke check covers text, image, video, mixed video/audio/image input, malformed-video rejection and recovery. `--embedding-suite full` retains the text, image, audio and video HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image/audio formats, multiple clips, audio/text/image interleaving, invalid inputs, cancellation and recovery |
 | ASR | English transcript WER ≤ 0.15, exact greedy replay, JSON/text/verbose formats, complete SSE matching buffered output, concurrent speech/silence, rejected options, malformed WAV recovery, stream cancellation and subsequent valid inference |
 | TTS | Voice discovery, valid non-silent 24-kHz mono PCM16 audio, two fixed texts with ASR WER ≤ 0.25, exact same-seed warm replay, WAV/PCM/SSE equality, different concurrent texts/seeds, rejected inputs, stream cancellation and subsequent valid inference |
 
@@ -490,6 +499,7 @@ RAM, disk and restart settings once their contracts pass.
 | `tool-agent-loop` | Bounded autonomous read/edit/verify loop; each turn checks cache reuse and detects repeated actions |
 | `tool-history` | Legacy names, result pairing, current-tool constraints, images, cached retry, stops/limits and sampled peers |
 | `messages-tools` | Messages `tool_use` call, `tool_result` replay with cache reuse, buffered and streamed events, and an uncached Chat control of the same prompt |
+| `openai-count-tokens` | Chat/Responses counts match complete generation prompt usage with system/history, Unicode, tools, reasoning, structured output and images; streaming request bodies, cold/warm caches, no inference side effects, over-context sizing and errors. Requires `--expected-input-modalities text,image` with a projector, or `text` for image rejection checks |
 | `messages-count-tokens` | Counts match complete Messages prompt usage with system/history, Unicode, all tool choices and thinking; cold/warm cache counts, no inference side effects, over-context sizing and request errors |
 | `messages-image-counts` | Image counts match buffered/streamed Messages usage, including tool results, warm caches, PNG/JPEG/WebP, multiple images, Unicode and over-context sizing; no inference side effects; text-only models reject image counts and generation. Requires `--expected-input-modalities text,image` with a projector, or `text` for capability rejection checks |
 | `tool-untyped` | Open/typed tools, refs and finite values: framing, arguments, streaming, turns, limits, stops/retry and sampled peers |
