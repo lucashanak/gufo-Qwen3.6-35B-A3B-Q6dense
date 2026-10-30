@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -29,6 +30,8 @@ public:
   explicit KvPool(std::size_t budget) : budget_(budget) {}
   KvPool(const KvPool&) = delete;
   KvPool& operator=(const KvPool&) = delete;
+  /// Frees every virtual range; no buffer may outlive the pool.
+  ~KvPool();
 
   /// Checks that this device can back growable rows.
   [[nodiscard]] static bool Supported(std::string* error);
@@ -39,11 +42,21 @@ public:
   /// Takes `bytes` of the budget, or nothing when they do not fit.
   [[nodiscard]] bool Charge(std::size_t bytes);
   void Refund(std::size_t bytes);
+  /// A virtual range of `bytes`: a released one of that size, or a new
+  /// reservation. Null when the device has no address space left.
+  [[nodiscard]] void* ReserveRange(std::size_t bytes, hipError_t* status);
+  /// Keeps an unmapped range for ReserveRange. Ranges go back to HIP only
+  /// when the pool is destroyed: on ROCm 7.2.4, chunks mapped into an
+  /// address range that an earlier hipMemAddressFree or hipFree released
+  /// intermittently fault on first access.
+  void ReleaseRange(void* base, std::size_t bytes);
 
 private:
   mutable std::mutex mutex_;
   std::size_t budget_;
   std::size_t mapped_{0};
+  std::vector<std::pair<void*, std::size_t>> ranges_;  ///< every reservation
+  std::vector<std::pair<void*, std::size_t>> free_ranges_;
 };
 
 /// One K, V or pooled-key buffer of a session: rows of `row_bytes` up to

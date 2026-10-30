@@ -83,6 +83,34 @@ void KvPool::Refund(std::size_t bytes) {
   mapped_ -= std::min(mapped_, bytes);
 }
 
+KvPool::~KvPool() {
+  for (const auto& [base, bytes] : ranges_)
+    (void)hipMemAddressFree(base, bytes);
+}
+
+void* KvPool::ReserveRange(std::size_t bytes, hipError_t* status) {
+  const std::lock_guard lock(mutex_);
+  *status = hipSuccess;
+  const auto reused = std::ranges::find_if(
+      free_ranges_, [&](const auto& range) { return range.second == bytes; });
+  if (reused != free_ranges_.end()) {
+    void* base = reused->first;
+    free_ranges_.erase(reused);
+    return base;
+  }
+  void* base = nullptr;
+  *status = hipMemAddressReserve(&base, bytes, 0, nullptr, 0);
+  if (*status != hipSuccess)
+    return nullptr;
+  ranges_.emplace_back(base, bytes);
+  return base;
+}
+
+void KvPool::ReleaseRange(void* base, std::size_t bytes) {
+  const std::lock_guard lock(mutex_);
+  free_ranges_.emplace_back(base, bytes);
+}
+
 GrowableRows::GrowableRows(GrowableRows&& other) noexcept
     : pool_(std::exchange(other.pool_, nullptr)),
       base_(std::exchange(other.base_, nullptr)),
@@ -95,7 +123,7 @@ GrowableRows::GrowableRows(GrowableRows&& other) noexcept
 GrowableRows::~GrowableRows() {
   (void)Shrink(0);
   if (base_ != nullptr)
-    (void)hipMemAddressFree(base_, reserved_bytes_);
+    pool_->ReleaseRange(base_, reserved_bytes_);
 }
 
 bool GrowableRows::Reserve(KvPool* pool, std::size_t row_bytes,
@@ -107,9 +135,9 @@ bool GrowableRows::Reserve(KvPool* pool, std::size_t row_bytes,
   }
   const std::size_t chunk = ChunkBytes(row_bytes * max_rows);
   const std::size_t bytes = FullBytes(row_bytes, max_rows);
-  void* base = nullptr;
-  const auto status = hipMemAddressReserve(&base, bytes, 0, nullptr, 0);
-  if (status != hipSuccess)
+  hipError_t status = hipSuccess;
+  void* base = pool->ReserveRange(bytes, &status);
+  if (base == nullptr)
     return Fail(error, "K/V address reservation", status);
   pool_ = pool;
   base_ = static_cast<std::uint8_t*>(base);
